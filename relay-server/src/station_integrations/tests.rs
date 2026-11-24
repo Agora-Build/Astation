@@ -653,6 +653,136 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
 #[cfg(feature = "delegated-host-work")]
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_commits_to_this_lists_owner_binding() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::remote_api::recovery::delegated::Command;
+    use crate::remote_api::recovery::delegated_recovery::{plan, Binding};
+
+    let origin = "https://station-dev.agora.build";
+    let (db, runtime, fixture) = fixture_at_station("https://auth.example", None, origin).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(
+        &runtime,
+        &fixture,
+        serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap(),
+    )
+    .await;
+    runtime
+        .app
+        .recovery
+        .configure_delegated(origin, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .app
+            .recovery
+            .delegated_operation(&genesis, PRINCIPAL, Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    let replica = db.reconnect(2).await;
+    let review =
+        || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding));
+
+    let mut old = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut previous_hash = Value::Null;
+    let other = "ab00000000000000000000000001";
+    for (version, owner, id, state, complete, disabled) in [
+        (1, OWNER, "old", "bound", true, false),
+        (2, OWNER, "old", "unbound", true, false),
+        (3, OWNER, "old", "released", true, false),
+        (4, other, "other-private", "bound", true, false),
+        (5, OWNER, "new", "bound", false, false),
+        (6, OWNER, "new", "bound", false, true),
+        (7, OWNER, "new", "bound", true, false),
+    ] {
+        let cursor = if version == 7 {
+            old.cursor + 1
+        } else {
+            old.cursor
+        };
+        let source = json!({"changes":[],"cursor":cursor,"checkpoint":{
+            "at":"2026-11-24T10:00:00.000Z","integrations":[{"id":ID,"ownerAccount":OWNER,
+                "state":"ready","scopes":["agent.view"],"r9Svc":draft["fingerprint"],
+                "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}],
+            "accounts":{"complete":complete,"disabled":if disabled { vec![OWNER] } else { vec![] }},
+            "bindings":[{"account":owner,"accountId":fixture.log.account_id(),"genesisHash":genesis,
+                "bindingId":id,"version":version,"bindingState":state}]}});
+        let snapshot =
+            PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding)
+                .unwrap();
+        let next = old.apply_checkpoint(snapshot, old.received_at).unwrap();
+        runtime
+            .policies
+            .commit_for_recovery(&old, &next, Some(&fence))
+            .await
+            .unwrap();
+        old = next;
+        let prepared = review().await.unwrap();
+        let observed = &prepared["portal_service_evidence"];
+        if owner == OWNER {
+            assert_eq!(
+                observed["owner_binding"],
+                json!({"status":"observed","binding_id":id,"version":version,"state":state})
+            );
+        } else {
+            assert_eq!(observed["owner_binding"], json!({"status":"unresolved"}));
+            let encoded = observed.to_string();
+            assert!(!encoded.contains(other) && !encoded.contains(id));
+        }
+        let availability = if disabled {
+            "disabled"
+        } else if complete {
+            "enabled"
+        } else {
+            "unknown"
+        };
+        assert_eq!(observed["owner_availability"], availability);
+        if version == 1 || version >= 5 {
+            let expected = if version == 1 {
+                "reviewed"
+            } else {
+                "owner_availability_unresolved"
+            };
+            assert_eq!(
+                observed["services"][0]["snapshot_review"]["status"],
+                expected
+            );
+        }
+        assert_ne!(prepared["portal_service_evidence_hash"], previous_hash);
+        previous_hash = prepared["portal_service_evidence_hash"].clone();
+        assert_eq!(prepared["recovery_ready"], false);
+    }
+
+    let mut writer = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM station_integration_policy WHERE binding=$1 FOR UPDATE")
+        .bind(runtime.binding.storage_key().unwrap())
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let error = review().await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("55P03")
+    );
+    writer.rollback().await.unwrap();
+    assert_eq!(
+        review().await.unwrap()["portal_service_evidence_hash"],
+        previous_hash
+    );
+    replica.close().await;
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_inventories_provisioning_before_enrollment() {
     use crate::integration_checkpoint::PortalCheckpoint;
     use crate::remote_api::recovery::delegated::Command;
