@@ -84,9 +84,9 @@ async fn changes(original: &StationIntegrations, cursor: u64, id: &str, kind: &s
     assert!(page
         .changes
         .iter()
-        .any(|c| c.integration_id.as_deref() == Some(id) && c.kind == kind));
+        .any(|c| c.integration_id() == Some(id) && c.kind == kind));
     json!({"cursor":page.cursor,"changes":page.changes.iter().map(|c|
-        json!({"id":c.id,"integration_id":c.integration_id,"kind":c.kind,
+        json!({"id":c.id,"integration_id":c.integration_id(),"kind":c.kind,
             "state":c.integration.as_ref().map(|p|p.state.as_str())})
     ).collect::<Vec<_>>()})
 }

@@ -6,6 +6,10 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub(crate) const PAGE_LIMIT: usize = 500;
 pub(crate) const MAX_POLICY_AGE_SECS: i64 = 120;
 
+#[path = "integration_availability.rs"]
+mod availability;
+use availability::Availability;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FeedBinding {
     pub issuer: String,
@@ -149,14 +153,37 @@ pub(crate) struct InitialIntegration {
     pub policy: IntegrationPolicy,
 }
 
+// Account events distinguish required JSON nulls from omitted fields. Other
+// event kinds can carry new metadata without changing their interpretation.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Change {
     pub id: u64,
-    pub integration_id: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    integration_id: Option<Option<String>>,
     pub kind: String,
     // The event's historical state is deliberately not used as current policy.
     pub integration: Option<IntegrationPolicy>,
+    #[serde(default, deserialize_with = "present")]
+    account: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    reason: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    state: Option<serde_json::Value>,
+}
+
+impl Change {
+    pub(crate) fn integration_id(&self) -> Option<&str> {
+        self.integration_id.as_ref().and_then(Option::as_deref)
+    }
 }
 
 #[derive(Deserialize)]
@@ -178,6 +205,8 @@ pub(crate) struct PolicyCheckpoint {
     pub portal_snapshot: Option<crate::integration_checkpoint::PortalCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal_snapshot_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    availability: Option<Availability>,
 }
 
 impl PolicyCheckpoint {
@@ -192,6 +221,7 @@ impl PolicyCheckpoint {
             integrations: BTreeMap::new(),
             portal_snapshot: None,
             portal_snapshot_revision: None,
+            availability: None,
         })
     }
 
@@ -240,7 +270,7 @@ impl PolicyCheckpoint {
                 return Err(());
             }
             previous = change.id;
-            if let Some(id) = &change.integration_id {
+            if let Some(id) = change.integration_id() {
                 if !client_id(id, "i-") {
                     return Err(());
                 }
@@ -254,7 +284,7 @@ impl PolicyCheckpoint {
                         {
                             return Err(());
                         }
-                        next.integrations.insert(id.clone(), policy.clone());
+                        next.integrations.insert(id.to_owned(), policy.clone());
                     }
                     None => {
                         next.integrations.remove(id);
@@ -266,6 +296,13 @@ impl PolicyCheckpoint {
         }
         if page.cursor != previous {
             return Err(());
+        }
+        // A reset or malformed availability change needs another exact checkpoint.
+        // Ordinary integration polling can still advance independently.
+        if self.denied || (requested_cursor == 0 && self.cursor != 0) ||
+            next.availability.as_mut().is_some_and(|state|
+                state.advance(requested_cursor, page.cursor, &page.changes).is_err()) {
+            next.availability = None;
         }
         next.cursor = page.cursor;
         next.revision = next.revision.checked_add(1).ok_or(())?;
@@ -318,9 +355,15 @@ impl PolicyCheckpoint {
         let mut next = self.clone();
         next.revision = self.revision.checked_add(1).ok_or(())?;
         // Collection cannot replace live policy, refresh its lease or clear a denial.
+        next.availability = snapshot.accounts.as_ref().map(|a| Availability::from_checkpoint(snapshot.cursor, a));
         next.portal_snapshot = Some(snapshot);
         next.portal_snapshot_revision = Some(next.revision);
         Ok(next)
+    }
+
+    pub(crate) fn allows_delegated_release(&self, owner: &str) -> bool {
+        !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
+            || (!self.denied && self.availability.as_ref().is_some_and(|s| s.enabled_at(self.cursor, owner)))
     }
 
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
@@ -393,6 +436,7 @@ impl PolicyStore {
                 let checkpoint: PolicyCheckpoint = serde_json::from_str(&saved).map_err(|_| ())?;
                 if checkpoint.binding != *binding
                     || checkpoint.cursor > MAX_SAFE_INTEGER
+                    || checkpoint.availability.as_ref().is_some_and(|s| !s.valid_for(binding))
                     || checkpoint.received_at < 0
                 {
                     return Err(());
@@ -433,6 +477,7 @@ impl PolicyStore {
             return Err(());
         }
         checkpoint.denied = true;
+        checkpoint.availability = None;
         checkpoint.portal_snapshot_revision = None;
         checkpoint.revision = checkpoint.revision.checked_add(1).ok_or(())?;
         sqlx::query("UPDATE station_integration_policy SET checkpoint=$1,recovery_generation=NULL,recovery_revision=NULL WHERE binding=$2")

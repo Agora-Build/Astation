@@ -28,6 +28,14 @@ pub(crate) async fn fixture_with_ceiling_cluster(
     issuer: &str,
     external: Option<&sqlx::PgPool>,
 ) -> (crate::test_database::TestDatabase, Arc<StationIntegrations>, Fixture) {
+    fixture_at_station(issuer, external, "https://custom.example").await
+}
+
+pub(crate) async fn fixture_at_station(
+    issuer: &str,
+    external: Option<&sqlx::PgPool>,
+    station: &str,
+) -> (crate::test_database::TestDatabase, Arc<StationIntegrations>, Fixture) {
     let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let mut app = crate::tests::test_state();
     app.recovery = RecoveryStore::postgres(db.pool.clone());
@@ -73,7 +81,7 @@ pub(crate) async fn fixture_with_ceiling_cluster(
         FeedBinding {
             issuer: issuer.into(),
             portal_origin: "https://portal.example".into(),
-            station_origin: "https://custom.example".into(),
+            station_origin: station.into(),
             report_client_id: "s-01234567890123456789012345".into(),
         },
         ServiceKeyVault::new(&[42; 32], "operator-test").unwrap(),

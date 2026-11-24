@@ -405,3 +405,48 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     assert!(store.load(&fixture.binding).await.unwrap().denied);
     database.cleanup().await;
 }
+
+#[test]
+fn built_in_account_changes_follow_the_checkpoint_across_pages_restart_and_reset() {
+    let config = binding(true);
+    let mut saved = PolicyCheckpoint::empty(config.clone()).unwrap();
+    let apply = |saved: &PolicyCheckpoint, changes: Vec<Value>, now| {
+        let end = changes.last().and_then(|c| c["id"].as_u64()).unwrap_or(saved.cursor);
+        let mut page = json!({"changes":changes, "cursor":end});
+        if saved.cursor == 0 { page["integrations"] = json!([]); }
+        saved.apply(saved.cursor, serde_json::from_value(page).unwrap(), now).unwrap()
+    };
+    let change = |id, kind, account: Value| json!({"id":id,"kind":kind,"integrationId":null,
+        "reason":"agora_build","state":null,"account":account});
+    // Ordinary traffic cannot establish a complete account baseline by itself.
+    saved = apply(&saved, vec![change(3, "accounts_baseline", Value::Null)], 100);
+    assert!(!saved.allows_delegated_release(OWNER));
+    saved = saved.apply_checkpoint(parse(&source(true), &config).unwrap(), 101).unwrap();
+    assert!(!saved.allows_delegated_release(OWNER));
+    // Replaying a disabled event before the cut cannot override the newer checkpoint.
+    saved = apply(&saved, vec![change(12, "account_disabled", json!(OWNER))], 102);
+    assert!(saved.allows_delegated_release(OWNER));
+    assert!(!saved.allows_delegated_release(OTHER));
+    saved = apply(&saved, vec![change(14, "account_disabled", json!(OWNER)),
+        change(16, "accounts_incomplete", Value::Null), change(18, "account_enabled", json!(OWNER))], 103);
+    saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(!saved.allows_delegated_release(OWNER));
+    saved = apply(&saved, vec![change(21, "accounts_baseline", Value::Null)], 104);
+    assert!(saved.allows_delegated_release(OWNER));
+    assert!(!saved.allows_delegated_release(OTHER));
+    let full = (22..522).map(|id| json!({"id":id,"kind":"station_registered"})).collect();
+    saved = apply(&saved, full, 105);
+    assert!(!saved.allows_delegated_release(OWNER));
+    saved = apply(&saved, vec![], 106);
+    assert!(saved.allows_delegated_release(OWNER));
+    let restart = saved.apply(0, serde_json::from_value(json!({"integrations":[],"changes":[],"cursor":0})).unwrap(), 107).unwrap();
+    assert!(!restart.allows_delegated_release(OWNER));
+    let mut missing_room = change(523, "account_enabled", json!(OTHER));
+    missing_room.as_object_mut().unwrap().remove("integrationId");
+    assert!(!apply(&saved, vec![missing_room], 107).allows_delegated_release(OTHER));
+    let repeated = r#"{"changes":[{"id":523,"kind":"account_enabled","integrationId":null,"state":null,"reason":"agora_build","account":"one","account":"two"}],"cursor":523}"#;
+    assert!(serde_json::from_str::<crate::integration_feed::FeedPage>(repeated).is_err());
+    let malformed = apply(&saved, vec![change(523, "account_disabled", Value::Null)], 107);
+    let baseline = apply(&malformed, vec![change(524, "accounts_baseline", Value::Null)], 108);
+    assert!(!baseline.allows_delegated_release(OWNER));
+}
