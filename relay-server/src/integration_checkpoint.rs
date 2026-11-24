@@ -79,7 +79,7 @@ fn exact_keys(value: &Value, keys: &[&str]) -> Result<(), ()> {
 }
 
 impl PortalCheckpoint {
-    fn built_in(binding: &FeedBinding) -> bool {
+    pub(crate) fn built_in(binding: &FeedBinding) -> bool {
         matches!(
             binding.station_origin.as_str(),
             "https://station.agora.build" | "https://station-dev.agora.build"

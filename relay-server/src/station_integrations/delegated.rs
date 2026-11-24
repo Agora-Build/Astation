@@ -61,6 +61,9 @@ impl StationIntegrations {
             // never manufacture a release, stop, or cover from expiry alone.
             _ => return Ok(()),
         };
+        if desired == ServiceDesired::Active && !checkpoint.allows_delegated_release(&context.owner) {
+            return Err(());
+        }
         let signer = crate::service_keys::load_approved_in(
             &mut tx,
             &self.vault,
@@ -434,6 +437,50 @@ mod tests {
         assert!(marker.is_none(), "the earlier request settles before the recovery fence commits");
         drop(runtime);
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_builtin_release_waits_for_the_current_enabled_owner() {
+        use super::super::tests::{append_body, fixture_at_station, request};
+        use crate::integration_checkpoint::PortalCheckpoint;
+        let (db, runtime, f) = fixture_at_station("https://auth.example", None, "https://station-dev.agora.build").await;
+        let genesis = f.log.genesis_hash().to_hex();
+        runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        let fingerprint = draft["fingerprint"].as_str().unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        policy(&runtime, "paused", fingerprint, None).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        policy(&runtime, "ready", fingerprint, None).await;
+        assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        let replica = crate::integration_feed::PolicyStore(db.reconnect(2).await);
+        let previous = replica.load(&runtime.binding).await.unwrap();
+        let mut integration = serde_json::to_value(&previous.integrations[ID]).unwrap();
+        integration["id"] = json!(ID);
+        let value = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
+            "at":"2026-11-24T10:00:00.000Z","integrations":[integration],
+            "accounts":{"complete":true,"disabled":[OWNER]},"bindings":[]
+        }});
+        let exact = PortalCheckpoint::parse(&serde_json::to_vec(&value).unwrap(), &runtime.binding).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let denied = previous.apply_checkpoint(exact, now).unwrap();
+        replica.commit(&previous, &denied).await.unwrap();
+        assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        assert_eq!(feed(&runtime, &genesis).await.len(), 2);
+        let id = denied.cursor + 1;
+        let mut page = json!({"changes":[{"kind":"account_enabled","id":id,"account":OWNER,
+            "integrationId":null,"state":null,"reason":"agora_build"}],"cursor":id});
+        if denied.cursor == 0 { page["integrations"] = value["checkpoint"]["integrations"].clone(); }
+        let enabled = denied.apply(denied.cursor, serde_json::from_value(page).unwrap(), now).unwrap();
+        replica.commit(&denied, &enabled).await.unwrap();
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        let records = feed(&runtime, &genesis).await;
+        assert_eq!(records.iter().map(|r| r["body"]["action"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["cover", "hold", "release"]);
+        replica.0.close().await;
+        drop(runtime);
+        db.cleanup().await;
     }
 
     #[tokio::test]

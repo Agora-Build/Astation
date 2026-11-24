@@ -182,6 +182,13 @@ All replicas share one checkpoint attempt per minute, including on restart or
 an unsigned nudge. Each attempt reads the checkpoint even if the feed cursor
 stayed fixed. A full ordinary page is processed before another checkpoint
 attempt. Legacy Station deployments continue their ordinary feed polling.
+On the built-in Station, an exact checkpoint also seeds account availability
+for delegated service signing. The ordinary feed applies account disables,
+enables, incomplete markers and baselines from that cursor in the same
+transaction as the integration policy. A backlog, reset, malformed account
+change or unavailable baseline blocks new covers for active services and
+blocks releases. Holds and terminal stops can still be signed. The normal
+policy freshness check also applies. Custom Stations use their own policy.
 The checkpoint's polling interval sets no ownership freshness guarantee.
 Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
