@@ -126,57 +126,36 @@ impl SigningCeilings {
 
     pub(crate) fn recovery_evidence(
         reservations: &[Reservation],
-        log: &atem_client::membership::Membership,
         plan: &serde_json::Value,
     ) -> Result<serde_json::Value, ()> {
-        use atem_client::{
-            control::principal_key_of,
-            membership::{Action, MemberKind},
-        };
-        use std::collections::BTreeSet;
-        let registered: BTreeSet<_> = reservations
+        use std::collections::{BTreeMap, BTreeSet};
+        let ceilings: BTreeMap<_, _> = reservations
             .iter()
-            .map(|row| (row.service_id.as_str(), row.key_hash.as_str()))
-            .collect();
-        let mut missing = BTreeSet::new();
-        for entry in log.entries() {
-            let member = match &entry.action {
-                Action::Add { member }
-                | Action::RecoveryAdd { member }
-                | Action::Genesis { member, .. } => member,
-                _ => continue,
-            };
-            if matches!(member.kind, MemberKind::Service { .. }) {
-                let key = principal_key_of(&member.auth_key).map_err(|_| ())?.to_hex();
-                if !registered.contains(&(member.device_id.as_str(), key.as_str())) {
-                    missing.insert((member.device_id.clone(), key));
-                }
-            }
-        }
-        let signed: std::collections::BTreeMap<_, _> = reservations
-            .iter()
-            .filter(|row| row.highest_ms > 0)
             .map(|row| {
                 (
                     (row.service_id.as_str(), row.key_hash.as_str()),
-                    row.highest_ms as u64,
+                    row.highest_ms,
                 )
             })
             .collect();
-        let mut uncovered = std::collections::BTreeMap::<&str, u64>::new();
-        for record in plan["known_history"]["records"].as_array().ok_or(())? {
-            let principal = record["principal"].as_str().ok_or(())?;
-            if record["signer"] == principal && record["verification"] == "valid" {
-                if let Some(service) = principal.strip_prefix("service:") {
-                    let key = record["principal_key"].as_str().ok_or(())?;
-                    let time = record["issued_at"].as_u64().ok_or(())?;
-                    if signed
-                        .get(&(service, key))
-                        .is_none_or(|ceiling| *ceiling < time)
-                    {
-                        let floor = uncovered.entry(service).or_default();
-                        *floor = (*floor).max(time);
-                    }
+        let mut missing = BTreeSet::new();
+        let mut uncovered = BTreeMap::<&str, u64>::new();
+        for observed in plan["known_history"]["observed_service_keys"]
+            .as_array()
+            .ok_or(())?
+        {
+            let service = observed["service_id"].as_str().ok_or(())?;
+            let key = observed["key_fingerprint"].as_str().ok_or(())?;
+            let ceiling = ceilings.get(&(service, key));
+            if ceiling.is_none() {
+                missing.insert((service, key));
+            }
+            let signature = observed.get("highest_signed_ms").ok_or(())?;
+            if !signature.is_null() {
+                let time = signature.as_u64().ok_or(())?;
+                if ceiling.is_none_or(|value| *value <= 0 || (*value as u64) < time) {
+                    let floor = uncovered.entry(service).or_default();
+                    *floor = (*floor).max(time);
                 }
             }
         }

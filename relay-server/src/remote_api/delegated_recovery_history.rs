@@ -4,8 +4,8 @@ use super::super::super::{delegated::Stored, MAX_STATE};
 use super::super::Binding;
 use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepared};
 use atem_client::{
-    control::{verify_control, ControlCheck, ControlRecord, RefusalReason},
-    membership::Membership,
+    control::{principal_key_of, verify_control, ControlCheck, ControlRecord, RefusalReason},
+    membership::{Action, MemberKind, Membership},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -97,6 +97,9 @@ pub(super) async fn inspection(
         .ok_or_else(invalid)?;
     let mut summaries = Vec::new();
     let mut records = BTreeMap::new();
+    // Keep a key's authenticated signatures even if the restored list predates
+    // its enrollment. Record IDs and today's authority are reviewed separately.
+    let mut service_keys = BTreeMap::<(String, String), Option<u64>>::new();
     let mut lower_bounds = BTreeMap::<String, u64>::new();
     let mut commitments = Vec::new();
     let mut retained_feed_ids = BTreeSet::new();
@@ -131,7 +134,7 @@ pub(super) async fn inspection(
         }
         // Validate the historical checkpoint, then classify every obligation
         // under current authority. Removed managers never regain authority.
-        retained
+        let old_review = retained
             .feed
             .recovery_review(&binding.origin, &old_log)
             .map_err(|_| invalid())?;
@@ -162,10 +165,28 @@ pub(super) async fn inspection(
             .as_array()
             .ok_or_else(invalid)?;
         let reviews = review["records"].as_array().ok_or_else(invalid)?;
-        if values.len() != reviews.len() {
+        let old_reviews = old_review["records"].as_array().ok_or_else(invalid)?;
+        if values.len() != reviews.len() || values.len() != old_reviews.len() {
             return Err(invalid());
         }
-        for (value, review) in values.iter().zip(reviews) {
+        for entry in old_log.entries() {
+            let member = match &entry.action {
+                Action::Add { member } | Action::RecoveryAdd { member } | Action::Genesis { member, .. }
+                    if matches!(member.kind, MemberKind::Service { .. }) => member,
+                _ => continue,
+            };
+            let key = principal_key_of(&member.auth_key).map_err(|_| invalid())?.to_hex();
+            service_keys.entry((member.device_id.clone(), key)).or_default();
+        }
+        for ((value, review), old) in values.iter().zip(reviews).zip(old_reviews) {
+            let principal = review["principal"].as_str().ok_or_else(invalid)?;
+            if review["signer"] == principal && (old["verification"] == "valid" || review["verification"] == "valid") {
+                let service = principal.strip_prefix("service:").ok_or_else(invalid)?;
+                let key = review["principal_key"].as_str().ok_or_else(invalid)?;
+                let issued = review["issued_at"].as_u64().ok_or_else(invalid)?;
+                let highest = service_keys.entry((service.to_owned(), key.to_owned())).or_default();
+                *highest = Some(highest.map_or(issued, |prior| prior.max(issued)));
+            }
             add_record(&mut records, value.clone(), review.clone())?;
         }
         for (principal, value) in review["retained_signing_watermarks"]
@@ -262,6 +283,9 @@ pub(super) async fn inspection(
     }
     let report = json!({
         "checkpoints": summaries,
+        "observed_service_keys": service_keys.into_iter().map(|((service, key), highest)| json!({
+            "service_id":service, "key_fingerprint":key, "highest_signed_ms":highest
+        })).collect::<Vec<_>>(),
         "records": records.values().map(|(_, review)| review).collect::<Vec<_>>(),
         "observed_signing_lower_bounds": lower_bounds,
         "evidence_hash": source_hash(&json!({"checkpoints": commitments, "imports": imports}))?,

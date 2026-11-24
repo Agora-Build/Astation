@@ -234,6 +234,19 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     let origin = &runtime.binding.station_origin;
     let recovery = &runtime.app.recovery;
     recovery.configure_delegated(origin, 1).await.unwrap();
+    assert_eq!(
+        recovery
+            .delegated_operation(&genesis, PRINCIPAL, Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let before_enrollment: Value =
+        sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+            .bind(&genesis)
+            .fetch_one(&primary.pool)
+            .await
+            .unwrap();
     let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
     append_body(
         &runtime,
@@ -307,9 +320,41 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         .await
         .unwrap();
     assert_eq!(
-        wrong_key["service_clock_evidence"]["uncovered_service_signatures"][service],
+        wrong_key["service_clock_evidence"]["uncovered_service_signatures"][&service],
         last
     );
+    // Restore the membership from before enrollment. Earlier authenticated
+    // signatures still belong to this key even after the verifier loses it.
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(before_enrollment)
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+    let later = Binding::new(origin, 3).unwrap();
+    later.initialize(&primary.pool, true).await.unwrap();
+    let replica = primary.reconnect(2).await;
+    let historical = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        historical["service_clock_evidence"]["uncovered_service_signatures"][&service],
+        last
+    );
+    let fingerprint = draft["fingerprint"].as_str().unwrap();
+    sqlx::query("DELETE FROM station_service_signing_ceilings WHERE key_hash=$1")
+        .bind(fingerprint)
+        .execute(&external.pool)
+        .await
+        .unwrap();
+    let missing = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        missing["service_clock_evidence"]["unregistered_membership_keys"],
+        json!([[service, fingerprint]])
+    );
+    replica.close().await;
     drop(runtime);
     primary.cleanup().await;
     external.cleanup().await;
