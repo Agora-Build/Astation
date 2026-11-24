@@ -1,6 +1,7 @@
 //! Native-authenticated transport for a paired local/LAN host. This is not a
 //! room participant: proxy proofs never claim the host's relay route.
 use super::*;
+use crate::identity_store::BindingUse;
 use crate::remote_api::recovery::{HostBinding, ProxyBinding};
 use axum::http::HeaderMap;
 
@@ -28,14 +29,14 @@ pub(super) struct NativeAuthority {
 }
 
 impl NativeAuthority {
-    async fn current(&self, hub: &RelayHub) -> bool {
+    async fn current(&self, hub: &RelayHub, usage: BindingUse<'_>) -> bool {
         let now = chrono::Utc::now().timestamp();
         matches!(hub.directory().get(&self.room).await, Ok(Some(room)) if room.verified
             && room.owner.as_ref() == Some(&self.native))
             && matches!(self.identity.get_key(&self.room).await, Ok(Some(key)) if key == self.key)
-            && matches!(self.identity.resolve(&self.session, now).await, Ok(Some(room)) if room == self.room)
             && matches!(self.accounts.subject_for_astation(&self.room).await, Ok(Some(owner)) if owner == self.subject)
             && matches!(self.accounts.verify_access_token(&self.token).await, Ok(owner) if owner.subject == self.subject)
+            && matches!(self.identity.lookup_binding(&self.session, now, usage).await, Ok(Some(room)) if room == self.room)
     }
 }
 
@@ -52,7 +53,11 @@ impl RelayHub {
             return false;
         };
         matches!(
-            tokio::time::timeout(Duration::from_secs(3), authority.current(self)).await,
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                authority.current(self, BindingUse::UseByOwner(&authority.room))
+            )
+            .await,
             Ok(true)
         )
     }
@@ -104,7 +109,11 @@ pub(crate) async fn handler(
         }
         if state
             .identity
-            .resolve(&params.session_id, chrono::Utc::now().timestamp())
+            .lookup_binding(
+                &params.session_id,
+                chrono::Utc::now().timestamp(),
+                BindingUse::CheckOwner(&params.room),
+            )
             .await
             .ok()??
             != params.room
@@ -187,15 +196,12 @@ async fn run(
             || proof.astation_id != params.room
             || proof.public_key != authority.key
             || !verify_relay_signature(&proof.public_key, &challenge, &params.room, &sig)
-            || !authority.current(&hub).await
+            || !authority
+                .current(&hub, BindingUse::CheckOwner(&params.room))
+                .await
         {
             return None;
         }
-        hub.inner
-            .proxy_authorities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), authority.clone());
         hub.local().send(
             &id,
             relay_auth_result_frame("verified", "Native proxy authenticated"),
@@ -205,7 +211,10 @@ async fn run(
         let Some(Ok(Message::Text(text))) = stream.next().await else {
             return None;
         };
-        if !hub.proxy_current(&id).await {
+        if !authority
+            .current(&hub, BindingUse::CheckOwner(&params.room))
+            .await
+        {
             return None;
         }
         let proxy = ProxyBinding {
@@ -230,6 +239,11 @@ async fn run(
                 // Track before queueing the verdict; cleanup retires it even if
                 // admission to the bounded writer fails.
                 binding = Some(route.clone());
+                hub.inner
+                    .proxy_authorities
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id.clone(), authority.clone());
                 hub.track_host_route(route.clone());
                 if !hub
                     .local()

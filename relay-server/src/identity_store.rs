@@ -91,6 +91,22 @@ fn dedup_sessions(sessions: &[String]) -> Vec<String> {
     listed
 }
 
+#[derive(Clone, Copy)]
+pub enum BindingUse<'a> {
+    Resolve,
+    CheckOwner(&'a str),
+    UseByOwner(&'a str),
+}
+
+impl BindingUse<'_> {
+    fn accepts(self, owner: &str) -> bool {
+        match self {
+            Self::Resolve => true,
+            Self::CheckOwner(expected) | Self::UseByOwner(expected) => owner == expected,
+        }
+    }
+}
+
 /// Storage for Astation keys and session bindings.
 #[async_trait]
 pub trait IdentityStore: Send + Sync {
@@ -161,7 +177,18 @@ pub trait IdentityStore: Send + Sync {
 
     /// The owning Astation of a live binding. `None` if missing or expired.
     /// Refreshes `last_used_at` when it is at least an hour old.
-    async fn resolve(&self, session_id: &str, now: i64) -> Result<Option<String>, IdentityError>;
+    async fn resolve(&self, session_id: &str, now: i64) -> Result<Option<String>, IdentityError> {
+        self.lookup_binding(session_id, now, BindingUse::Resolve)
+            .await
+    }
+
+    /// Preflight is read-only. UseByOwner refreshes only that owner's live binding.
+    async fn lookup_binding(
+        &self,
+        session_id: &str,
+        now: i64,
+        usage: BindingUse<'_>,
+    ) -> Result<Option<String>, IdentityError>;
 }
 
 // ─────────────────────────── In-memory implementation ───────────────────────────
@@ -356,16 +383,21 @@ impl IdentityStore for InMemoryIdentityStore {
         Ok(out)
     }
 
-    async fn resolve(&self, session_id: &str, now: i64) -> Result<Option<String>, IdentityError> {
+    async fn lookup_binding(
+        &self,
+        session_id: &str,
+        now: i64,
+        usage: BindingUse<'_>,
+    ) -> Result<Option<String>, IdentityError> {
         let mut st = self.state.lock().await;
         let b = match st.bindings.get_mut(session_id) {
             None => return Ok(None),
             Some(b) => b,
         };
-        if is_expired(b.last_used_at, now) {
+        if !usage.accepts(&b.astation_id) || is_expired(b.last_used_at, now) {
             return Ok(None);
         }
-        if needs_touch(b.last_used_at, now) {
+        if !matches!(usage, BindingUse::CheckOwner(_)) && needs_touch(b.last_used_at, now) {
             b.last_used_at = now;
         }
         Ok(Some(b.astation_id.clone()))
@@ -617,7 +649,12 @@ impl IdentityStore for PgIdentityStore {
         Ok(out)
     }
 
-    async fn resolve(&self, session_id: &str, now: i64) -> Result<Option<String>, IdentityError> {
+    async fn lookup_binding(
+        &self,
+        session_id: &str,
+        now: i64,
+        usage: BindingUse<'_>,
+    ) -> Result<Option<String>, IdentityError> {
         let row: Option<(String, i64)> = sqlx::query_as(
             "SELECT astation_id, last_used_at FROM session_bindings WHERE session_id = $1",
         )
@@ -629,22 +666,37 @@ impl IdentityStore for PgIdentityStore {
             None => return Ok(None),
             Some(r) => r,
         };
-        if is_expired(last_used_at, now) {
+        if !usage.accepts(&astation_id) || is_expired(last_used_at, now) {
             return Ok(None);
         }
-        if needs_touch(last_used_at, now) {
+        if !matches!(usage, BindingUse::CheckOwner(_)) && needs_touch(last_used_at, now) {
             // Conditional on the owner and the old timestamp being unchanged, so
             // a concurrent unbind/rebind or a fresher touch is never overwritten.
-            sqlx::query(
+            let touched = sqlx::query(
                 "UPDATE session_bindings SET last_used_at = $3 \
-                 WHERE session_id = $1 AND astation_id = $2 AND last_used_at < $3",
+                 WHERE session_id = $1 AND astation_id = $2 AND last_used_at = $4",
             )
             .bind(session_id)
             .bind(&astation_id)
             .bind(now)
+            .bind(last_used_at)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;
+            if touched.rows_affected() == 0 {
+                // Another replica may have refreshed, removed or replaced this
+                // binding. Only a live row for the original owner still counts.
+                return sqlx::query_scalar(
+                    "SELECT astation_id FROM session_bindings
+                     WHERE session_id=$1 AND astation_id=$2 AND last_used_at>$3",
+                )
+                .bind(session_id)
+                .bind(&astation_id)
+                .bind(now.saturating_sub(BINDING_TTL_SECS))
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err);
+            }
         }
         Ok(Some(astation_id))
     }
@@ -950,6 +1002,21 @@ pub(crate) mod tests {
                 None
             );
         }
+
+        pub async fn only_authenticated_use_by_the_owner_extends_a_binding(s: &dyn IdentityStore) {
+            let used = T0 + DAY;
+            for (session, usage, matched, renewed) in [
+                ("preflight", BindingUse::CheckOwner(A), true, false),
+                ("other-room", BindingUse::UseByOwner(B), false, false),
+                ("admitted", BindingUse::UseByOwner(A), true, true),
+            ] {
+                s.bind(session, A, T0).await.unwrap();
+                let observed = s.lookup_binding(session, used, usage).await.unwrap();
+                assert_eq!(observed.as_deref(), matched.then_some(A));
+                let at_expiry = s.resolve(session, T0 + BINDING_TTL_SECS).await.unwrap();
+                assert_eq!(at_expiry.as_deref(), renewed.then_some(A));
+            }
+        }
     }
 
     macro_rules! mem_tests {
@@ -979,6 +1046,7 @@ pub(crate) mod tests {
         replace_all_empty_clears_own,
         sliding_expiry,
         resolve_touch_is_throttled,
+        only_authenticated_use_by_the_owner_extends_a_binding,
     );
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1058,6 +1126,38 @@ pub(crate) mod tests {
                     database.cleanup().await;
                 }
 
+                #[tokio::test]
+                #[ignore]
+                async fn refresh_racing_reassignment_refuses_the_old_proxy_owner() {
+                    let (database, store) = fresh_pg().await;
+                    store.bind("session", A, T0).await.unwrap();
+                    let replica = PgIdentityStore::new(database.reconnect(2).await);
+                    let mut tx = database.pool.begin().await.unwrap();
+                    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *tx).await.unwrap();
+                    sqlx::query("UPDATE session_bindings SET astation_id=$1 WHERE session_id='session'")
+                        .bind(B).execute(&mut *tx).await.unwrap();
+                    let task = tokio::spawn(async move {
+                        replica.lookup_binding("session", T0 + DAY, BindingUse::UseByOwner(A)).await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let waiting: bool = sqlx::query_scalar(
+                                "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))"
+                            ).bind(blocker).fetch_one(&database.pool).await.unwrap();
+                            if waiting { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("replica waiting to refresh the old owner's binding");
+                    tx.commit().await.unwrap();
+                    assert_eq!(task.await.unwrap().unwrap(), None);
+                    let row: (String, i64) = sqlx::query_as(
+                        "SELECT astation_id,last_used_at FROM session_bindings WHERE session_id='session'"
+                    ).fetch_one(&database.pool).await.unwrap();
+                    assert_eq!(row, (B.to_owned(), T0));
+                    database.cleanup().await;
+                }
+
                 /// Bindings and keys outlive the store instance (a relay restart).
                 #[tokio::test]
                 #[ignore]
@@ -1108,5 +1208,6 @@ pub(crate) mod tests {
         replace_all_empty_clears_own,
         sliding_expiry,
         resolve_touch_is_throttled,
+        only_authenticated_use_by_the_owner_extends_a_binding,
     );
 }

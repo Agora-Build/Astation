@@ -4198,7 +4198,7 @@ pub(crate) mod tests {
         async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, StoreError> {
             unreachable!()
         }
-        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, StoreError> {
+        async fn lookup_binding(&self, _: &str, _: i64, _: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, StoreError> {
             unreachable!()
         }
     }
@@ -5795,9 +5795,9 @@ pub(crate) mod tests {
             self.check()?;
             self.inner.replace_all(id, sessions, now).await
         }
-        async fn resolve(&self, s: &str, now: i64) -> Result<Option<String>, StoreError> {
+        async fn lookup_binding(&self, s: &str, now: i64, usage: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, StoreError> {
             self.check()?;
-            self.inner.resolve(s, now).await
+            self.inner.lookup_binding(s, now, usage).await
         }
     }
 

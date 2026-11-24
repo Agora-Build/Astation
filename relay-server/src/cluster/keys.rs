@@ -211,7 +211,7 @@ mod tests {
         async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
-        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+        async fn lookup_binding(&self, _: &str, _: i64, _: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
     }
@@ -334,7 +334,7 @@ mod tests {
         async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
             unreachable!()
         }
-        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+        async fn lookup_binding(&self, _: &str, _: i64, _: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, IdentityError> {
             unreachable!()
         }
     }
@@ -407,7 +407,7 @@ mod tests {
         async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
             unreachable!()
         }
-        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+        async fn lookup_binding(&self, _: &str, _: i64, _: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, IdentityError> {
             unreachable!()
         }
     }
@@ -542,7 +542,7 @@ mod tests {
             async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
                 unreachable!()
             }
-            async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+            async fn lookup_binding(&self, _: &str, _: i64, _: crate::identity_store::BindingUse<'_>) -> Result<Option<String>, IdentityError> {
                 unreachable!()
             }
         }
