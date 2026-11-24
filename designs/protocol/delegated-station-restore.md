@@ -786,6 +786,30 @@ ceiling for its exact key, even if another key registered for the same integrati
 has reserved a higher time. A missing checkpoint is reported as pending.
 Publication must recheck current authority.
 
+### Staging revocations and interrupts
+
+After reviewing `prepare`, run
+
+```sh
+station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>
+```
+
+Station locks the closed generation and account, rebuilds that exact review and
+assembles its known signed stops. It preserves each authorized original,
+including an old-feed service revoke and a feed-independent host interrupt.
+For a former manager it requires the reviewed replacement signature for that
+particular original. It checks the resulting stop effects with the shared Atem
+SDK at current membership. Stops are ordered by original record ID so replicas
+assemble the same component. A stale review, missing copy or unresolved
+authority prevents staging.
+
+The transaction saves the signed component under the plan ID. Its receipt gives
+the candidate feed ID, reconstruction hash, record count and records hash.
+After new evidence, repeat preparation and stage against the new hash. The live
+feed and its ACK ledger continue to refer to the old feed. The complete snapshot
+still requires participant and service evidence, current covers and holds,
+clock verification and atomic publication.
+
 ### Operator Steps
 
 1. Drain and stop every replica before restoring. Keep delegated serving,

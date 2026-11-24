@@ -13,6 +13,8 @@ mod portal_services;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
+#[path = "delegated_snapshot_stops.rs"]
+pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
 mod history;
 #[path = "delegated_native_recovery.rs"]
@@ -150,9 +152,10 @@ async fn review_evidence(
     binding: &Binding,
     report: &mut Value,
     operator_review: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<snapshot_stops::StopSources, sqlx::Error> {
     let signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
-    report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report, &signed).await?;
+    let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &signed).await?;
+    report["recovery_signatures"] = summary;
     let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
         "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
@@ -161,7 +164,7 @@ async fn review_evidence(
         reconstruction["author_confirmation_hash"] = confirmations.clone();
     }
     report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
-    Ok(())
+    Ok(snapshot_stops::StopSources { signed, copies })
 }
 
 async fn review_source_evidence(

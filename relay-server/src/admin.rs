@@ -8,6 +8,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin delegated-recovery status|fence\n\
+       station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
        station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file>\n\
@@ -151,7 +152,7 @@ async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std:
 
 async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{generation, inspect, inspect_root, Binding};
-    let (fence, root, file, native_plan) = match args {
+    let (fence, root, file, plan_or_hash) = match args {
         [command] if command == "status" => (false, None, None, None),
         [command] if command == "fence" => (true, None, None, None),
         [command, genesis]
@@ -159,6 +160,12 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
             (false, Some((command.as_str(), genesis)), None, None)
+        }
+        [command, genesis, review] if command == "stage-stops"
+            && crate::remote_api::recovery::delegated_recovery::canonical_genesis(genesis)
+            && crate::remote_api::recovery::delegated_recovery::canonical_genesis(review) =>
+        {
+            (false, Some((command.as_str(), genesis)), None, Some(review))
         }
         [command, genesis, plan] if command == "abandon"
             && crate::remote_api::recovery::delegated_recovery::canonical_genesis(genesis)
@@ -225,17 +232,21 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 }
             };
             if command == "compare-authors" {
-                author_roster::compare(&pool, &binding, genesis, native_plan.expect("validated plan"), &bytes).await
+                author_roster::compare(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &bytes).await
             } else if command == "retain-resigned" {
-                signatures::retain(&pool, &binding, genesis, native_plan.expect("validated plan"), &bytes).await
-            } else if let Some(plan) = native_plan {
+                signatures::retain(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &bytes).await
+            } else if let Some(plan) = plan_or_hash {
                 native::retain(&pool, &binding, genesis, plan, &bytes).await
             } else {
                 stops::retain(&pool, &binding, genesis, &bytes).await
             }
+        } else if command == "stage-stops" {
+            crate::remote_api::recovery::delegated_recovery::plan::snapshot_stops::stage(
+                &pool, &binding, genesis, plan_or_hash.expect("validated reconstruction hash"),
+            ).await
         } else if command == "abandon" {
             crate::remote_api::recovery::delegated_recovery::plan::outcome::abandon(&pool, &binding, genesis,
-                native_plan.expect("validated plan")).await
+                plan_or_hash.expect("validated plan")).await
         } else if command == "prepare" {
             let Ok(ceilings) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
                 eprintln!("invalid signing store configuration");
