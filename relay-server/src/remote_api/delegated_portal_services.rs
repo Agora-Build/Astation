@@ -26,7 +26,7 @@ pub(super) async fn observe(
     }
     let saved: Option<String> = sqlx::query_scalar(
         "SELECT checkpoint FROM station_integration_policy WHERE binding=$1 AND recovery_generation=$2
-         AND recovery_revision=(checkpoint::jsonb->>'revision')::numeric",
+         AND recovery_revision=(checkpoint::jsonb->>'revision')::numeric FOR SHARE NOWAIT",
     )
     .bind(portal.storage_key().map_err(|_| invalid())?)
     .bind(fence.generation)
@@ -38,7 +38,7 @@ pub(super) async fn observe(
     if policy.binding != *portal || policy.portal_snapshot_revision != Some(policy.revision) {
         return Err(invalid());
     }
-    let snapshot = policy.portal_snapshot.ok_or_else(invalid)?;
+    let snapshot = policy.portal_snapshot.as_ref().ok_or_else(invalid)?;
     snapshot.validate_for(portal).map_err(|_| invalid())?;
     if policy.denied {
         return Ok(json!({"status":"reporting_denied"}));
@@ -57,6 +57,11 @@ pub(super) async fn observe(
         return Err(invalid());
     }
 
+    let can_release = snapshot
+        .accounts
+        .as_ref()
+        .is_none_or(|accounts| accounts.enabled(owner))
+        && policy.allows_delegated_release(owner);
     let policy = |id: &str, key: &str| {
         id.strip_prefix("svc-")
             .and_then(|id| snapshot.integrations.get(id))
@@ -136,10 +141,6 @@ pub(super) async fn observe(
     }
     let mut attributed_keys: BTreeSet<_> = services.keys().chain(&managed_keys).cloned().collect();
     let stops = ServiceStops::from_review(review)?;
-    let can_release = snapshot
-        .accounts
-        .as_ref()
-        .is_none_or(|accounts| accounts.enabled(owner));
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
         let known = stops.get(id.as_str()).copied().unwrap_or_default();
@@ -201,14 +202,34 @@ pub(super) async fn observe(
             "portal_observation":observation(id,key)})
         })
         .collect();
-    Ok(
-        json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
+    let mut evidence = json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":genesis,
         "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
         "provisioning_without_fingerprint":pending,
-        "portal_keys_without_attribution":unattributed,"services":rows}),
-    )
+        "portal_keys_without_attribution":unattributed,"services":rows});
+    if let (Some(bindings), Some(accounts)) = (&snapshot.bindings, &snapshot.accounts) {
+        // A binding can advance without a feed event. Only commit this
+        // owner's record for the exact R9 account and genesis to the review.
+        let binding = bindings.iter().find(|row| {
+            row.account_id == log.account_id()
+                && row.genesis_hash == genesis
+                && row.account == *owner
+        });
+        evidence["owner_binding"] = binding.map_or_else(
+            || json!({"status":"unresolved"}),
+            |row| json!({"status":"observed","binding_id":row.binding_id,"version":row.version,"state":row.binding_state}),
+        );
+        evidence["owner_availability"] = if accounts.disabled.contains(owner) {
+            "disabled"
+        } else if accounts.enabled(owner) {
+            "enabled"
+        } else {
+            "unknown"
+        }
+        .into();
+    }
+    Ok(evidence)
 }
 
 #[derive(Clone, Copy, Default)]

@@ -775,6 +775,13 @@ the configured issuer's account owner, integration ID and signed service key.
 The projection carries the lifecycle state, interruption choice, expiry and any
 known revocation time. Missing or mismatched rows stay unresolved. The recovery
 plan commits to this observation separately from its native signer reports.
+For a built-in Station, the observation includes account availability and the
+binding ID, version and state for this owner's exact R9 account and genesis.
+A change to that binding changes the evidence hash even at the same feed cursor.
+An absent binding or a binding owned by another account is reported as unresolved.
+The review holds the policy row through its transaction and can be retried after a
+concurrent writer commits. This observation describes the checkpoint. Live room
+admission and closure require the separate ownership check.
 When the independent signing database is configured, the same account and genesis
 reservation rows also drive the Portal comparison. Keys missing from the restored
 list appear in `registrations_without_membership`. Each row carries the highest
