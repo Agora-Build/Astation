@@ -277,7 +277,11 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 &pool, &binding, genesis, ceilings.as_ref(), portal.as_ref(), vault.as_ref(),
             ).await
         } else {
-            inspect_root(&pool, &binding, genesis).await
+            let Ok(portal) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+                eprintln!("invalid Portal reporting configuration");
+                return 1;
+            };
+            inspect_root(&pool, &binding, genesis, portal.as_ref()).await
         };
         return match report {
             Ok(report) => {

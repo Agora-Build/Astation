@@ -297,6 +297,18 @@ signed bodies, recovery blobs, keys or report payloads. An absent root or an
 absent feed for this origin is reported as null; it is not created or borrowed
 from another Station.
 
+With built-in Station reporting configured, the same transaction includes
+`root.route_ownership` for the room migration. It checks each retained relay
+and native proxy proof against the stored list head and trust generation.
+The result identifies the carrier and host, whether the registered room owner
+matches the root's issuer-scoped identity, and the ownership source from the
+last observed Portal binding. An unbound or released list has no bound owner.
+For a never-bound list, a missing root identity or conflicting or unresolvable
+registration requires review. A stale proof supplies no ownership evidence.
+The report omits account subjects, room codes and connection identifiers.
+It can run offline from a database replica. Live room admission still needs
+current availability and binding invalidation.
+
 Every report says `retained_history_only: true`. It can inventory what survived
 the restore, but cannot establish missing later stops or unknown clock anchors.
 `recovery_ready` describes only the existing deployment fence. Neither a report
