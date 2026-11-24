@@ -1,6 +1,6 @@
 use super::super::super::delegated_recovery::{
     inspect,
-    plan::{prepare, signatures::retain, stops},
+    plan::{prepare, signatures::retain, snapshot_stops::stage, stops},
     Binding,
 };
 use super::recovery_plan::retained;
@@ -316,6 +316,8 @@ async fn postgres_delegated_recovery_refuses_copy_of_unauthenticated_original() 
         &json!({"plan_id":plan["plan_id"],"source_hash":plan["source_hash"],"records":[unsigned_change]})).unwrap()
     ).await.unwrap();
     assert_eq!(obligation(&review, changed.record_id())["requirement"], "authority_review");
+    assert!(stage(&database.pool, &binding, &genesis,
+        review["reconstruction_hash"].as_str().unwrap()).await.is_err());
     let prior = saved(&database.pool).await;
     let copy = fresh(&f, &review, &changed, 1000);
     assert!(submit(&database.pool, &binding, &genesis, &review, &input(&review, &changed, copy)).await.is_err());
@@ -602,6 +604,13 @@ async fn postgres_delegated_recovery_signatures_refuse_partial_batches_and_keep_
         .clone();
     assert!(host_copy["body"].get("feed_id").is_none());
     assert_eq!(host_copy["body"]["revoke_seq"], f.log.head().seq);
+    let staged = stage(&database.pool, &binding, &genesis,
+        accepted["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], 2);
+    let records: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops")
+        .fetch_one(&database.pool).await.unwrap();
+    assert!(records.as_array().unwrap().contains(&host.object().to_json()));
+    assert!(records.as_array().unwrap().contains(&source.object().to_json()));
     drop(store);
     database.cleanup().await;
 }
@@ -709,6 +718,8 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
         next_plan["recovery_signatures"]["observed_signing_lower_bounds"]["service:svc-test"],
         f.created + 1000
     );
+    assert!(stage(&database.pool, &next_binding, &genesis,
+        next_plan["reconstruction_hash"].as_str().unwrap()).await.is_err());
     let removed_copy = fresh(&f, &next_plan, &source, 1001);
     let before_refusal = saved(&database.pool).await;
     assert!(submit(
@@ -734,7 +745,7 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
         &next_binding,
         &genesis,
         &next_plan,
-        &input(&next_plan, &source, fresh_copy),
+        &input(&next_plan, &source, fresh_copy.clone()),
     )
     .await
     .unwrap();
@@ -756,7 +767,70 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
             .count(),
         1
     );
+    let staged = stage(&database.pool, &next_binding, &genesis,
+        result["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], 1);
+    let records: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops WHERE plan_id=$1")
+        .bind(next_plan["plan_id"].as_str().unwrap()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(records, json!([fresh_copy]));
     assert_eq!(result["recovery_ready"], false);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and_changed_review() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let review = plan["reconstruction_hash"].as_str().unwrap();
+    let before = saved(&database.pool).await;
+    let source = original(&before);
+    let second = database.reconnect(2).await;
+    let (first, retry) = tokio::join!(
+        stage(&database.pool, &binding, &genesis, review),
+        stage(&second, &binding, &genesis, review),
+    );
+    let receipt = first.unwrap();
+    assert_eq!(retry.unwrap(), receipt);
+    assert_eq!(receipt["stop_count"], 1);
+    assert_eq!(receipt["snapshot_complete"], false);
+    assert_eq!(receipt["recovery_ready"], false);
+    assert_eq!(saved(&database.pool).await, before);
+    let read = "SELECT records FROM station_delegated_snapshot_stops";
+    let staged: Value = sqlx::query_scalar(read).fetch_one(&second).await.unwrap();
+    assert_eq!(staged, json!([source.object().to_json()]));
+    // A fresh copy for a still-authorized signer leaves the exact original usable.
+    let updated = submit(&second, &binding, &genesis, &plan,
+        &input(&plan, &source, fresh(&f, &plan, &source, 1000))).await.unwrap();
+    let next = updated["reconstruction_hash"].as_str().unwrap();
+    assert_ne!(next, review);
+    assert!(stage(&database.pool, &binding, &genesis, review).await.is_err());
+
+    // No receipt or new component can escape a failed transaction commit.
+    sqlx::raw_sql("CREATE FUNCTION reject_staging() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected commit failure'; END; $$;
+        CREATE CONSTRAINT TRIGGER reject_staging AFTER UPDATE ON station_delegated_snapshot_stops
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_staging()")
+        .execute(&database.pool).await.unwrap();
+    assert!(stage(&database.pool, &binding, &genesis, next).await.is_err());
+    let retained: String = sqlx::query_scalar("SELECT reconstruction_hash FROM station_delegated_snapshot_stops")
+        .fetch_one(&second).await.unwrap();
+    assert_eq!(retained, review);
+    sqlx::query("DROP TRIGGER reject_staging ON station_delegated_snapshot_stops")
+        .execute(&second).await.unwrap();
+    assert_eq!(stage(&second, &binding, &genesis, next).await.unwrap()["records_hash"], receipt["records_hash"]);
+    assert_eq!(sqlx::query_scalar::<_,Value>(read).fetch_one(&second).await.unwrap(), staged);
+    // A contradictory existing row cannot be reported as an exact retry.
+    sqlx::query("UPDATE station_delegated_snapshot_stops SET records='[]'::jsonb")
+        .execute(&second).await.unwrap();
+    assert!(stage(&database.pool, &binding, &genesis, next).await.is_err());
+    assert!(!inspect(&second, ORIGIN).await.unwrap().unwrap().ready);
+    Binding::new(ORIGIN, 2).unwrap().initialize(&second, true).await.unwrap();
+    assert!(stage(&database.pool, &binding, &genesis, next).await.is_err());
+    second.close().await;
     drop(store);
     database.cleanup().await;
 }

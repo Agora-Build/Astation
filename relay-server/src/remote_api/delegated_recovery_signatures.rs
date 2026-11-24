@@ -310,7 +310,7 @@ pub(super) async fn inspection(
     binding: &Binding,
     report: &Value,
     signed: &BTreeMap<String, Value>,
-) -> Result<Value, sqlx::Error> {
+) -> Result<(Value, BTreeMap<String, ControlRecord>), sqlx::Error> {
     let (rows, lower_bounds) = load(connection, prepared, log, binding, signed, report).await?;
     let mut commitments = Vec::new();
     let mut summaries = Vec::new();
@@ -323,18 +323,20 @@ pub(super) async fn inspection(
             ControlCheck::Pending(reason) => format!("pending:{}", reason.code()),
             ControlCheck::Refused(reason) => reason.code().to_owned(),
         };
+        let principal = record.principal().name();
+        let issued_at = record.issued_at();
         let current_review =
             row.plan_id == prepared.plan_id && report["evidence_hash"] == row.evidence_hash;
         if current_review
             && verification == "valid"
             && current_copies
-                .insert(row.original_record_id.clone(), row.record_id.clone())
+                .insert(row.original_record_id.clone(), record)
                 .is_some()
         {
             return Err(invalid());
         }
         summaries.push(json!({"original_record_id":row.original_record_id,"record_id":row.record_id,
-            "principal":record.principal().name(),"issued_at":record.issued_at(),"verification":verification,
+            "principal":principal,"issued_at":issued_at,"verification":verification,
             "current_review":current_review,
             "source_evidence_hash":row.evidence_hash,"plan_id":row.plan_id}));
         commitments.push(json!({"plan_id":row.plan_id,"record_id":row.record_id,
@@ -348,7 +350,7 @@ pub(super) async fn inspection(
             continue;
         }
         let original = super::stops::review(&record, log, &binding.origin)?;
-        let copy = current_copies.get(record.record_id());
+        let copy = current_copies.get(record.record_id()).map(ControlRecord::record_id);
         let requirement = if copy.is_some() {
             "signed_copy_retained"
         } else {
@@ -359,10 +361,11 @@ pub(super) async fn inspection(
         obligations
             .push(json!({"original":original,"copy_record_id":copy,"requirement":requirement}));
     }
-    Ok(
+    Ok((
         json!({"records":summaries,"evidence_hash":source_hash(&json!(commitments))?,
         "known_native_obligations":obligations,
         "observed_signing_lower_bounds":lower_bounds,"signing_clock_complete":false,
         "snapshot_complete":false,"recovery_ready":false}),
-    )
+        current_copies,
+    ))
 }
