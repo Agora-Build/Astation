@@ -527,7 +527,7 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
         let binding = binding.clone();
         let genesis = genesis.clone();
         let id = review["plan_id"].as_str().unwrap().to_owned();
-        async move { plan::author_roster::compare(&pool, &binding, &genesis, &id, &bytes).await }
+        async move { plan::author_roster::compare(&pool, &binding, &genesis, &id, &[bytes]).await }
     };
     let result = comparison(roster.clone()).await.unwrap();
     assert_eq!(result["matching_current_reports"][0]["slot"], "astation-macos");
@@ -630,12 +630,29 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
         "selected":true,"review_head":f.log.head().to_json()})));
     let compare = async |roster: &Value| {
         plan::author_roster::compare(&resumed, &binding, &genesis, initial["plan_id"].as_str().unwrap(),
-            roster.to_string().as_bytes()).await
+            &[roster.to_string().into_bytes()]).await
     };
     let result = compare(&roster).await.unwrap();
     assert_eq!(result["matching_evidence_confirmations"].as_array().unwrap().len(), 2);
     assert_eq!(result["reviewed_without_current_confirmation"], json!([]));
     assert_eq!(result["complete_history"], false);
+
+    // Two managers can supply their lists separately for one locked review.
+    let mut phone = roster.clone();
+    phone["slots"] = json!([roster["slots"][0]]);
+    let mut manager = roster.clone();
+    manager["slots"] = json!([roster["slots"][1]]);
+    let compare_files = async |files: &[Value]| {
+        let inputs: Vec<_> = files.iter().map(|v| v.to_string().into_bytes()).collect();
+        plan::author_roster::compare(&resumed, &binding, &genesis, initial["plan_id"].as_str().unwrap(), &inputs).await
+    };
+    assert_eq!(compare_files(&[manager.clone(), phone.clone(), phone.clone()]).await.unwrap(), result);
+    let mut conflict = phone.clone();
+    conflict["slots"][0]["selected"] = json!(false);
+    assert!(compare_files(&[phone.clone(), conflict]).await.is_err());
+    let mut stale = manager.clone();
+    stale["evidence_hash"] = json!("0".repeat(64));
+    assert!(compare_files(&[phone.clone(), stale]).await.is_err());
 
     // A new revision represents new evidence. An old receipt cannot confirm it.
     // A fresh challenge is needed even if a previous one is still inside its lease.
@@ -644,6 +661,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), changed).await.0, StatusCode::OK);
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), initial_submission).await, original_receipt);
     assert!(compare(&roster).await.is_err());
+    assert!(compare_files(&[phone, manager]).await.is_err());
     let latest = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(&latest["evidence_hash"], hash);
     roster["evidence_hash"] = latest["evidence_hash"].clone();
