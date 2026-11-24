@@ -705,18 +705,23 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let member = "manager-a", active = { true }
         let coordinator = try h.coordinator(confirmProcessRoster: { true })
         _ = try await coordinator.setup()
+        XCTAssertEqual(try coordinator.memberProcessReviews(), [.init(member: member, status: .needsReview)])
         let review = try await coordinator.prepareProcessReview(member: member, current: active)
         let lines = ["desktop " + process, "offline AQEBAQEBAQEBAQEBAQEBAQ"]
         try await coordinator.acceptProcessReview(review, lines: lines, current: active)
         let restarted = try h.coordinator(confirmProcessRoster: { true })
         let log = try await restarted.hostSenderMembership()
         XCTAssertEqual(try restarted.reviewedProcessSlots(member: member, log: log).map(\.slot), ["desktop", "offline"])
+        XCTAssertEqual(try restarted.memberProcessReviews(), [.init(member: member, status: .reviewed(slots: 2))])
         XCTAssertFalse(restarted.hostSenderControlsAvailable)
         do { try await coordinator.acceptProcessReview(review, lines: lines, current: active); XCTFail("replayed review") } catch {}
         let foreign = try h.coordinator(relayURL: "https://another.example")
         XCTAssertThrowsError(try foreign.reviewedProcessSlots(member: member, log: log))
+        XCTAssertEqual(try foreign.memberProcessReviews(), [.init(member: member, status: .needsReview)])
         _ = try await addSecondManager(harness: h)
         let changed = try await restarted.hostSenderMembership()
+        XCTAssertEqual(try restarted.memberProcessReviews(), [.init(member: member, status: .previousRevision),
+            .init(member: "manager-b", status: .needsReview)])
         XCTAssertThrowsError(try restarted.reviewedProcessSlots(member: member, log: changed))
         XCTAssertThrowsError(try restarted.reviewedProcessSlots(member: member, log: log))
         let next = try await restarted.prepareProcessReview(member: member, current: active)

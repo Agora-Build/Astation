@@ -244,11 +244,30 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         pick.messageText = "Choose a verifier member"
         pick.informativeText = "Review the processes using this device or integration's signing key."
         let members = NSPopUpButton()
-        members.addItems(withTitles: verifierMembers)
-        members.selectItem(withTitle: coordinator.managerID)
+        do {
+            let reviews = try coordinator.memberProcessReviews()
+            var firstPending: Int?
+            for (index, review) in reviews.enumerated() {
+                let detail: String
+                switch review.status {
+                case .needsReview: detail = "Needs review"
+                case .previousRevision: detail = "Device list changed"
+                case .expiredService: detail = "Service expired"
+                case .reviewed(let slots): detail = slots == 1 ? "1 reviewed slot" : "\(slots) reviewed slots"
+                }
+                members.addItem(withTitle: review.member + " (" + detail + ")")
+                members.lastItem?.representedObject = review.member
+                if firstPending == nil && (review.status == .needsReview || review.status == .previousRevision) {
+                    firstPending = index
+                }
+            }
+            guard !reviews.isEmpty else { return }
+            members.selectItem(at: firstPending ?? reviews.firstIndex(where: { $0.member == coordinator.managerID }) ?? 0)
+        } catch { status.stringValue = error.localizedDescription; return }
         pick.accessoryView = members
         pick.addButton(withTitle: "Continue"); pick.addButton(withTitle: "Cancel")
-        guard pick.runModal() == .alertFirstButtonReturn, let member = members.titleOfSelectedItem, current() else { return }
+        guard pick.runModal() == .alertFirstButtonReturn,
+              let member = members.selectedItem?.representedObject as? String, current() else { return }
         let epoch = generation
         let active = { current() && NSApp.isActive && !Task.isCancelled }
         task = Task { [weak self] in
