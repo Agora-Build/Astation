@@ -1,5 +1,7 @@
 //! Manager authority established by the signed list, including prior managers.
+use atem_client::member_report::JournalSummary;
 use atem_client::membership::{Action, MemberStatus, Membership, RecoveryState, Role, RolesChange};
+use atem_client::Hash32;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -58,32 +60,58 @@ pub(super) struct JournalHistory {
     journals: BTreeMap<(String, [u8; 16]), JournalObservations>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrozenSets {
+    records: u64,
+    records_hash: Hash32,
+    drafts: u64,
+    drafts_hash: Hash32,
+}
+
 struct JournalObservations {
     first_since: u64,
     since_changed: bool,
     prior_revision: Option<u64>,
     current_revision: Option<u64>,
+    revisions: BTreeMap<u64, FrozenSets>,
+    generations: BTreeMap<i64, FrozenSets>,
+    revision_conflict: bool,
+    barrier_conflict: bool,
 }
 
 impl JournalHistory {
     pub(super) fn observe(
         &mut self,
         member: &str,
-        id: [u8; 16],
-        since: u64,
-        revision: u64,
+        journal: &JournalSummary,
+        generation: i64,
         current: bool,
     ) {
+        let revision = journal.revision;
+        let sets = FrozenSets {
+            records: journal.records,
+            records_hash: journal.records_hash,
+            drafts: journal.drafts,
+            drafts_hash: journal.drafts_hash,
+        };
         let row = self
             .journals
-            .entry((member.to_owned(), id))
+            .entry((member.to_owned(), journal.id))
             .or_insert(JournalObservations {
-                first_since: since,
+                first_since: journal.since,
                 since_changed: false,
                 prior_revision: None,
                 current_revision: None,
+                revisions: BTreeMap::new(),
+                generations: BTreeMap::new(),
+                revision_conflict: false,
+                barrier_conflict: false,
             });
-        row.since_changed |= since != row.first_since;
+        row.since_changed |= journal.since != row.first_since;
+        // Every accepted report remains evidence. A later matching report cannot
+        // erase a fork at one revision or changes to a plan's held inventory.
+        row.revision_conflict |= *row.revisions.entry(revision).or_insert(sets) != sets;
+        row.barrier_conflict |= *row.generations.entry(generation).or_insert(sets) != sets;
         let highest = if current {
             &mut row.current_revision
         } else {
@@ -96,6 +124,8 @@ impl JournalHistory {
         self.journals.into_iter().filter_map(|((member, id), row)| {
             let mut reasons = Vec::new();
             if row.since_changed { reasons.push("creation_sequence_changed"); }
+            if row.revision_conflict { reasons.push("conflicting_revision_contents"); }
+            if row.barrier_conflict { reasons.push("held_inventory_changed"); }
             if let Some(prior) = row.prior_revision {
                 match row.current_revision {
                     None => reasons.push("missing_current_report"),
@@ -114,16 +144,54 @@ impl JournalHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn summary(id: u8, since: u64, revision: u64) -> JournalSummary {
+        JournalSummary {
+            id: [id; 16],
+            since,
+            revision,
+            records: 0,
+            records_hash: Hash32::of(b"records"),
+            drafts: 0,
+            drafts_hash: Hash32::of(b"drafts"),
+        }
+    }
+
+    #[test]
+    fn later_confirmations_cannot_clear_contradictory_signed_inventory() {
+        let mut history = JournalHistory::default();
+        let frozen = summary(1, 1, 3);
+        let mut changed = frozen.clone();
+        changed.drafts_hash = Hash32::of(b"other drafts");
+        history.observe("member:a", &frozen, 1, false);
+        history.observe("member:a", &changed, 2, true);
+        history.observe("member:a", &frozen, 2, true);
+        changed.revision += 1;
+        history.observe("member:b", &frozen, 1, false);
+        history.observe("member:b", &changed, 2, true);
+        history.observe("member:c", &frozen, 1, false);
+        history.observe("member:c", &changed, 1, false);
+        history.observe("member:c", &changed, 2, true);
+        let gaps = history.gaps();
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0]["signer"], "member:a");
+        assert_eq!(
+            gaps[0]["reasons"],
+            json!(["conflicting_revision_contents", "held_inventory_changed"])
+        );
+        assert_eq!(gaps[1]["signer"], "member:c");
+        assert_eq!(gaps[1]["reasons"], json!(["held_inventory_changed"]));
+    }
+
     #[test]
     fn journal_gaps_preserve_prior_revisions_and_distinguish_members_and_replaced_journals() {
         let mut history = JournalHistory::default();
-        history.observe("member:a", [1; 16], 2, 11, false);
-        history.observe("member:a", [1; 16], 2, 8, false);
-        history.observe("member:a", [1; 16], 3, 10, true);
-        history.observe("member:a", [2; 16], 2, 12, true);
-        history.observe("member:b", [1; 16], 2, 0, false);
-        history.observe("member:c", [3; 16], 1, 6, false);
-        history.observe("member:c", [3; 16], 1, 6, true);
+        history.observe("member:a", &summary(1, 2, 11), 1, false);
+        history.observe("member:a", &summary(1, 2, 8), 1, false);
+        history.observe("member:a", &summary(1, 3, 10), 2, true);
+        history.observe("member:a", &summary(2, 2, 12), 2, true);
+        history.observe("member:b", &summary(1, 2, 0), 1, false);
+        history.observe("member:c", &summary(3, 1, 6), 1, false);
+        history.observe("member:c", &summary(3, 1, 6), 2, true);
         let gaps = history.gaps();
         assert_eq!(gaps.len(), 2);
         assert_eq!(

@@ -192,8 +192,7 @@ pub(super) async fn inspection(
                 add_record(&mut records, record.object().to_json(), stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
-                journals.observe(&verified.signer, verified.journal.id, verified.journal.since,
-                    verified.journal.revision, current_plan);
+                journals.observe(&verified.signer, &verified.journal, generation, current_plan);
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
