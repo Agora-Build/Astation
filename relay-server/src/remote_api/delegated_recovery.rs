@@ -6,6 +6,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 
+#[path = "route_ownership.rs"]
+mod route_ownership;
+
 #[path = "delegated_recovery_plan.rs"]
 pub(crate) mod plan;
 
@@ -142,9 +145,13 @@ pub(crate) async fn inspect_root(
     pool: &PgPool,
     binding: &Binding,
     genesis: &str,
+    portal: Option<&crate::integration_feed::FeedBinding>,
 ) -> Result<Value, sqlx::Error> {
     if !canonical_genesis(genesis) {
         return Err(sqlx::Error::Protocol("invalid genesis hash".into()));
+    }
+    if portal.is_some_and(|p| p.station_origin != binding.origin) {
+        return Err(sqlx::Error::Protocol("reporting origin differs from inspected Station".into()));
     }
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -159,13 +166,23 @@ pub(crate) async fn inspect_root(
     .bind(&binding.origin)
     .fetch_optional(&mut *tx)
     .await?;
-    let stored: Option<(Option<Value>,)> = sqlx::query_as(
-        "SELECT CASE WHEN octet_length(state::text) <= $2 THEN state END FROM remote_recovery_roots WHERE genesis_hash=$1")
+    let stored: Option<(String, Option<Value>)> = sqlx::query_as(
+        "SELECT account_subject, CASE WHEN octet_length(state::text) <= $2 THEN state END FROM remote_recovery_roots WHERE genesis_hash=$1")
         .bind(genesis).bind(MAX_STATE as i64).fetch_optional(&mut *tx).await?;
     let root = match stored {
         None => Value::Null,
-        Some((Some(value),)) => root_inspection(value, binding, genesis)?,
-        Some((None,)) => {
+        Some((owner, Some(value))) => {
+            let root: Root = serde_json::from_value(value).map_err(|_| invalid_root())?;
+            let hash = Hash32::from_hex(genesis).map_err(|_| invalid_root())?;
+            let log = Membership::from_stored(&root.account, &hash, &root.membership)
+                .map_err(|_| invalid_root())?;
+            let mut report = root_inspection(&root, binding, &log)?;
+            if let Some(source) = portal.filter(|p| crate::integration_checkpoint::PortalCheckpoint::built_in(p)) {
+                report["route_ownership"] = route_ownership::inspect(&mut tx, &root, &log, &owner, source).await?;
+            }
+            report
+        }
+        Some((_, None)) => {
             return Err(sqlx::Error::Protocol(
                 "recovery root exceeds inspection bound".into(),
             ))
@@ -184,18 +201,17 @@ pub(crate) async fn inspect_root(
     }))
 }
 
-fn root_inspection(value: Value, binding: &Binding, genesis: &str) -> Result<Value, sqlx::Error> {
-    let invalid = || sqlx::Error::Protocol("retained recovery state could not be inspected".into());
-    let root: Root = serde_json::from_value(value).map_err(|_| invalid())?;
-    let hash = Hash32::from_hex(genesis).map_err(|_| invalid())?;
-    let log =
-        Membership::from_stored(&root.account, &hash, &root.membership).map_err(|_| invalid())?;
+fn invalid_root() -> sqlx::Error {
+    sqlx::Error::Protocol("retained recovery state could not be inspected".into())
+}
+
+fn root_inspection(root: &Root, binding: &Binding, log: &Membership) -> Result<Value, sqlx::Error> {
     let feed = root
         .delegated
         .get(&binding.origin)
         .map(|feed| {
-            feed.recovery_inspection(&binding.origin, &log)
-                .map_err(|_| invalid())
+            feed.recovery_inspection(&binding.origin, log)
+                .map_err(|_| invalid_root())
         })
         .transpose()?;
     Ok(json!({

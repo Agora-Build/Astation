@@ -441,12 +441,17 @@ impl PolicyStore {
         Ok(result.rows_affected() == 1)
     }
     pub async fn load(&self, binding: &FeedBinding) -> Result<PolicyCheckpoint, ()> {
+        let mut connection = self.0.acquire().await.map_err(|_| ())?;
+        Self::load_in(&mut connection, binding).await
+    }
+
+    pub(crate) async fn load_in(connection: &mut sqlx::PgConnection, binding: &FeedBinding) -> Result<PolicyCheckpoint, ()> {
         let key = binding.storage_key()?;
         let saved: Option<String> = sqlx::query_scalar(
             "SELECT checkpoint FROM station_integration_policy WHERE binding=$1",
         )
         .bind(key)
-        .fetch_optional(&self.0)
+        .fetch_optional(connection)
         .await
         .map_err(|_| ())?;
         match saved {
