@@ -304,7 +304,12 @@ The result identifies the carrier and host, whether the registered room owner
 matches the root's issuer-scoped identity, and the ownership source from the
 last observed Portal binding. An unbound or released list has no bound owner.
 For a never-bound list, a missing root identity or conflicting or unresolvable
-registration requires review. A stale proof supplies no ownership evidence.
+registration requires review. For a Station-issued session room, inspection
+also resolves its seven-day binding to a registered Astation under the same
+issuer. The bound Astation and any registration under the literal room name
+must agree with the candidate owner. A missing, expired or unmapped session
+binding leaves the owner unresolved. Inspection never refreshes its expiry.
+A stale proof supplies no ownership evidence.
 The report omits account subjects, room codes and connection identifiers.
 It can run offline from a database replica. Live room admission still needs
 current availability and binding invalidation.

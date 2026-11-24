@@ -1,5 +1,7 @@
 //! Inspect the durable sources for built-in Station room migration.
 use super::{invalid_root, Membership, Root};
+use crate::auth::session_id_for_room;
+use crate::identity_store::BINDING_TTL_SECS;
 use crate::integration_checkpoint::account_id;
 use crate::integration_feed::{FeedBinding, PolicyStore};
 use serde_json::{json, Value};
@@ -57,6 +59,28 @@ pub(super) async fn inspect(
         }
     }
 
+    let session_ids: Vec<_> = rooms
+        .iter()
+        .filter_map(|room| session_id_for_room(room))
+        .collect();
+    // The normal session resolver touches last_used_at. Inspect the binding
+    // at the snapshot's timestamp without extending its lifetime.
+    let sessions: BTreeMap<_, _> = sqlx::query_as::<_, (String, bool, Option<String>)>(
+        "SELECT s.session_id,
+           s.last_used_at > floor(extract(epoch FROM transaction_timestamp()))::bigint - $3 AS current,
+           i.subject FROM session_bindings s
+         LEFT JOIN astation_accounts a ON a.astation_id=s.astation_id
+         LEFT JOIN account_identities i ON i.principal=a.agora_user AND i.issuer=$1
+         WHERE s.session_id=ANY($2)",
+    )
+    .bind(&portal.issuer)
+    .bind(session_ids)
+    .bind(BINDING_TTL_SECS)
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .map(|(id, current, subject)| (id, (current, subject)))
+    .collect();
     let registrations: BTreeMap<String, Option<String>> = sqlx::query_as(
         "SELECT a.astation_id,i.subject FROM astation_accounts a LEFT JOIN account_identities i
          ON i.principal=a.agora_user AND i.issuer=$1 WHERE a.astation_id=ANY($2)",
@@ -85,18 +109,37 @@ pub(super) async fn inspect(
             },
             Some(_) => "unresolved",
         };
-        let source = match binding_state {
-            "bound" => "portal_binding",
-            "released" | "unbound" => "no_bound_owner",
+        let (mut source, candidate) = match binding_state {
+            "bound" => ("portal_binding", binding.map(|b| b.account.as_str())),
+            "released" | "unbound" => ("no_bound_owner", None),
             "no_binding_in_checkpoint"
                 if owner.is_some() && matches!(room_owner, "matches_root" | "unregistered") =>
             {
-                "recovery_root"
+                ("recovery_root", owner)
             }
-            _ => "unresolved",
+            _ => ("unresolved", None),
         };
-        hosts.push(json!({"host_id":host,"carrier":carrier,"proof":"verified",
-            "registered_room_owner":room_owner,"owner_source":source}));
+        let mut row = json!({"host_id":host,"carrier":carrier,"proof":"verified",
+            "registered_room_owner":room_owner});
+        if let Some(id) = session_id_for_room(&route.room) {
+            let (status, session_owner) = match sessions.get(id) {
+                None => ("missing", None),
+                Some((false, _)) => ("expired", None),
+                Some((true, Some(s))) if account_id(s) => ("current", Some(s.as_str())),
+                Some((true, _)) => ("unresolved", None),
+            };
+            row["session_binding"] = json!(status);
+            if let Some(candidate) = candidate {
+                let direct = registrations.get(&route.room);
+                if session_owner != Some(candidate)
+                    || direct.is_some_and(|s| s.as_deref() != Some(candidate))
+                {
+                    source = "unresolved";
+                }
+            }
+        }
+        row["owner_source"] = json!(source);
+        hosts.push(row);
     }
     Ok(
         json!({"root_owner_mapped":owner.is_some(),"last_observed_binding":binding_state,

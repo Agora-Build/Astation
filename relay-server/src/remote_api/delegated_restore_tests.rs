@@ -458,12 +458,21 @@ async fn postgres_delegated_recovery_failed_fence_commit_cannot_start_the_new_ge
     database.cleanup().await;
 }
 
+fn inspection_portal() -> crate::integration_feed::FeedBinding {
+    crate::integration_feed::FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: ORIGIN.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_inspection_resolves_proved_route_owners_across_replicas() {
     use crate::cluster::ConnRef;
     use crate::integration_checkpoint::PortalCheckpoint;
-    use crate::integration_feed::{FeedBinding, PolicyStore};
+    use crate::integration_feed::PolicyStore;
     use crate::remote_api::recovery::ProxyBinding;
     use atem_client::host_route::{
         host_route_message, sign_host_route_as, HostRouteBody, RouteKind,
@@ -475,12 +484,7 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
     f.publish(&store).await;
     let genesis = f.log.genesis_hash().to_hex();
     let origin = Binding::new(ORIGIN, 1).unwrap();
-    let portal = FeedBinding {
-        issuer: "https://auth.example".into(),
-        portal_origin: "https://portal.example".into(),
-        station_origin: ORIGIN.into(),
-        report_client_id: "s-01234567890123456789012345".into(),
-    };
+    let portal = inspection_portal();
     let alice = "ab00000000000000000000000001";
     let bob = "ab00000000000000000000000002";
     sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice'),($1,$3,'bob'),('https://other.example',$2,'legacy-user')")
@@ -599,6 +603,125 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
         report["root"]["route_ownership"]["retained_routes"][1]["proof"],
         "verified"
     );
+
+    replica.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_inspection_resolves_session_rooms_without_extending_bindings() {
+    use crate::cluster::ConnRef;
+    use crate::identity_store::{
+        IdentityStore, PgIdentityStore, BINDING_TOUCH_INTERVAL_SECS, BINDING_TTL_SECS,
+    };
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::integration_feed::PolicyStore;
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = RecoveryStore::postgres(database.pool.clone());
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let origin = Binding::new(ORIGIN, 1).unwrap();
+    let portal = inspection_portal();
+    let alice = "ab00000000000000000000000001";
+    let bob = "ab00000000000000000000000002";
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice'),($1,$3,'bob')")
+        .bind(&portal.issuer).bind(alice).bind(bob).execute(&database.pool).await.unwrap();
+
+    let session = crate::auth::create_session("bootstrap-host");
+    let room = format!("session-{}", session.id);
+    let challenge = HostChallenge::new(&room);
+    let relay_proof = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a");
+    store
+        .admit_host(
+            &relay_proof.to_string(),
+            challenge.nonce,
+            &room,
+            "host-a",
+            ConnRef::new("bootstrap-relay", "other-replica"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let replica = database.reconnect(2).await;
+    let session_route = || async {
+        inspect_root(&replica, &origin, &genesis, Some(&portal))
+            .await
+            .unwrap()["root"]["route_ownership"]["retained_routes"][0]
+            .clone()
+    };
+    let policies = PolicyStore(database.pool.clone());
+    let initial = policies.load(&portal).await.unwrap();
+    let mut body = json!({"cursor":0,"changes":[],"checkpoint":{"at":"2026-11-24T10:00:00.000Z",
+        "accounts":{"complete":true,"disabled":[]},"bindings":[],"integrations":[]}});
+    let exact = |body: &Value| {
+        PortalCheckpoint::parse(&serde_json::to_vec(body).unwrap(), &portal).unwrap()
+    };
+    let unbound = initial.apply_checkpoint(exact(&body), 1).unwrap();
+    policies.commit(&initial, &unbound).await.unwrap();
+    let missing = session_route().await;
+    assert_eq!(missing["owner_source"], "unresolved");
+    assert_eq!(missing["session_binding"], "missing");
+
+    let identity = PgIdentityStore::new(database.pool.clone());
+    let now = chrono::Utc::now().timestamp();
+    let last_used = now - BINDING_TOUCH_INTERVAL_SECS - 30;
+    identity
+        .bind(&session.id, "phone", last_used)
+        .await
+        .unwrap();
+    let unmapped = session_route().await;
+    assert_eq!(unmapped["owner_source"], "unresolved");
+    assert_eq!(unmapped["session_binding"], "unresolved");
+    sqlx::query("INSERT INTO astation_accounts VALUES ('phone','alice','test','group',0,0)")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(session_route().await["owner_source"], "recovery_root");
+
+    body["checkpoint"]["bindings"] = json!([{"account":bob,"accountId":f.log.account_id(),
+        "genesisHash":genesis,"bindingId":"binding","version":1,"bindingState":"bound"}]);
+    let next = unbound.apply_checkpoint(exact(&body), 1).unwrap();
+    policies.commit(&unbound, &next).await.unwrap();
+    assert_eq!(session_route().await["owner_source"], "unresolved");
+
+    sqlx::query("UPDATE astation_accounts SET agora_user='bob' WHERE astation_id='phone'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for (timestamp, binding_status, source) in [
+        (now - BINDING_TTL_SECS, "expired", "unresolved"),
+        (last_used, "current", "portal_binding"),
+    ] {
+        identity
+            .bind(&session.id, "phone", timestamp)
+            .await
+            .unwrap();
+        let row = session_route().await;
+        assert_eq!(row["session_binding"], binding_status);
+        assert_eq!(row["owner_source"], source);
+        let retained: i64 =
+            sqlx::query_scalar("SELECT last_used_at FROM session_bindings WHERE session_id=$1")
+                .bind(&session.id)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(retained, timestamp);
+        assert!(!row.to_string().contains(&session.id));
+    }
+    // A literal room registration cannot supersede the bound session owner.
+    sqlx::query("INSERT INTO astation_accounts VALUES ($1,'alice','test','group',0,0)")
+        .bind(&room)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(session_route().await["owner_source"], "unresolved");
+    identity.unbind(&session.id, "phone").await.unwrap();
+    let missing = session_route().await;
+    assert_eq!(missing["session_binding"], "missing");
+    assert_eq!(missing["owner_source"], "unresolved");
     replica.close().await;
     database.cleanup().await;
 }

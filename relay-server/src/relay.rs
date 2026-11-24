@@ -1418,7 +1418,7 @@ pub async fn ws_handler(
         match session {
             Some(s) if s.status == crate::auth::SessionStatus::Granted => {
                 // Valid session - use session_id as room code, role defaults to "atem"
-                let code = format!("session-{}", session_id);
+                let code = format!("{}{session_id}", crate::auth::SESSION_ROOM_PREFIX);
                 let role = params.role.clone().unwrap_or_else(|| "atem".to_string());
                 if let Err(error) = hub.ensure_room(&code, &s.hostname, now).await {
                     return ws_unavailable(&error);

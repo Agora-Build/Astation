@@ -27,6 +27,16 @@ pub struct Session {
     pub astation_id: Option<String>,
 }
 
+pub(crate) const SESSION_ROOM_PREFIX: &str = "session-";
+
+/// Match rooms created for a Station-issued session. Identity room names are
+/// otherwise opaque and can also start with "session-".
+pub(crate) fn session_id_for_room(room: &str) -> Option<&str> {
+    let id = room.strip_prefix(SESSION_ROOM_PREFIX)?;
+    let uuid = Uuid::parse_str(id).ok()?;
+    (uuid.get_version_num() == 4 && uuid.to_string() == id).then_some(id)
+}
+
 /// Generate an 8-digit numeric OTP.
 pub fn generate_otp() -> String {
     let mut rng = rand::thread_rng();
