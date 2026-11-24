@@ -653,6 +653,7 @@ impl super::RecoveryStore {
         context: &crate::service_keys::ServiceKeyContext,
         signer: &crate::service_keys::ServiceSigner,
         desired: ServiceDesired,
+        checkpoint: &crate::integration_feed::PolicyCheckpoint,
     ) -> Result<bool, ()> {
         use atem_client::{KeyId, KeyProvider};
         let origin = self.delegated_origin.get().ok_or(())?;
@@ -671,6 +672,11 @@ impl super::RecoveryStore {
         let clock = super::now();
         log.advance(&clock);
         if log.frozen().is_some() {
+            return Err(());
+        }
+        if desired == ServiceDesired::Active
+            && !checkpoint.allows_list_release(&context.owner, log.account_id(), &context.genesis)
+        {
             return Err(());
         }
         ensure(&mut root, origin, &log).map_err(|_| ())?;

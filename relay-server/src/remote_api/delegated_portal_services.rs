@@ -57,11 +57,12 @@ pub(super) async fn observe(
         return Err(invalid());
     }
 
+    let genesis = log.genesis_hash().to_hex();
     let can_release = snapshot
         .accounts
         .as_ref()
         .is_none_or(|accounts| accounts.enabled(owner))
-        && policy.allows_delegated_release(owner);
+        && policy.allows_list_release(owner, log.account_id(), &genesis);
     let policy = |id: &str, key: &str| {
         id.strip_prefix("svc-")
             .and_then(|id| snapshot.integrations.get(id))
@@ -103,7 +104,6 @@ pub(super) async fn observe(
         .filter(|(_, row)| row.policy.owner_account == *owner)
         .filter_map(|(id, row)| Some((format!("svc-{id}"), row.policy.r9_svc.clone()?)))
         .collect();
-    let genesis = log.genesis_hash().to_hex();
     // A key may have been provisioned before either membership or Portal
     // learned its fingerprint. Enumerate this list independently of both.
     let scope = json!({"issuer":portal.issuer,"station_origin":fence.origin,"owner":owner,"genesis":genesis});
