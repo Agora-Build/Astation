@@ -124,6 +124,15 @@ impl Test {
 #[tokio::test]
 async fn native_proxy_requires_current_account_pairing_and_registered_native_key() {
     let t = Test::new().await;
+    // Opening the socket only starts the native key challenge. Until the host
+    // is admitted it cannot extend the pairing's lifetime.
+    let now = chrono::Utc::now().timestamp();
+    let last_used = now - crate::identity_store::BINDING_TOUCH_INTERVAL_SECS - 60;
+    t.state
+        .identity
+        .bind("paired-session", "phone", last_used)
+        .await
+        .unwrap();
     for request in [
         t.request(None, "paired-session"),
         t.request(Some("mallory"), "paired-session"),
@@ -153,20 +162,34 @@ async fn native_proxy_requires_current_account_pairing_and_registered_native_key
         .lock()
         .unwrap()
         .is_empty());
+    let expires = last_used + crate::identity_store::BINDING_TTL_SECS;
+    assert_eq!(
+        t.state
+            .identity
+            .resolve("paired-session", expires)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
 async fn proxy_proof_kind_is_mandatory_and_does_not_create_a_relay_route() {
     let t = Test::new().await;
+    let last_used = chrono::Utc::now().timestamp() - crate::identity_store::BINDING_TOUCH_INTERVAL_SECS - 60;
+    let expires = last_used + crate::identity_store::BINDING_TTL_SECS;
+    t.state.identity.bind("paired-session", "phone", last_used).await.unwrap();
     let mut wrong = t.proxy(RouteKind::Relay).await;
     assert_eq!(
         next_client_json(&mut wrong).await["op"],
         "host_route_refused"
     );
     assert!(t.state.relay.inner.host_routes.lock().unwrap().is_empty());
+    assert_eq!(t.state.identity.resolve("paired-session", expires).await.unwrap(), None);
     let mut proxy = t.proxy(RouteKind::Proxy).await;
     assert_eq!(next_client_json(&mut proxy).await["op"], "host_route_ok");
     assert_eq!(next_client_json(&mut proxy).await["op"], "heads");
+    assert_eq!(t.state.identity.resolve("paired-session", expires).await.unwrap().as_deref(), Some("phone"));
     assert!(t
         .state
         .relay
