@@ -827,7 +827,14 @@ genesis. A provisioned key can predate both native enrollment and Portal's
 receipt of its fingerprint. It appears in `provisioned_without_membership`
 even if neither source mentions it. An interrupted provisioning operation
 without a saved fingerprint appears in `provisioning_without_fingerprint`.
-These entries require reconciliation before publication. If the Portal alone identifies a
+When the operator configures the Station service wrapping key, `protected_service_keys`
+reports the public fingerprint derived from each authenticated envelope. A key saved
+before the provisioning fingerprint is `pending`. An established fingerprint can
+be `matched` or `mismatch`. An absent envelope is `missing`, and one the Station
+cannot authenticate is `unreadable`. Preparing a review leaves the provisioning
+record and enrollment as they were. The protected-key observation is omitted when
+the wrapping key is unconfigured. These entries require reconciliation before
+publication. If the Portal alone identifies a
 key for this Agora.Build owner, `portal_keys_without_attribution` preserves its
 lifecycle observation. The owner can have several R9 lists, so this evidence
 requires reconciliation before the Station can attribute the key to this list.

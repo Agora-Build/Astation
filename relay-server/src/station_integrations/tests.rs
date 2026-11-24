@@ -565,7 +565,7 @@ async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_close
     runtime.policies.commit(&old,&unbound).await.unwrap();
     let fence = Binding::new(origin, 2).unwrap();
     fence.initialize(&db.pool, true).await.unwrap();
-    let review = |fence| plan::prepare_with_sources(&db.pool, fence, &genesis, None, Some(&runtime.binding));
+    let review = |fence| plan::prepare_with_sources(&db.pool, fence, &genesis, None, Some(&runtime.binding), Some(&runtime.vault));
     let before = review(&fence).await.unwrap();
     assert_eq!(before["portal_service_evidence"]["status"], "awaiting_checkpoint");
     let bound = unbound.apply_checkpoint(snapshot.clone(), old.received_at).unwrap();
@@ -622,7 +622,7 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
     let fence = Binding::new(origin,2).unwrap();
     fence.initialize(&db.pool,true).await.unwrap();
     let replica = db.reconnect(2).await;
-    let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding));
+    let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding), Some(&runtime.vault));
     for (state, expected) in [
         ("paused",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
         ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
@@ -687,7 +687,7 @@ async fn postgres_delegated_recovery_commits_to_this_lists_owner_binding() {
     fence.initialize(&db.pool, true).await.unwrap();
     let replica = db.reconnect(2).await;
     let review =
-        || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding));
+        || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding), Some(&runtime.vault));
 
     let mut old = runtime.policies.load(&runtime.binding).await.unwrap();
     let mut previous_hash = Value::Null;
@@ -849,8 +849,16 @@ async fn postgres_delegated_recovery_inventories_provisioning_before_enrollment(
             .execute(&db.pool).await.unwrap();
     }
     let replica = db.reconnect(2).await;
-    let review =
-        || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding));
+    let review = || {
+        plan::prepare_with_sources(
+            &replica,
+            &fence,
+            &genesis,
+            None,
+            Some(&runtime.binding),
+            Some(&runtime.vault),
+        )
+    };
     let prepared = review().await.unwrap();
     let evidence = &prepared["portal_service_evidence"];
     assert_eq!(
@@ -870,6 +878,154 @@ async fn postgres_delegated_recovery_inventories_provisioning_before_enrollment(
         review().await.unwrap()["portal_service_evidence_hash"],
         prepared["portal_service_evidence_hash"]
     );
+    let protected = &evidence["protected_service_keys"];
+    assert_eq!(protected.as_array().unwrap().len(), 2);
+    assert_eq!(protected[0]["status"], "matched");
+    assert_eq!(protected[0]["key_fingerprint"], draft["fingerprint"]);
+    assert_eq!(protected[1]["status"], "missing");
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT context FROM station_integration_provisioning WHERE binding=$1 AND integration_id=$2",
+    ).bind(&binding).bind(ID).fetch_one(&db.pool).await.unwrap();
+    let context: ServiceKeyContext = serde_json::from_str(&stored).unwrap();
+    let (key_context, sealed): (String, String) =
+        sqlx::query_as("SELECT context,sealed FROM station_service_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+    // Restore between the durable envelope write and fingerprint write.
+    sqlx::query("UPDATE station_integration_provisioning SET fingerprint=NULL WHERE binding=$1 AND integration_id=$2")
+        .bind(&binding).bind(ID).execute(&db.pool).await.unwrap();
+    let interrupted = review().await.unwrap();
+    let evidence = &interrupted["portal_service_evidence"];
+    assert_eq!(
+        evidence["protected_service_keys"][0],
+        json!({
+            "service_id":context.service_id, "status":"pending", "provisioning_fingerprint":null,
+            "key_fingerprint":draft["fingerprint"], "portal_observation":{"status":"unresolved"}
+        })
+    );
+    assert_eq!(
+        evidence["provisioning_without_fingerprint"],
+        json!([context.service_id, format!("svc-{pending}")])
+    );
+    assert_eq!(evidence["provisioned_without_membership"], json!([]));
+    assert_eq!(evidence["services"], json!([]));
+    assert_eq!(interrupted["recovery_ready"], false);
+    let repeat = plan::prepare_with_sources(
+        &db.pool,
+        &fence,
+        &genesis,
+        None,
+        Some(&runtime.binding),
+        Some(&runtime.vault),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        interrupted["portal_service_evidence_hash"],
+        repeat["portal_service_evidence_hash"]
+    );
+    let unchanged: (Option<String>, String) = sqlx::query_as(
+        "SELECT fingerprint,sealed FROM station_integration_provisioning,station_service_keys
+         WHERE binding=$1 AND integration_id=$2 AND station_service_keys.context=$3",
+    )
+    .bind(&binding)
+    .bind(ID)
+    .bind(&key_context)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, (None, sealed.clone()));
+
+    let without_vault = plan::prepare_with_sources(
+        &db.pool,
+        &fence,
+        &genesis,
+        None,
+        Some(&runtime.binding),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(without_vault["portal_service_evidence"]
+        .get("protected_service_keys")
+        .is_none());
+    assert_eq!(
+        without_vault["portal_service_evidence"]["provisioning_without_fingerprint"],
+        evidence["provisioning_without_fingerprint"]
+    );
+    let other_vault = ServiceKeyVault::new(&[41; 32], "operator-test").unwrap();
+    let wrong_vault = plan::prepare_with_sources(
+        &db.pool,
+        &fence,
+        &genesis,
+        None,
+        Some(&runtime.binding),
+        Some(&other_vault),
+    )
+    .await
+    .unwrap();
+    let unreadable = json!({"service_id":context.service_id, "status":"unreadable", "provisioning_fingerprint":null});
+    assert_eq!(
+        wrong_vault["portal_service_evidence"]["protected_service_keys"][0],
+        unreadable
+    );
+    let mut other = context.clone();
+    other.owner = "ab00000000000000000000000001".into();
+    let foreign = serde_json::to_string(&runtime.vault.generate(&other).unwrap()).unwrap();
+    for material in [foreign.as_str(), "corrupt"] {
+        sqlx::query("UPDATE station_service_keys SET sealed=$1 WHERE context=$2")
+            .bind(material)
+            .bind(&key_context)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            review().await.unwrap()["portal_service_evidence"]["protected_service_keys"][0],
+            unreadable
+        );
+    }
+    sqlx::query("UPDATE station_service_keys SET sealed=$1 WHERE context=$2")
+        .bind(&sealed)
+        .bind(&key_context)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let unrelated = "a".repeat(64);
+    sqlx::query("UPDATE station_integration_provisioning SET fingerprint=$1 WHERE binding=$2 AND integration_id=$3")
+        .bind(&unrelated).bind(&binding).bind(ID).execute(&db.pool).await.unwrap();
+    let mismatch = review().await.unwrap();
+    let row = &mismatch["portal_service_evidence"]["protected_service_keys"][0];
+    assert_eq!(row["status"], "mismatch");
+    assert_eq!(row["provisioning_fingerprint"], unrelated);
+    assert_eq!(row["key_fingerprint"], draft["fingerprint"]);
+    assert_eq!(mismatch["recovery_ready"], false);
+    sqlx::query("DELETE FROM station_service_keys WHERE context=$1")
+        .bind(&key_context)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let missing = review().await.unwrap();
+    assert_eq!(
+        missing["portal_service_evidence"]["protected_service_keys"][0],
+        json!({"service_id":context.service_id,"status":"missing","provisioning_fingerprint":unrelated})
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_service_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT ready FROM station_delegated_recovery WHERE origin=$1"
+    )
+    .bind(origin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap());
     replica.close().await;
     drop(runtime);
     db.cleanup().await;

@@ -13,6 +13,8 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+pub(crate) const SERVICE_KEY_CONTEXT: &str = "station-service-key-v1";
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ServiceKeyContext {
     pub issuer: String,
@@ -48,7 +50,7 @@ impl ServiceKeyContext {
         {
             return Err(());
         }
-        serde_json::to_vec(&("station-service-key-v1", self)).map_err(|_| ())
+        serde_json::to_vec(&(SERVICE_KEY_CONTEXT, self)).map_err(|_| ())
     }
 }
 
@@ -80,6 +82,17 @@ impl ServiceKeyVault {
             ),
             wrapping_key_id: wrapping_key_id.into(),
         })
+    }
+
+    /// Authenticate restored material in its original provisioning context.
+    pub(crate) fn retained_fingerprint(
+        &self,
+        context: &ServiceKeyContext,
+        encoded: &str,
+    ) -> Result<String, ()> {
+        let sealed = serde_json::from_str(encoded).map_err(|_| ())?;
+        let signer = self.open(context, &sealed)?;
+        atem_client::membership::service_key_fingerprint(&signer.public).map_err(|_| ())
     }
 
     pub fn generate(&self, context: &ServiceKeyContext) -> Result<SealedServiceKey, ()> {

@@ -115,7 +115,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
     assert!(feed(&runtime, &genesis).await.is_empty());
     let fence = Binding::new(origin, 2).unwrap();
     fence.initialize(&primary.pool, true).await.unwrap();
-    let review = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
+    let review = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -173,7 +173,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .execute(&external.pool)
         .await
         .unwrap();
-    let missing = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
+    let missing = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -211,7 +211,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .await
         .is_err());
     assert!(
-        plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
+        plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None, None)
             .await
             .is_err()
     );
@@ -285,7 +285,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         &fence,
         &genesis,
         recovery.signing_ceilings.get(),
-        None,
+        None, None,
     )
     .await
     .unwrap();
@@ -316,7 +316,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         )
         .await
         .unwrap();
-    let wrong_key = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(store), None)
+    let wrong_key = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(store), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -334,7 +334,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     let later = Binding::new(origin, 3).unwrap();
     later.initialize(&primary.pool, true).await.unwrap();
     let replica = primary.reconnect(2).await;
-    let historical = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None)
+    let historical = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -347,7 +347,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         .execute(&external.pool)
         .await
         .unwrap();
-    let missing = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None)
+    let missing = plan::prepare_with_sources(&replica, &later, &genesis, Some(store), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -362,7 +362,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     let snapshot = crate::integration_checkpoint::PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
     let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
     runtime.policies.commit_for_recovery(&previous,&next,Some(&later)).await.unwrap();
-    let portal = plan::prepare_with_sources(&replica,&later,&genesis,Some(store),Some(&runtime.binding)).await.unwrap();
+    let portal = plan::prepare_with_sources(&replica,&later,&genesis,Some(store),Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
     let observed = &portal["portal_service_evidence"]["prior_membership_keys"][0];
     assert_eq!(observed["service_id"], service);
     assert_eq!(observed["key_fingerprint"], fingerprint);
@@ -470,7 +470,7 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
             &fence,
             &genesis,
             Some(store),
-            Some(&runtime.binding),
+            Some(&runtime.binding), Some(&runtime.vault),
         )
     };
     let prepared = review().await.unwrap();
