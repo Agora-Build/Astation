@@ -153,16 +153,37 @@ pub(crate) struct InitialIntegration {
     pub policy: IntegrationPolicy,
 }
 
+// Account events distinguish required JSON nulls from omitted fields. Other
+// event kinds can carry new metadata without changing their interpretation.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Change {
     pub id: u64,
-    pub integration_id: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    integration_id: Option<Option<String>>,
     pub kind: String,
     // The event's historical state is deliberately not used as current policy.
     pub integration: Option<IntegrationPolicy>,
-    #[serde(flatten)]
-    metadata: BTreeMap<String, serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    account: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    reason: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    state: Option<serde_json::Value>,
+}
+
+impl Change {
+    pub(crate) fn integration_id(&self) -> Option<&str> {
+        self.integration_id.as_ref().and_then(Option::as_deref)
+    }
 }
 
 #[derive(Deserialize)]
@@ -249,7 +270,7 @@ impl PolicyCheckpoint {
                 return Err(());
             }
             previous = change.id;
-            if let Some(id) = &change.integration_id {
+            if let Some(id) = change.integration_id() {
                 if !client_id(id, "i-") {
                     return Err(());
                 }
@@ -263,7 +284,7 @@ impl PolicyCheckpoint {
                         {
                             return Err(());
                         }
-                        next.integrations.insert(id.clone(), policy.clone());
+                        next.integrations.insert(id.to_owned(), policy.clone());
                     }
                     None => {
                         next.integrations.remove(id);

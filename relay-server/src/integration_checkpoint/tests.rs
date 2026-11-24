@@ -441,6 +441,11 @@ fn built_in_account_changes_follow_the_checkpoint_across_pages_restart_and_reset
     assert!(saved.allows_delegated_release(OWNER));
     let restart = saved.apply(0, serde_json::from_value(json!({"integrations":[],"changes":[],"cursor":0})).unwrap(), 107).unwrap();
     assert!(!restart.allows_delegated_release(OWNER));
+    let mut missing_room = change(523, "account_enabled", json!(OTHER));
+    missing_room.as_object_mut().unwrap().remove("integrationId");
+    assert!(!apply(&saved, vec![missing_room], 107).allows_delegated_release(OTHER));
+    let repeated = r#"{"changes":[{"id":523,"kind":"account_enabled","integrationId":null,"state":null,"reason":"agora_build","account":"one","account":"two"}],"cursor":523}"#;
+    assert!(serde_json::from_str::<crate::integration_feed::FeedPage>(repeated).is_err());
     let malformed = apply(&saved, vec![change(523, "account_disabled", Value::Null)], 107);
     let baseline = apply(&malformed, vec![change(524, "accounts_baseline", Value::Null)], 108);
     assert!(!baseline.allows_delegated_release(OWNER));

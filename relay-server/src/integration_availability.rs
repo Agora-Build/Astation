@@ -50,14 +50,14 @@ impl Availability {
                 "accounts_incomplete" | "accounts_baseline" => false,
                 _ => continue,
             };
-            if change.integration_id.is_some()
+            if change.integration_id != Some(None)
                 || change.integration.is_some()
-                || change.metadata.get("reason").and_then(Value::as_str) != Some("agora_build")
-                || change.metadata.get("state") != Some(&Value::Null)
+                || change.reason.as_ref().and_then(Value::as_str) != Some("agora_build")
+                || change.state.as_ref() != Some(&Value::Null)
             {
                 return Err(());
             }
-            let account = change.metadata.get("account").ok_or(())?;
+            let account = change.account.as_ref().ok_or(())?;
             if account_change {
                 let id = account.as_str().filter(|id| account_id(id)).ok_or(())?;
                 if change.kind == "account_disabled" {
