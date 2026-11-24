@@ -115,9 +115,12 @@ impl Stored {
             let record = ControlRecord::parse(
                 &serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?,
             ).map_err(|_| Fault::Unavailable)?;
+            // A reset carries the exact signed revoke or interrupt from this
+            // origin. Covers, holds and releases are signed for the new feed.
+            let stop = matches!(record.action(), ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. });
             if record.account_id() != log.account_id()
                 || record.genesis_hash() != log.genesis_hash()
-                || record.feed().is_some_and(|feed| feed != (origin, self.feed_id.as_str()))
+                || record.feed().is_some_and(|(station, feed)| station != origin || (!stop && feed != self.feed_id))
                 || !seen.insert(record.record_id().to_owned())
                 || self.signing_high_water.get(&record.principal().name())
                     .is_none_or(|watermark| *watermark < record.issued_at())

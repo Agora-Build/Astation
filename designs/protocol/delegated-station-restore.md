@@ -853,6 +853,10 @@ SDK at current membership. Stops are ordered by original record ID so replicas
 assemble the same component. A stale review, missing copy or unresolved
 authority prevents staging.
 
+If a later backup already contains a carried stop, recovery verifies its original
+signature again at the restored membership. Its signed feed ID is also reserved
+against reuse. A cover, hold or release must name the feed that contains it.
+
 The transaction saves the signed component under the plan ID. Its receipt gives
 the candidate feed ID, reconstruction hash, record count and records hash.
 After new evidence, repeat preparation and stage against the new hash. The live

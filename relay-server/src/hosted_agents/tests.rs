@@ -216,6 +216,7 @@ async fn controlled_host_attachments(
 
 #[derive(Default)]
 struct HostScenario {
+    route_ready: Option<tokio::sync::oneshot::Sender<()>>,
     busy_initializations: usize,
     pending_approval: bool,
     lose_submit_reply: bool,
@@ -236,6 +237,9 @@ async fn controlled_host_scenario(
     let mut socket = connect_atem(&base, "phone", "host-a").await;
     crate::remote_api::host_route_tests::prove(&mut socket, &f.keys, &f.host_key, &log, "host-a")
         .await;
+    if let Some(ready) = scenario.route_ready {
+        ready.send(()).expect("host readiness receiver");
+    }
     let mut receipts = std::collections::BTreeMap::new();
     let mut launches: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let mut messages: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
@@ -627,31 +631,20 @@ async fn postgres_host_init_busy_has_bounded_pre_authentication_retries() {
             Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
         ));
         let (base, relay) = spawn_relay(app).await;
+        let (route_ready, ready) = tokio::sync::oneshot::channel();
         let host = tokio::spawn(controlled_host_scenario(
             base,
             Arc::new(f),
             log,
             if refused == 1 { 2 } else { 4 },
             HostScenario {
+                route_ready: Some(route_ready),
                 busy_initializations: refused,
                 ..Default::default()
             },
         ));
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !crate::remote_api::recovery::host_target(
-                &runtime.app,
-                &context.genesis,
-                PRINCIPAL,
-                "host-a",
-            )
-            .await
-            .is_ok_and(|(_, _, proof, _)| proof.is_some())
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await.expect("host route acknowledgment timed out").expect("test host stopped");
         let start = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(8),
@@ -659,7 +652,7 @@ async fn postgres_host_init_busy_has_bounded_pre_authentication_retries() {
         )
         .await
         .expect("busy retries must be bounded");
-        assert!(start.elapsed() >= Duration::from_secs(1));
+        let elapsed = start.elapsed();
         if refused == 1 {
             let connection = result.unwrap();
             assert!(connection.attached.target("ses-aaaaaaaaaaaa").is_some());
@@ -673,6 +666,7 @@ async fn postgres_host_init_busy_has_bounded_pre_authentication_retries() {
                     .unwrap();
             assert_eq!(body["error"]["code"], "host_connection_busy");
         }
+        assert!(elapsed >= Duration::from_secs(1));
         host.await.unwrap();
         relay.abort();
         drop(runtime);

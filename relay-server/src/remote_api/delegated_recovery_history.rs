@@ -33,11 +33,10 @@ struct Retained {
 
 fn add_record(
     records: &mut BTreeMap<String, (Value, Value)>,
-    value: Value,
+    record: &ControlRecord,
     review: Value,
 ) -> Result<(), sqlx::Error> {
-    let record = ControlRecord::parse(&serde_json::to_vec(&value).map_err(|_| invalid())?)
-        .map_err(|_| invalid())?;
+    let value = record.object().to_json();
     let id = record.record_id().to_owned();
     if let Some((previous, previous_review)) = records.get(&id) {
         if previous != &value || previous_review != &review {
@@ -168,6 +167,11 @@ pub(super) async fn inspection(
             service_keys.entry((member.device_id.clone(), key)).or_default();
         }
         for ((value, review), old) in values.iter().zip(reviews).zip(old_reviews) {
+            let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
+                .map_err(|_| invalid())?;
+            if let Some((_, id)) = record.feed() {
+                retained_feed_ids.insert(id.to_owned());
+            }
             let principal = review["principal"].as_str().ok_or_else(invalid)?;
             if review["signer"] == principal && (old["verification"] == "valid" || review["verification"] == "valid") {
                 let service = principal.strip_prefix("service:").ok_or_else(invalid)?;
@@ -176,7 +180,7 @@ pub(super) async fn inspection(
                 let highest = service_keys.entry((service.to_owned(), key.to_owned())).or_default();
                 *highest = Some(highest.map_or(issued, |prior| prior.max(issued)));
             }
-            add_record(&mut records, value.clone(), review.clone())?;
+            add_record(&mut records, &record, review.clone())?;
         }
         for (principal, value) in review["retained_signing_watermarks"]
             .as_object()
@@ -199,7 +203,7 @@ pub(super) async fn inspection(
                     let lower = lower_bounds.entry(record.principal().name()).or_default();
                     *lower = (*lower).max(record.issued_at());
                 }
-                add_record(&mut records, record.object().to_json(), stops::review(&record, log, &binding.origin)?)?;
+                add_record(&mut records, &record, stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
                 journals.observe(&verified.signer, &verified.journal, generation, current_plan);
@@ -266,7 +270,7 @@ pub(super) async fn inspection(
         }
         add_record(
             &mut records,
-            value.clone(),
+            &record,
             stops::review(&record, log, &binding.origin)?,
         )?;
     }
