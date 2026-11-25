@@ -38,7 +38,11 @@ the shortest replica lease bounds the service evidence from request start,
 including token acquisition and response delay. Failed polls, key mismatch,
 missing replicas, expiry and explicit retirement clear evidence. Delayed retired
 polls cannot replace newer evidence; replayed response bytes cannot extend a
-lease. Production signing still needs the complete participant owner.
+lease. At signing, the earliest expiry of any active service in the signed
+list also bounds the evidence. A proposed service's own expiry applies to
+its exact enrollment. The Mac checks wall time and elapsed time, including
+sleep, even when a report has time left. Production signing still needs
+the complete participant owner.
 Native/third-party SDK members require their own
 authenticated source; a Station cannot use this endpoint to confirm them.
 

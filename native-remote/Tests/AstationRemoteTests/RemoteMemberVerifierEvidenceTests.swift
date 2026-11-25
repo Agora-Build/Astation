@@ -64,7 +64,7 @@ private final class MemberReportFixture {
             slot: $0, process: verifierReportProcess()) }
         let ids: [RemoteVerifierID] = [.member("manager"), .host("host"), .stationReplica("station")]
             + (service ? [.member("service")] : [])
-        gate = try RemoteVerifierSigningGate(log: log, verifiers: ids, now: { [unowned self] in time })
+        gate = try RemoteVerifierSigningGate(log: log, verifiers: ids, wall: { [unowned self] in wall }, now: { [unowned self] in time })
         let station = try gate.connect(.stationReplica("station"))
         try gate.observeConsumer(verifierInventory(), on: station)
         let host = try gate.connect(.host("host"))
