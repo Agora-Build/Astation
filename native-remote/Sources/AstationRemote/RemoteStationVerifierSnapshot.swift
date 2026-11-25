@@ -153,6 +153,25 @@ public final class RemoteStationVerifierEvidence {
         return next
     }
 
+    /// Fetch from the selected Station and withdraw this poll's evidence if its context changes.
+    /// The returned IDs are reviewed replicas that supplied no live inventory in this snapshot.
+    public func inspect(using transport: any RemoteStationVerifierTransport,
+                        current: @MainActor () throws -> Void) async throws -> [String] {
+        let expected = begin()
+        do {
+            try Task.checkCancellation()
+            try current()
+            let snapshot = try await transport.stationVerifiers(genesisHash: genesis)
+            try Task.checkCancellation()
+            try current()
+            try receive(snapshot, for: expected)
+            return snapshot.replicas.filter { $0.inventory == nil }.map(\.id)
+        } catch {
+            failed(expected)
+            throw error
+        }
+    }
+
     public func receive(_ snapshot: RemoteStationVerifierSnapshot, for expected: Poll) throws {
         guard poll == expected else { throw RemoteVerifierGateError.staleConnection }
         poll = nil

@@ -401,9 +401,12 @@ sleeping, or changing membership invalidates the in-flight work. After a process
 restart the Mac reports its new SDK process ID under the saved slot, allowing a
 consumer to detect the conflict and require a new review.
 
-**Check Live Processes** in the Mac's Host Sending Access window inspects the
-reviewed member slots on the selected Station. It uses the protected Station
-roster and signed device list. Members without an eligible review stay visible.
+**Check Live Processes** in the Mac's Host Sending Access window first fetches
+the selected Station's live server reports. It checks the account, signed
+device-list head and protected server roster before issuing any member
+challenge. A changed roster requires a new server review. A reviewed server
+without a live inventory is listed by name. The server check also works when
+no member process has been reviewed. Members without an eligible review stay visible.
 The Mac issues up to eight challenges at a time and reads each original nonce
 after allowing the responders five seconds to answer. The result counts reports
 verified during the inspection. Different batches can finish at different
