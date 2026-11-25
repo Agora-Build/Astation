@@ -19,6 +19,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let servers = NSButton(title: "Review Station Servers...", target: nil, action: nil)
     private let processes = NSButton(title: "Review Member Processes...", target: nil, action: nil)
+    private let checkProcesses = NSButton(title: "Check Live Processes", target: nil, action: nil)
     private let revoke = NSButton(title: "Revoke...", target: nil, action: nil)
     private let readmit = NSButton(title: "Readmit...", target: nil, action: nil)
     private let interrupt = NSButton(title: "Interrupt...", target: nil, action: nil)
@@ -48,7 +49,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         let savedActions = NSStackView(views: [resume, cancel])
         savedActions.spacing = 8
         let stack = NSStackView(views: [intro, hosts, details, actions, savedActions,
-            NSStackView(views: [servers, processes]), status])
+            NSStackView(views: [servers, processes, checkProcesses]), status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
         guard let content = window.contentView else { return }
         content.addSubview(stack)
@@ -66,7 +67,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         hosts.target = self; hosts.action = #selector(selectedHost)
         hosts.setAccessibilityLabel("Host sender")
         for (button, action) in [(refresh, #selector(reload)), (servers, #selector(reviewServers)),
-            (processes, #selector(reviewProcesses)), (revoke, #selector(revokeHost)),
+            (processes, #selector(reviewProcesses)), (checkProcesses, #selector(inspectLiveProcesses)), (revoke, #selector(revokeHost)),
             (readmit, #selector(readmitHost)), (interrupt, #selector(interruptHost)),
             (resume, #selector(resumeChange)), (cancel, #selector(cancelChange))] {
             button.bezelStyle = .rounded; button.target = self; button.action = action
@@ -185,6 +186,40 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         refresh.isEnabled = task == nil
         servers.isEnabled = task == nil && current?() == true && coordinator?.verifierRosterReviewAvailable == true
         processes.isEnabled = task == nil && current?() == true && coordinator?.processReviewAvailable == true && !verifierMembers.isEmpty
+        checkProcesses.isEnabled = processes.isEnabled
+    }
+
+    @objc private func inspectLiveProcesses() {
+        guard task == nil, let coordinator, let current, current() else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                guard try coordinator.acceptedStationVerifierRoster() != nil else {
+                    status.stringValue = "Review Station Servers before checking live processes."
+                    return
+                }
+                let context = try hub.verifierContext(for: coordinator)
+                let result = try await coordinator.checkMemberProcesses(current: { current() && context() },
+                    transport: hub.verifierTransport(current:)) { checked, total in
+                    self.status.stringValue = "Checking reviewed processes (\(checked)/\(total))..."
+                }
+                guard current(), context(), !Task.isCancelled else { throw AccountLoginError.changed }
+                let summary = "\(result.answered) of \(result.total) reviewed slots returned verified reports during this check."
+                status.stringValue = summary
+                guard !result.unanswered.isEmpty || !result.pendingMembers.isEmpty else { return }
+                let alert = NSAlert()
+                alert.messageText = "Process check"
+                alert.informativeText = summary
+                let missing = result.unanswered.map { $0.memberID + " / " + $0.slot + " - no report" }.sorted()
+                let pending = result.pendingMembers.map { $0 + " - no current eligible review" }
+                alert.accessoryView = processEditor((pending + missing).joined(separator: "\n"), editable: false).0
+                alert.addButton(withTitle: "Done")
+                alert.runModal()
+            } catch { if generation == epoch { status.stringValue = error.localizedDescription } }
+        }
+        render()
     }
 
     static func serverReviewText(_ review: AstationRecoveryCoordinator.VerifierRosterReview) -> String {

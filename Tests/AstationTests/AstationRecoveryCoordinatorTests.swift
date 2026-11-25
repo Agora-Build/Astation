@@ -467,6 +467,7 @@ private final class RecoveryCoordinatorHarness {
     let keys = RecoveryMemoryKeys()
     let relay = RecoveryMemoryRelay()
     var authorBytes: [String: Data] = [:]
+    var verifierHistoryBytes: [String: Data] = [:]
     var protectedJournal: ((MembershipLog, String) throws -> RemoteControlSigningJournal)?
     let identityStorage = TestAtemStorage()
     let identityCryptography = TestAtemCryptography()
@@ -508,7 +509,11 @@ private final class RecoveryCoordinatorHarness {
             },
             authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations,
             retainedControlTransport: retainedControlTransport,
-            confirmVerifierRoster: confirmVerifierRoster, confirmProcessRoster: confirmProcessRoster, verifierTime: verifierTime)
+            confirmVerifierRoster: confirmVerifierRoster, confirmProcessRoster: confirmProcessRoster,
+            verifierHistory: { [unowned self] log, origin, creating in
+                try RemoteMemberVerifierJournal(log: log, origin: origin, creating: creating,
+                    read: { self.verifierHistoryBytes[origin] }, persist: { self.verifierHistoryBytes[origin] = $0 })
+            }, verifierTime: verifierTime)
     }
 }
 
@@ -728,6 +733,84 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(next.previous?.lines, lines, "Keep offline slots visible while re-reviewing the newer head")
         try await restarted.acceptProcessReview(next, lines: [lines[0]], current: active)
         XCTAssertEqual(try restarted.reviewedProcessSlots(member: member, log: changed).count, 1)
+    }
+
+    func testMacCollectsSignedReportsAcrossReviewedSlotsAndRefusesMissingHistory() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in true }, confirmProcessRoster: { true })
+        _ = try await coordinator.setup()
+        _ = try await addSecondManager(harness: h)
+        let station = try await coordinator.prepareStationVerifierRoster(current: { true })
+        try await coordinator.acceptStationVerifierRoster(station, current: { true })
+        let review = try await coordinator.prepareProcessReview(member: coordinator.managerID, current: { true })
+        try await coordinator.acceptProcessReview(review, lines: ["offline AQEBAQEBAQEBAQEBAQEBAQ",
+            "truck " + verifierReportProcess()], current: { true })
+        let restarted = try h.coordinator()
+        let log = try await restarted.hostSenderMembership()
+        let origin = restarted.relayURL, member = restarted.managerID, identity = h.identity
+        let anchor = try RemoteVerifierReportAnchor(log: log)
+        let head: [String: Any] = ["seq": log.head().seq, "hash": log.head().hash]
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryReportHTTPStub.self]
+        var issued: [String: String] = [:]
+        var reads = 0
+        RecoveryReportHTTPStub.lock.withLock {
+            RecoveryReportHTTPStub.response = { request, data in
+                let nonce: String
+                if request.httpMethod == "POST" {
+                    let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                    XCTAssertEqual(body["expected"] as? NSDictionary, head as NSDictionary)
+                    let bytes = try JSONSerialization.data(withJSONObject: XCTUnwrap(body["challenge"]))
+                    let json = String(decoding: bytes, as: UTF8.self)
+                    nonce = try parseVerifierReportChallenge(challengeJson: json).nonce
+                    issued[nonce] = json
+                } else {
+                    XCTAssertEqual(request.httpMethod, "GET")
+                    nonce = try XCTUnwrap(request.url?.lastPathComponent)
+                    reads += 1
+                }
+                let json = try XCTUnwrap(issued[nonce])
+                let challenge = try parseVerifierReportChallenge(challengeJson: json)
+                var reports: [Any] = []
+                if request.httpMethod == "GET", challenge.slot == "truck" {
+                    let report = try identity.verifierReport(log: log, anchor: anchor, memberID: member,
+                        challengeJSON: json, slot: challenge.slot, origin: origin,
+                        wallMs: AstationRecoveryCoordinator.clock().wallMs, current: { true })
+                    reports.append(try JSONSerialization.jsonObject(with: Data(report.utf8)))
+                }
+                return try JSONSerialization.data(withJSONObject: ["challenge": JSONSerialization.jsonObject(with: Data(json.utf8)),
+                    "expected": head, "reports": reports] as [String: Any])
+            }
+        }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        var activeAccount = true
+        func check(wait: @escaping @Sendable () async throws -> Void = {}) async throws -> AstationRecoveryCoordinator.ProcessCheck {
+            try await restarted.checkMemberProcesses(current: { activeAccount }, transport: { active in
+                try RemoteRecoveryHTTP(relayURL: origin, configuration: config) {
+                    guard await active() else { throw AccountLoginError.changed }
+                    return "test-token"
+                }
+            }, waitForReport: wait, progress: { _, _ in })
+        }
+        let result = try await check()
+        XCTAssertEqual(issued.count, 2)
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(result.answered, 1)
+        XCTAssertEqual(result.unanswered.map(\.slot), ["offline"])
+        XCTAssertEqual(result.pendingMembers, ["manager-b"])
+        XCTAssertFalse(restarted.hostSenderControlsAvailable)
+        do {
+            _ = try await check { await MainActor.run { activeAccount = false } }
+            XCTFail("signed-out check returned a result")
+        } catch {}
+        XCTAssertEqual(reads, 2, "a retired inspection cannot read the mailbox")
+        activeAccount = true
+        let requestsBeforeStorageLoss = issued.count
+        h.verifierHistoryBytes.removeValue(forKey: origin)
+        do { _ = try await check(); XCTFail("a missing journal was recreated") }
+        catch RemoteVerifierGateError.invalidInventory {}
+        XCTAssertEqual(issued.count, requestsBeforeStorageLoss)
+        XCTAssertNil(h.verifierHistoryBytes[origin])
     }
 
     func testReviewedMacAnswersStationInboxAndRetriesOnlyUnconfirmedReports() async throws {

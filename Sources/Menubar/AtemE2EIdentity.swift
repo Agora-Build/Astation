@@ -396,19 +396,32 @@ final class AtemE2EIdentity {
         return try crypto.sign(request.input, material: record.material)
     }
 
+    /// Called with the identity lock held. Verifier checks only need the existing public keys.
+    private func existingVerifierIdentity(log: MembershipLog, memberID: String) throws -> Stored {
+        guard log.frozen() == nil, let member = log.member(deviceId: memberID),
+              member.status == .active, member.kind == "native",
+              let record = try read(create: false, noninteractive: true),
+              member.authKey == PublicKeyData(alg: .p256, raw: try crypto.signingPublicKeyWithoutInteraction(record.material)),
+              member.encKey == PublicKeyData(alg: .x25519, raw: record.material.encryptionPublicKey) else {
+            throw AtemIdentityError.identityChanged
+        }
+        return record
+    }
+
+    func requireVerifierManager(log: MembershipLog, memberID: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard log.member(deviceId: memberID)?.roles.contains("manage") == true else { throw AtemIdentityError.identityChanged }
+        _ = try existingVerifierIdentity(log: log, memberID: memberID)
+    }
+
     /// This API builds the report in the SDK; it never accepts arbitrary signing bytes.
     func verifierReport(log: MembershipLog, anchor: RemoteVerifierReportAnchor, memberID: String, challengeJSON: String, slot: String,
                         origin: String, wallMs: UInt64, current: () -> Bool) throws -> String {
         lock.lock(); defer { lock.unlock() }
         try anchor.require(log)
         let saved = try storage.read()
-        guard current(), log.frozen() == nil,
-              let member = log.member(deviceId: memberID), member.status == .active, member.kind == "native",
-              let record = try read(create: false, noninteractive: true),
-              member.authKey == PublicKeyData(alg: .p256, raw: try crypto.signingPublicKeyWithoutInteraction(record.material)),
-              member.encKey == PublicKeyData(alg: .x25519, raw: record.material.encryptionPublicKey) else {
-            throw AtemIdentityError.identityChanged
-        }
+        guard current() else { throw AtemIdentityError.identityChanged }
+        let record = try existingVerifierIdentity(log: log, memberID: memberID)
         let request = try VerifierReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + memberID,
             slot: slot, origin: origin, keyId: memberID, nowMs: wallMs)
         let signature = try crypto.signWithoutInteraction(request.signRequest().input, material: record.material)

@@ -210,6 +210,9 @@ final class RemoteMemberVerifierEvidenceTests: XCTestCase {
         XCTAssertNoThrow(try f.authorize())
         XCTAssertEqual(creates, 1)
         f.time += 10_000; f.wall += 10_000
+        let original = try await poller.readIssuedChallenge(f.slots[0])
+        XCTAssertTrue(original)
+        XCTAssertEqual(creates, 1, "A delayed inspection must read the issued nonce")
         try await assertPoll(poller, f.slots[0], expected: true)
         XCTAssertEqual(creates, 2)
         unavailable = true

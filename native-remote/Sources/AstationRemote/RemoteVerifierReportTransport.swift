@@ -72,13 +72,26 @@ public final class RemoteMemberVerifierPoller {
 
     @discardableResult
     public func poll(_ slot: RemoteMemberVerifierSlot) async throws -> Bool {
+        try await poll(slot, readExisting: false)
+    }
+
+    /// Finish the issued challenge even if the response was delayed past the
+    /// normal ten-second rotation. Never replace it with a fresh challenge.
+    public func readIssuedChallenge(_ slot: RemoteMemberVerifierSlot) async throws -> Bool {
+        try await poll(slot, readExisting: true)
+    }
+
+    private func poll(_ slot: RemoteMemberVerifierSlot, readExisting: Bool) async throws -> Bool {
         guard !retired else { throw RemoteVerifierGateError.staleConnection }
         if Task.isCancelled { retire(); throw CancellationError() }
         let log = try currentMembership()
         let time = now()
         if rounds[slot]?.inFlight == true { throw RemoteVerifierGateError.staleConnection }
         let creating: Bool
-        if let round = rounds[slot], time >= round.started, time - round.started < 10_000 { creating = false }
+        if readExisting {
+            guard rounds[slot] != nil else { throw RemoteVerifierGateError.staleConnection }
+            creating = false
+        } else if let round = rounds[slot], time >= round.started, time - round.started < 10_000 { creating = false }
         else {
             let challenge = try evidence.begin(slot, log: log, wallMs: wall())
             rounds[slot] = Round(id: UUID(), challenge: challenge, started: time)
