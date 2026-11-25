@@ -57,7 +57,9 @@ class AstationHubManager: ObservableObject {
     var needsAccountSignIn: Bool { signedInAccount == nil || accountSignInRequired || stationAccountSignInRequired }
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
-    private var accountGeneration = UUID()
+    private var accountGeneration = UUID() {
+        didSet { verifierReportTask?.cancel() }
+    }
     var integrationAccountGeneration: UUID { accountGeneration }
     private struct StationRegistrationContext: Equatable {
         let socket: String
@@ -324,7 +326,11 @@ class AstationHubManager: ObservableObject {
     private var directMigrationContexts: [String: MigrationContext] = [:]
     private var directSessionContexts: [String: AtemSessionContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
-    @MainActor private var accountRecovery: AstationRecoveryCoordinator?
+    @MainActor private var accountRecovery: AstationRecoveryCoordinator? {
+        didSet { updateVerifierPolling() }
+    }
+    private var verifierReportTimer: Timer?
+    private var verifierReportTask: Task<Void, Never>?
     @MainActor private var approvalPushHints: RemotePushHints?
     @MainActor private var approvalPushScope: String?
     @MainActor private var outcomeReminders: RemoteOutcomeReminders?
@@ -341,6 +347,47 @@ class AstationHubManager: ObservableObject {
     }
     var controlReviewsDidChange: (@MainActor (ControlReviewNotice) -> Void)?
     var controlReviewNotificationsEnabled: (@MainActor () -> Bool)?
+
+    @MainActor private func updateVerifierPolling() {
+        verifierReportTask?.cancel()
+        verifierReportTimer?.invalidate()
+        verifierReportTimer = nil
+        guard accountRecovery?.hasLocalVerifierSlot == true else { return }
+        let tick: @MainActor @Sendable () -> Void = { [weak self] in self?.pollLocalVerifier() }
+        verifierReportTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in
+            MainActor.assumeIsolated { tick() }
+        }
+        pollLocalVerifier()
+    }
+
+    @MainActor private func pollLocalVerifier() {
+        guard verifierReportTask == nil, let coordinator = accountRecovery, coordinator.hasLocalVerifierSlot,
+              !systemIsSleeping, !needsAccountSignIn, let owner = signedInAccount,
+              coordinator.accountID == e2eDataAccount, coordinator.relayURL == stationRelayUrl else { return }
+        let epoch = accountGeneration, origin = stationRelayUrl, auth = accountAuth
+        let current: @MainActor @Sendable () -> Bool = { [weak self, weak coordinator] in
+            guard let self, let coordinator else { return false }
+            return self.accountRecovery === coordinator && self.accountGeneration == epoch &&
+                self.e2eDataAccount == coordinator.accountID && self.stationRelayUrl == origin &&
+                self.signedInAccount == owner && !self.needsAccountSignIn && !self.systemIsSleeping
+        }
+        verifierReportTask = Task { [weak self] in
+            defer { self?.verifierReportTask = nil }
+            // A missing session or locked key is retried on the next tick without opening UI.
+            try? await coordinator.answerVerifierChallenges(current: current) { active in
+                try RemoteRecoveryHTTP(relayURL: origin, accessToken: {
+                    guard await active(), try await auth.current()?.session.subject == owner else {
+                        throw AccountLoginError.changed
+                    }
+                    let token = try await auth.accessToken(relayURL: origin)
+                    guard try await auth.current()?.session.subject == owner, await active() else {
+                        throw AccountLoginError.changed
+                    }
+                    return token
+                })
+            }
+        }
+    }
 
     @MainActor private func refreshBackgroundControlReviews() {
         guard !systemIsSleeping, let owner = signedInAccount, !accountSignInRequired else { return }
@@ -500,6 +547,11 @@ class AstationHubManager: ObservableObject {
             guard let self, let coordinator, self.accountRecovery === coordinator,
                   self.e2eDataAccount == account, self.stationRelayUrl == targetRelay else { return }
             self.refreshChannelsAfterMembershipCommit(head)
+            self.updateVerifierPolling()
+        }
+        coordinator.onLocalVerifierSlotChange = { [weak self, weak coordinator] in
+            guard let self, let coordinator, self.accountRecovery === coordinator else { return }
+            self.updateVerifierPolling()
         }
         coordinator.onControlCommit = { [weak self, weak coordinator] in
             guard let self, let coordinator, self.accountRecovery === coordinator,
@@ -819,6 +871,8 @@ class AstationHubManager: ObservableObject {
         transportPolicyTimer?.invalidate()
         sessionExpiryTimer?.invalidate()
         controlReviewTimer?.invalidate()
+        verifierReportTimer?.invalidate()
+        verifierReportTask?.cancel()
         identityRelayPathMonitor?.cancel()
         identityRelayTask?.cancel(with: .goingAway, reason: nil)
         if let core = coreHandle {
@@ -2872,6 +2926,7 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         guard !systemIsSleeping else { return }
         systemIsSleeping = true
+        verifierReportTask?.cancel()
         resumeRelayAfterSleep = identityRelayReconnectGeneration > 0
         Log.info("[Sessions] Mac sleeping; closing session transports and releasing local authority")
         refreshSessionConnections()
