@@ -202,21 +202,23 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
                 }
                 let context = try hub.verifierContext(for: coordinator)
                 let result = try await coordinator.checkMemberProcesses(current: { current() && context() },
-                    transport: hub.verifierTransport(current:)) { checked, total in
+                    transport: hub.verifierTransport(current:), reportingHosts: hub.hostsWithLiveVerifierReports(in:)) { checked, total in
                     self.status.stringValue = "Checking Station servers and processes (\(checked)/\(total) slots)..."
                 }
                 guard current(), context(), !Task.isCancelled else { throw AccountLoginError.changed }
                 let servers = result.serverCount - result.unconfirmedServers.count
-                let summary = "Reported during this check: \(servers)/\(result.serverCount) Station servers and \(result.answered)/\(result.total) reviewed process slots."
+                let hosts = result.hostCount - result.unconfirmedHosts.count
+                let summary = "Reports received from \(servers)/\(result.serverCount) Station servers, \(hosts)/\(result.hostCount) hosts and \(result.answered)/\(result.total) reviewed process slots."
                 status.stringValue = summary
-                guard !result.unconfirmedServers.isEmpty || !result.unanswered.isEmpty || !result.pendingMembers.isEmpty else { return }
+                guard !result.unconfirmedServers.isEmpty || !result.unconfirmedHosts.isEmpty || !result.unanswered.isEmpty || !result.pendingMembers.isEmpty else { return }
                 let alert = NSAlert()
                 alert.messageText = "Process check"
                 alert.informativeText = summary
                 let missing = result.unanswered.map { $0.memberID + " / " + $0.slot + " - no report" }.sorted()
                 let pending = result.pendingMembers.map { $0 + " - no current eligible review" }
                 let unavailable = result.unconfirmedServers.map { $0 + " - no live Station server report" }
-                alert.accessoryView = processEditor((unavailable + pending + missing).joined(separator: "\n"), editable: false).0
+                let missingHosts = result.unconfirmedHosts.map { $0 + " - no live host report" }
+                alert.accessoryView = processEditor((unavailable + missingHosts + pending + missing).joined(separator: "\n"), editable: false).0
                 alert.addButton(withTitle: "Done")
                 alert.runModal()
             } catch { if generation == epoch { status.stringValue = error.localizedDescription } }

@@ -835,6 +835,10 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let h = RecoveryCoordinatorHarness()
         let coordinator = try h.coordinator(confirmVerifierRoster: { _ in true })
         _ = try await coordinator.setup()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let request = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: request, confirmedAt: AstationRecoveryCoordinator.clock().monoMs,
+            current: { true })
         let roster = try await coordinator.prepareStationVerifierRoster(current: { true })
         try await coordinator.acceptStationVerifierRoster(roster, current: { true })
         let log = try await coordinator.hostSenderMembership()
@@ -862,6 +866,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         let result = try await check(switchAccount: false)
         XCTAssertEqual(result.unconfirmedServers, ["a", "b"])
+        XCTAssertEqual(result.hostCount, 1)
+        XCTAssertEqual(result.unconfirmedHosts, ["host-a"])
         XCTAssertEqual(result.pendingMembers, [coordinator.managerID])
         XCTAssertEqual(result.total, 0)
         XCTAssertTrue(h.verifierHistoryBytes.isEmpty)

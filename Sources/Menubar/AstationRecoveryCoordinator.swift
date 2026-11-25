@@ -1508,12 +1508,15 @@ extension AstationRecoveryCoordinator {
         let pendingMembers: [String]
         let serverCount: Int
         let unconfirmedServers: [String]
+        let hostCount: Int
+        let unconfirmedHosts: [String]
         var answered = 0
         var unanswered: [RemoteMemberVerifierSlot] = []
     }
 
     func checkMemberProcesses(current: @escaping @MainActor @Sendable () -> Bool,
         transport: (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport & RemoteStationVerifierTransport,
+        reportingHosts: (RemoteVerifierSigningGate) -> Set<String> = { _ in [] },
         waitForReport: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .seconds(5)) },
         progress: (Int, Int) -> Void) async throws -> ProcessCheck {
         guard current(), !Task.isCancelled, !busy, !uncertain, let log = membershipLog?.snapshot(),
@@ -1547,8 +1550,11 @@ extension AstationRecoveryCoordinator {
         defer { servers.disconnect() }
         progress(0, slots.count)
         let missing = try await servers.inspect(using: carrier) { _ = try membership() }
+        let hosts = gate.enrolledHostIDs
+        let reported = reportingHosts(gate)
         var result = ProcessCheck(total: slots.count, pendingMembers: pending,
-            serverCount: station.replicas.count, unconfirmedServers: missing)
+            serverCount: station.replicas.count, unconfirmedServers: missing,
+            hostCount: hosts.count, unconfirmedHosts: hosts.filter { !reported.contains($0) })
         guard let journal else { return result }
         let evidence = try RemoteMemberVerifierEvidence(gate: gate, log: log, origin: relayURL, slots: slots,
             journal: journal, current: active, now: verifierTime)

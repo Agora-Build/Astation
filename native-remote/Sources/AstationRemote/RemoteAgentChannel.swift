@@ -64,6 +64,7 @@ public final class RemoteAgentChannel {
     public var hostPolicyReady: Bool { phase == .ready && core.hostPolicyReady }
     private let core: RemoteChannelCore
     private let verifierEvidence: RemoteHostVerifierEvidence?
+    private var verifierWelcome: (info: WelcomeInfo, receivedAt: UInt64)?
     private let clock: () -> UInt64
     private let sign: (SignRequest) async throws -> Data
     private let send: (RemoteChannelRoute, Data) throws -> Void
@@ -156,10 +157,12 @@ public final class RemoteAgentChannel {
                     }
                 }
             case .awaitingWelcome:
-                let welcome = try core.welcome(frame, now: clock())
+                let receivedAt = clock()
+                let welcome = try core.welcome(frame, now: receivedAt)
                 guard welcome.authorizationMsLeft > 0 else { throw RemoteChannelError.deadlineExceeded }
                 deadline = try addingDeadline(welcome.authorizationMsLeft)
-                verifierEvidence?.welcome(welcome)
+                verifierWelcome = (welcome, receivedAt)
+                verifierEvidence?.welcome(welcome, receivedAt: receivedAt)
                 transition(.ready)
                 if phase == .ready { observe(.ready(welcome)) }
             case .ready:
@@ -168,10 +171,12 @@ public final class RemoteAgentChannel {
                     switch event {
                     case .outgoing(let outgoing): try transmit(outgoing)
                     case .fenced:
+                        verifierWelcome = nil
                         verifierEvidence?.disconnect()
                         observe(.update(event))
                         finish(nil)
                     case .membershipHead(_, let head, _):
+                        if head != verifierWelcome?.info.head { verifierWelcome = nil }
                         verifierEvidence?.membershipHead(head)
                         observe(.update(event))
                     default: observe(.update(event))
@@ -180,6 +185,12 @@ public final class RemoteAgentChannel {
             default: throw RemoteChannelError.notReady
             }
         } catch { finish(error) }
+    }
+
+    /// Read the current channel without changing its verifier connection or renewing its welcome.
+    public func hasLiveVerifierReport(hostID: String, in gate: RemoteVerifierSigningGate) -> Bool {
+        guard phase == .ready, let verifierWelcome else { return false }
+        return gate.hasHostReport(verifierWelcome.info, id: hostID, receivedAt: verifierWelcome.receivedAt)
     }
 
     /// Caller retains request IDs durably before submitting; this adapter never retries a command.
@@ -228,6 +239,7 @@ public final class RemoteAgentChannel {
     private func finish(_ error: Error?) {
         guard phase != .closed else { return }
         phase = .closed
+        verifierWelcome = nil
         verifierEvidence?.disconnect()
         timer?.cancel(); timer = nil
         signer?.cancel(); signer = nil

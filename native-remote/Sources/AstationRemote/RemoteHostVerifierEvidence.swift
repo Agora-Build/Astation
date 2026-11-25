@@ -18,10 +18,10 @@ final class RemoteHostVerifierEvidence {
         connection = try gate.connect(.host(hostID))
     }
 
-    func welcome(_ welcome: WelcomeInfo) {
+    func welcome(_ welcome: WelcomeInfo, receivedAt: UInt64) {
         guard let connection else { return }
         do {
-            try gate.observeHostWelcome(welcome, on: connection)
+            try gate.observeHostWelcome(welcome, on: connection, receivedAt: receivedAt)
             confirmedHead = welcome.head
         }
         catch { disconnect() }

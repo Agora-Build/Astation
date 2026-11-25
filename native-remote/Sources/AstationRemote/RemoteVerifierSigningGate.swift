@@ -204,21 +204,33 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     public func observeHostWelcome(_ welcome: WelcomeInfo, on connection: Connection,
                                    receivedAt: UInt64? = nil) throws {
         let current = now()
-        let received = receivedAt ?? current
-        let deadline = received.addingReportingOverflow(welcome.authorizationMsLeft)
-        guard case .host(let id) = connection.verifier, welcome.atemDeviceId == id,
-              welcome.accountId == accountID, welcome.head == head,
-              welcome.revision == 9, (1...86_400_000).contains(welcome.authorizationMsLeft),
-              received <= current, !deadline.overflow,
-              hostGenerations[id] == welcome.hostTrustGen else {
+        guard case .host(let id) = connection.verifier,
+              let deadline = hostDeadline(welcome, id: id, receivedAt: receivedAt ?? current, current: current) else {
             try observe(nil, on: connection)
             throw RemoteVerifierGateError.staleMembership
         }
-        guard current < deadline.partialValue else {
-            try observe(nil, on: connection, validBefore: deadline.partialValue)
+        guard current < deadline else {
+            try observe(nil, on: connection, validBefore: deadline)
             throw RemoteVerifierGateError.staleMembership
         }
-        try observe(welcome.verifier, on: connection, validBefore: deadline.partialValue)
+        try observe(welcome.verifier, on: connection, validBefore: deadline)
+    }
+
+    public var enrolledHostIDs: [String] { hostGenerations.keys.sorted() }
+
+    private func hostDeadline(_ welcome: WelcomeInfo, id: String, receivedAt: UInt64, current: UInt64) -> UInt64? {
+        let deadline = receivedAt.addingReportingOverflow(welcome.authorizationMsLeft)
+        guard welcome.atemDeviceId == id, welcome.accountId == accountID, welcome.head == head,
+              welcome.revision == 9, (1...86_400_000).contains(welcome.authorizationMsLeft),
+              receivedAt <= current, !deadline.overflow, hostGenerations[id] == welcome.hostTrustGen else { return nil }
+        return deadline.partialValue
+    }
+
+    func hasHostReport(_ welcome: WelcomeInfo, id: String, receivedAt: UInt64) -> Bool {
+        let current = now()
+        guard let deadline = hostDeadline(welcome, id: id, receivedAt: receivedAt, current: current),
+              current < deadline, let inventory = welcome.verifier else { return false }
+        return (try? Self.validateInventory(inventory)) != nil
     }
 
     private func observe(_ inventory: VerifierInventory?, on connection: Connection,
