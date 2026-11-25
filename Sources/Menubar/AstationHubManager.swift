@@ -331,6 +331,7 @@ class AstationHubManager: ObservableObject {
     }
     private var verifierReportTimer: Timer?
     private var verifierReportTask: Task<Void, Never>?
+    private var verifierWakeGeneration = UUID()
     @MainActor private var approvalPushHints: RemotePushHints?
     @MainActor private var approvalPushScope: String?
     @MainActor private var outcomeReminders: RemoteOutcomeReminders?
@@ -360,31 +361,40 @@ class AstationHubManager: ObservableObject {
         pollLocalVerifier()
     }
 
-    @MainActor private func pollLocalVerifier() {
-        guard verifierReportTask == nil, let coordinator = accountRecovery, coordinator.hasLocalVerifierSlot,
-              !systemIsSleeping, !needsAccountSignIn, let owner = signedInAccount,
-              coordinator.accountID == e2eDataAccount, coordinator.relayURL == stationRelayUrl else { return }
-        let epoch = accountGeneration, origin = stationRelayUrl, auth = accountAuth
-        let current: @MainActor @Sendable () -> Bool = { [weak self, weak coordinator] in
+    @MainActor func verifierContext(for coordinator: AstationRecoveryCoordinator) throws -> @MainActor @Sendable () -> Bool {
+        guard !systemIsSleeping, !needsAccountSignIn, let owner = signedInAccount,
+              accountRecovery === coordinator, coordinator.accountID == e2eDataAccount,
+              coordinator.relayURL == stationRelayUrl else { throw AccountLoginError.changed }
+        let epoch = accountGeneration, origin = stationRelayUrl, wake = verifierWakeGeneration
+        return { [weak self, weak coordinator] in
             guard let self, let coordinator else { return false }
             return self.accountRecovery === coordinator && self.accountGeneration == epoch &&
                 self.e2eDataAccount == coordinator.accountID && self.stationRelayUrl == origin &&
-                self.signedInAccount == owner && !self.needsAccountSignIn && !self.systemIsSleeping
+                self.signedInAccount == owner && !self.needsAccountSignIn && !self.systemIsSleeping &&
+                self.verifierWakeGeneration == wake
         }
+    }
+
+    @MainActor func verifierTransport(current: @escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport {
+        guard current(), let owner = signedInAccount else { throw AccountLoginError.changed }
+        let origin = stationRelayUrl, auth = accountAuth
+        return try RemoteRecoveryHTTP(relayURL: origin, accessToken: {
+            guard await current(), try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
+            let token = try await auth.accessToken(relayURL: origin)
+            guard try await auth.current()?.session.subject == owner, await current() else { throw AccountLoginError.changed }
+            return token
+        })
+    }
+
+    @MainActor private func pollLocalVerifier() {
+        guard verifierReportTask == nil, let coordinator = accountRecovery, coordinator.hasLocalVerifierSlot,
+              let current = try? verifierContext(for: coordinator) else { return }
         verifierReportTask = Task { [weak self] in
             defer { self?.verifierReportTask = nil }
             // A missing session or locked key is retried on the next tick without opening UI.
             try? await coordinator.answerVerifierChallenges(current: current) { active in
-                try RemoteRecoveryHTTP(relayURL: origin, accessToken: {
-                    guard await active(), try await auth.current()?.session.subject == owner else {
-                        throw AccountLoginError.changed
-                    }
-                    let token = try await auth.accessToken(relayURL: origin)
-                    guard try await auth.current()?.session.subject == owner, await active() else {
-                        throw AccountLoginError.changed
-                    }
-                    return token
-                })
+                guard let self else { throw AccountLoginError.changed }
+                return try self.verifierTransport(current: active)
             }
         }
     }
@@ -2926,6 +2936,7 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         guard !systemIsSleeping else { return }
         systemIsSleeping = true
+        verifierWakeGeneration = UUID()
         verifierReportTask?.cancel()
         resumeRelayAfterSleep = identityRelayReconnectGeneration > 0
         Log.info("[Sessions] Mac sleeping; closing session transports and releasing local authority")

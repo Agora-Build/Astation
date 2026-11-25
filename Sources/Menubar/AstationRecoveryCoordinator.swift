@@ -58,6 +58,7 @@ final class AstationRecoveryCoordinator {
         var supersededHostSenderPublications: [Data]?
         var verifierRosters: [String: AcceptedVerifierRoster]?
         var processRosters: [String: [String: AstationProcessRoster]]?
+        var verifierHistoryRoots: [String: String]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -80,6 +81,7 @@ final class AstationRecoveryCoordinator {
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
     private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
     private let confirmProcessRoster: (() async -> Bool)?
+    private let verifierHistory: @MainActor (MembershipLog, String, Bool) throws -> RemoteMemberVerifierJournal
     private var processReview: ProcessReview?
     private var deliveredVerifierChallenges = Set<String>()
     private var verifierReportGeneration = UUID()
@@ -187,6 +189,8 @@ final class AstationRecoveryCoordinator {
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
         confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)? = nil,
         confirmProcessRoster: (() async -> Bool)? = nil,
+        verifierHistory: @escaping @MainActor (MembershipLog, String, Bool) throws -> RemoteMemberVerifierJournal =
+            RemoteMemberVerifierJournal.init(log:origin:creating:),
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
@@ -207,13 +211,17 @@ final class AstationRecoveryCoordinator {
         self.retainedControlTransport = retainedControlTransport
         self.confirmVerifierRoster = confirmVerifierRoster
         self.confirmProcessRoster = confirmProcessRoster
+        self.verifierHistory = verifierHistory
         self.verifierTime = verifierTime
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard (2...8).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard (2...9).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 9 || saved.verifierHistoryRoots == nil,
+                  (saved.verifierHistoryRoots ?? [:]).count <= 64,
+                  (saved.verifierHistoryRoots ?? [:]).allSatisfy({ PortalIntegrationRecord.validOrigin($0.key) && RemoteRecoveryKit.validHash($0.value) }),
                   saved.version >= 8 || !(saved.processRosters ?? [:]).values.contains(where: {
                       $0.values.contains { $0.localReporterSlot != nil }
                   }),
@@ -1371,6 +1379,10 @@ extension AstationRecoveryCoordinator {
 
     /// Include every active signed-list member, even when none of its processes are online.
     func memberProcessReviews() throws -> [MemberProcessReview] {
+        try memberProcessInventory().map(\.review)
+    }
+
+    private func memberProcessInventory() throws -> [(review: MemberProcessReview, slots: [RemoteMemberVerifierSlot])] {
         guard !busy, !uncertain, let log = membershipLog, log.frozen() == nil,
               log.accountId() == accountID else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
@@ -1379,6 +1391,7 @@ extension AstationRecoveryCoordinator {
         return try log.members().filter { $0.status == .active }.map { member in
             let id = member.deviceId
             let status: MemberProcessReview.Status
+            var slots: [RemoteMemberVerifierSlot] = []
             if member.kind == "service" && (member.expiresAt ?? 0) <= wall {
                 status = .expiredService
             } else if let roster = rosters[id] {
@@ -1386,11 +1399,12 @@ extension AstationRecoveryCoordinator {
                       roster.sequence > 0, roster.sequence <= head.seq else { throw RemoteRecoveryError.invalidCheckpoint }
                 if roster.sequence == head.seq {
                     guard roster.headHash == head.hash else { throw RemoteRecoveryError.invalidCheckpoint }
-                    status = .reviewed(slots: try roster.slots().count)
+                    slots = try roster.slots()
+                    status = .reviewed(slots: slots.count)
                 } else { status = .previousRevision }
             } else { status = .needsReview }
-            return MemberProcessReview(member: id, status: status)
-        }.sorted { $0.member < $1.member }
+            return (review: MemberProcessReview(member: id, status: status), slots: slots)
+        }.sorted { $0.review.member < $1.review.member }
     }
 
     func reviewedProcessSlots(member: String, log: MembershipLog) throws -> [RemoteMemberVerifierSlot] {
@@ -1458,11 +1472,21 @@ extension AstationRecoveryCoordinator {
               lists.reduce(0, { $0 + ($1.earlier?.count ?? 0) }) <= 4096 else { throw RemoteVerifierGateError.invalidRoster }
         guard await confirmProcessRoster() else { throw RemoteRecoveryError.confirmationRequired }
         let confirmedAt = verifierTime()
-        try check(try await refreshedLog(genesis: review.genesis))
+        let log = try await refreshedLog(genesis: review.genesis)
+        try check(log)
+        try requireDurableRecoveryCheckpoint()
+        var roots = saved.verifierHistoryRoots ?? [:]
+        if let genesis = roots[relayURL] {
+            guard genesis == review.genesis else { throw RemoteRecoveryError.invalidCheckpoint }
+        } else {
+            // An interrupted first review may have already created this journal.
+            // The shared opener preserves any existing conflict and downgrade history.
+            _ = try verifierHistory(log, relayURL, true)
+            roots[relayURL] = review.genesis
+        }
         let finished = verifierTime()
         guard finished >= confirmedAt, finished - confirmedAt < 30_000 else { throw RemoteRecoveryError.requiresReview }
-        try requireDurableRecoveryCheckpoint()
-        try persist { $0.version = candidate.localReporterSlot == nil ? 7 : 8; $0.processRosters = rosters }
+        try persist { $0.version = 9; $0.processRosters = rosters; $0.verifierHistoryRoots = roots }
         verifierReportGeneration = UUID()
         deliveredVerifierChallenges.removeAll()
         do { try requireDurableRecoveryCheckpoint() }
@@ -1475,6 +1499,71 @@ extension AstationRecoveryCoordinator {
               let log = membershipLog, log.frozen() == nil else { return false }
         return roster.localReporterSlot != nil && roster.genesis == log.genesisHash() &&
             roster.sequence == log.head().seq && roster.headHash == log.head().hash
+    }
+
+    /// These counts describe this inspection. No live connection or signing
+    /// capability escapes the check, including on cancellation or an error.
+    struct ProcessCheck {
+        let total: Int
+        let pendingMembers: [String]
+        var answered = 0
+        var unanswered: [RemoteMemberVerifierSlot] = []
+    }
+
+    func checkMemberProcesses(current: @escaping @MainActor @Sendable () -> Bool,
+        transport: (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport,
+        waitForReport: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .seconds(5)) },
+        progress: (Int, Int) -> Void) async throws -> ProcessCheck {
+        guard current(), !Task.isCancelled, !busy, !uncertain, let log = membershipLog?.snapshot(),
+              let station = try acceptedStationVerifierRoster() else { throw RemoteVerifierGateError.invalidRoster }
+        let inventory = try memberProcessInventory()
+        let pending = inventory.filter { $0.slots.isEmpty }.map(\.review.member)
+        let slots = inventory.flatMap(\.slots)
+        var result = ProcessCheck(total: slots.count, pendingMembers: pending)
+        if slots.isEmpty { return result }
+        guard saved.verifierHistoryRoots?[relayURL] == log.genesisHash() else { throw RemoteRecoveryError.requiresReview }
+        let head = log.head(), generation = verifierReportGeneration
+        let active: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return current() && !Task.isCancelled && !self.busy && !self.uncertain &&
+                self.verifierReportGeneration == generation && self.membershipLog?.head() == head &&
+                self.membershipLog?.frozen() == nil && self.saved.verifierRosters?[self.relayURL]?.roster == station
+        }
+        let membership: () throws -> MembershipLog = {
+            guard active(), let latest = self.membershipLog else { throw RemoteVerifierGateError.staleConnection }
+            try self.requireDurableRecoveryCheckpoint()
+            try self.identity.requireVerifierManager(log: latest, memberID: self.managerID)
+            return latest
+        }
+        _ = try membership()
+        let journal = try verifierHistory(log, relayURL, false)
+        let gate = try RemoteVerifierSigningGate(log: log, station: station, now: verifierTime)
+        let evidence = try RemoteMemberVerifierEvidence(gate: gate, log: log, origin: relayURL, slots: slots,
+            journal: journal, current: active, now: verifierTime)
+        let poller = RemoteMemberVerifierPoller(evidence: evidence, transport: try transport(active),
+            membership: membership, wall: { self.now().wallMs }, now: verifierTime)
+        defer { poller.retire() }
+        progress(0, slots.count)
+        // Bound issuance and give the four-second Mac responder time to answer.
+        for start in stride(from: 0, to: slots.count, by: 8) {
+            let end = min(start + 8, slots.count)
+            try await withThrowingTaskGroup(of: (RemoteMemberVerifierSlot, Bool).self) { group in
+                for slot in slots[start..<end] {
+                    group.addTask {
+                        _ = try await poller.poll(slot)
+                        try await waitForReport()
+                        return (slot, try await poller.readIssuedChallenge(slot))
+                    }
+                }
+                for try await (slot, answered) in group {
+                    if answered { result.answered += 1 }
+                    else { result.unanswered.append(slot) }
+                }
+            }
+            _ = try membership()
+            progress(end, slots.count)
+        }
+        return result
     }
 
     func answerVerifierChallenges(current: @escaping @MainActor @Sendable () -> Bool,

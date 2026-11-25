@@ -50,6 +50,7 @@ public final class RemoteMemberVerifierEvidence {
     private let now: () -> UInt64
     private let current: () -> Bool
     private var states: [RemoteMemberVerifierSlot: State]
+    private let memberSlots: [String: [RemoteMemberVerifierSlot]]
     private var connections: [String: RemoteVerifierSigningGate.Connection] = [:]
     private var retired = false
     private var lastTime: UInt64
@@ -69,6 +70,7 @@ public final class RemoteMemberVerifierEvidence {
                   return member.kind == "native" || member.kind == "service"
               }) else { throw RemoteVerifierGateError.invalidRoster }
         self.gate = gate; self.log = log.snapshot(); self.origin = origin
+        memberSlots = Dictionary(grouping: slots, by: \.memberID)
         self.journal = journal
         self.current = current; self.now = now
         lastTime = now()
@@ -85,7 +87,7 @@ public final class RemoteMemberVerifierEvidence {
                 throw RemoteVerifierGateError.invalidRoster
             }
         }
-        for id in Set(slots.map(\.memberID)) { connections[id] = try gate.connect(.member(id)) }
+        for id in memberSlots.keys { connections[id] = try gate.connect(.member(id)) }
     }
 
     deinit { for connection in connections.values { gate.disconnect(connection) } }
@@ -203,13 +205,13 @@ public final class RemoteMemberVerifierEvidence {
     /// Recheck synchronously at the protected signing boundary, with the fresh log.
     public func refresh(log: MembershipLog, wallMs: UInt64) throws {
         try check(log)
-        for id in Set(states.keys.map(\.memberID)) {
+        for id in memberSlots.keys {
             if let member = log.member(deviceId: id), member.kind == "service",
                member.expiresAt.map({ wallMs >= $0 }) != false {
                 retire(); throw RemoteVerifierGateError.staleMembership
             }
         }
-        for id in Set(states.keys.map(\.memberID)) { try refreshMember(id) }
+        for id in memberSlots.keys { try refreshMember(id) }
     }
 
     public func retire() {
@@ -264,13 +266,14 @@ public final class RemoteMemberVerifierEvidence {
     private func refreshMember(_ id: String) throws {
         withdraw(id)
         let time = now()
-        for slot in Array(states.keys) where slot.memberID == id {
+        guard let required = memberSlots[id] else { throw RemoteVerifierGateError.invalidRoster }
+        for slot in required {
             if let deadline = states[slot]?.validBefore, time >= deadline {
                 states[slot]?.inventory = nil; states[slot]?.validBefore = nil
             }
         }
-        let slots = states.filter { $0.key.memberID == id }.map(\.value)
-        guard slots.allSatisfy({ !$0.conflicted && $0.pending == nil && $0.inventory != nil &&
+        let slots = required.compactMap { states[$0] }
+        guard slots.count == required.count, slots.allSatisfy({ !$0.conflicted && $0.pending == nil && $0.inventory != nil &&
             $0.validBefore.map { time < $0 } == true }),
               let first = slots.first?.inventory,
               let version = slots.compactMap({ $0.inventory?.version }).min(),

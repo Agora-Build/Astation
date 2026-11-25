@@ -67,8 +67,20 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
 
     /// A roster is valid for one exact signed head. Changing membership requires a fresh roster
     /// and fresh reports; an unsigned server response cannot silently remove an offline verifier.
-    public init(log: MembershipLog, verifiers: [RemoteVerifierID],
+    public convenience init(log: MembershipLog, verifiers: [RemoteVerifierID],
                 now: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws {
+        try self.init(log: log, verifiers: verifiers, includeMembership: false, now: now)
+    }
+
+    /// The signed list supplies all active members and hosts; the protected Station
+    /// roster supplies its replica identities. None starts with live evidence.
+    public convenience init(log: MembershipLog, station: RemoteStationVerifierRoster,
+                now: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws {
+        try self.init(log: log, verifiers: station.replicas.map(station.verifierID), includeMembership: true, now: now)
+    }
+
+    private init(log: MembershipLog, verifiers: [RemoteVerifierID], includeMembership: Bool,
+                 now: @escaping () -> UInt64) throws {
         var required = Set(log.members().filter { $0.status == .active }.map { RemoteVerifierID.member($0.deviceId) })
         var hosts: [String: UInt64] = [:]
         for entry in log.entries() {
@@ -77,11 +89,12 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
                let current = log.host(hostId: id) { hosts[id] = current.hostTrustGen }
         }
         required.formUnion(hosts.keys.map { .host($0) })
-        let roster = Set(verifiers)
-        guard log.frozen() == nil, !verifiers.isEmpty, verifiers.count <= 4096,
-              roster.count == verifiers.count, required.isSubset(of: roster),
-              verifiers.contains(where: { if case .stationReplica = $0 { return true }; return false }),
-              verifiers.allSatisfy({ id in
+        let supplied = Set(verifiers)
+        let roster = includeMembership ? supplied.union(required) : supplied
+        guard log.frozen() == nil, !roster.isEmpty, roster.count <= 4096,
+              supplied.count == verifiers.count, required.isSubset(of: roster),
+              roster.contains(where: { if case .stationReplica = $0 { return true }; return false }),
+              roster.allSatisfy({ id in
                   let name: String
                   switch id {
                   case .host(let value), .member(let value): name = value
@@ -94,7 +107,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         head = log.head()
         hostGenerations = hosts
         self.now = now
-        states = Dictionary(uniqueKeysWithValues: verifiers.map { ($0, State()) })
+        states = Dictionary(uniqueKeysWithValues: roster.map { ($0, State()) })
     }
 
     public func connect(_ verifier: RemoteVerifierID) throws -> Connection {

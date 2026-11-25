@@ -401,7 +401,22 @@ sleeping, or changing membership invalidates the in-flight work. After a process
 restart the Mac reports its new SDK process ID under the saved slot, allowing a
 consumer to detect the conflict and require a new review.
 
+**Check Live Processes** in the Mac's Host Sending Access window inspects the
+reviewed member slots on the selected Station. It uses the protected Station
+roster and signed device list. Members without an eligible review stay visible.
+The Mac issues up to eight challenges at a time and reads each original nonce
+after allowing the responders five seconds to answer. The result counts reports
+verified during the inspection. Different batches can finish at different
+times. No signing permission or live proof survives closing the check.
+
+The first protected process review on this build opens the persistent conflict
+and inventory journal and pins its origin and genesis in the account checkpoint.
+For earlier reviews, confirm one process list on this Station to initialize the
+journal. Once pinned, a missing journal stops a live check before any challenge
+is sent. Account changes, sleep, roster changes and membership changes invalidate
+in-flight work. The check uses existing keys without interaction.
+
 The review covers one member at one Station. The production provider must
 establish coverage for every active member, host and Station replica, and
 obtain independent evidence from every required process. Third-party service
-carriage, consumer-side scheduling across participants and VII.A are still open.
+carriage, continuous evidence at the protected signing boundary and VII.A are still open.
