@@ -1805,6 +1805,32 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
     }
 
+    func testKeyProviderRequiresInventoryForServiceEnrollmentAndRoleChanges() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let key = try h.identity.remotePublicKeys(create: false).signing
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: coordinator.managerID, publicKey: key)
+        let log = try await coordinator.serviceMembership()
+        let clock = AstationRecoveryCoordinator.clock()
+        for operations in [["view"], ["launch", "view"], ["message", "view"], ["notify", "view"]] {
+            let enrollment = try await service(coordinator, operations: operations)
+            let roles: [String: Any] = ["action": "set_roles", "device_id": "service-test", "roles": ["service"],
+                "scope": ["hosts": ["host-a"], "ops": operations], "expires_at": clock.wallMs + 600_000]
+            let change = try log.draftEntry(signer: coordinator.managerID, signedAt: clock.wallMs, actionJson: recoveryTestJSON(roles))
+            for body in [enrollment.bodyJSON, change] {
+                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: coordinator.managerID)
+                let before = h.identityCryptography.signingCalls
+                if operations == ["view"] {
+                    XCTAssertNoThrow(try provider.sign(request: request))
+                    XCTAssertEqual(h.identityCryptography.signingCalls, before + 1)
+                } else {
+                    XCTAssertThrowsError(try provider.sign(request: request))
+                    XCTAssertEqual(h.identityCryptography.signingCalls, before)
+                }
+            }
+        }
+    }
+
     func testNewServiceOperationsRecheckInventoryAfterConfirmationAndAtTheKeyBoundary() async throws {
         for failAt in [2, 3] {
             let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
