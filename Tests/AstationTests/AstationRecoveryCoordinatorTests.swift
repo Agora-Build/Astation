@@ -754,8 +754,19 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         config.protocolClasses = [RecoveryReportHTTPStub.self]
         var issued: [String: String] = [:]
         var reads = 0
+        var rosterGeneration = 1
+        let inventory = verifierInventory()
         RecoveryReportHTTPStub.lock.withLock {
             RecoveryReportHTTPStub.response = { request, data in
+                if request.url?.lastPathComponent == "verifiers" {
+                    XCTAssertEqual(request.httpMethod, "GET")
+                    let rows: [[String: Any]] = [
+                        ["id": "a", "connection_generation": 2, "authorization_ms_left": 30_000,
+                         "verifier": ["version": inventory.version, "actions": inventory.actions]],
+                        ["id": "b", "connection_generation": 1]]
+                    return try JSONSerialization.data(withJSONObject: ["origin": origin, "account_id": log.accountId(),
+                        "genesis_hash": log.genesisHash(), "roster_generation": rosterGeneration, "head": head, "replicas": rows])
+                }
                 let nonce: String
                 if request.httpMethod == "POST" {
                     let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -798,7 +809,14 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.answered, 1)
         XCTAssertEqual(result.unanswered.map(\.slot), ["offline"])
         XCTAssertEqual(result.pendingMembers, ["manager-b"])
+        XCTAssertEqual(result.serverCount, 2)
+        XCTAssertEqual(result.unconfirmedServers, ["b"])
         XCTAssertFalse(restarted.hostSenderControlsAvailable)
+        rosterGeneration = 2
+        do { _ = try await check(); XCTFail("unreviewed server roster accepted") }
+        catch RemoteVerifierGateError.staleMembership {}
+        XCTAssertEqual(issued.count, 2, "validate the reviewed server list before creating challenges")
+        rosterGeneration = 1
         do {
             _ = try await check { await MainActor.run { activeAccount = false } }
             XCTFail("signed-out check returned a result")
@@ -811,6 +829,44 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         catch RemoteVerifierGateError.invalidInventory {}
         XCTAssertEqual(issued.count, requestsBeforeStorageLoss)
         XCTAssertNil(h.verifierHistoryBytes[origin])
+    }
+
+    func testLiveServerCheckWorksBeforeProcessReviewAndDropsRepliesAfterAccountChange() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in true })
+        _ = try await coordinator.setup()
+        let roster = try await coordinator.prepareStationVerifierRoster(current: { true })
+        try await coordinator.acceptStationVerifierRoster(roster, current: { true })
+        let log = try await coordinator.hostSenderMembership()
+        let origin = coordinator.relayURL
+        let body = try JSONSerialization.data(withJSONObject: ["origin": origin, "account_id": log.accountId(),
+            "genesis_hash": log.genesisHash(), "roster_generation": 1, "replicas": [["id": "a"], ["id": "b"]],
+            "head": ["seq": log.head().seq, "hash": log.head().hash]])
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryReportHTTPStub.self]
+        RecoveryReportHTTPStub.lock.withLock {
+            RecoveryReportHTTPStub.response = { request, _ in
+                XCTAssertEqual(request.url?.lastPathComponent, "verifiers")
+                return body
+            }
+        }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        var selected = true
+        func check(switchAccount: Bool) async throws -> AstationRecoveryCoordinator.ProcessCheck {
+            try await coordinator.checkMemberProcesses(current: { selected }, transport: { _ in
+                try RemoteRecoveryHTTP(relayURL: origin, configuration: config) {
+                    if switchAccount { await MainActor.run { selected = false } }
+                    return "test-token"
+                }
+            }, progress: { _, _ in })
+        }
+        let result = try await check(switchAccount: false)
+        XCTAssertEqual(result.unconfirmedServers, ["a", "b"])
+        XCTAssertEqual(result.pendingMembers, [coordinator.managerID])
+        XCTAssertEqual(result.total, 0)
+        XCTAssertTrue(h.verifierHistoryBytes.isEmpty)
+        do { _ = try await check(switchAccount: true); XCTFail("accepted a response for the previous account") }
+        catch RemoteVerifierGateError.staleConnection {}
     }
 
     func testReviewedMacAnswersStationInboxAndRetriesOnlyUnconfirmedReports() async throws {
