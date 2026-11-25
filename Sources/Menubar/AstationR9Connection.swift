@@ -107,6 +107,11 @@ final class AstationR9Connection {
         router.receive(bytes, generation: generation)
     }
 
+    func hasLiveVerifierReport(in gate: RemoteVerifierSigningGate) -> Bool {
+        guard isCurrent, let membershipLog, (try? gate.requireMembership(membershipLog)) != nil else { return false }
+        return channel?.hasLiveVerifierReport(hostID: context.device, in: gate) == true
+    }
+
     func send(_ message: AstationMessage) -> Bool {
         guard !closed, current(), let channel, channel.phase == .ready, message.isPrivateAgentTraffic,
               let bytes = try? JSONEncoder().encode(message), let json = String(data: bytes, encoding: .utf8) else { return false }

@@ -411,6 +411,11 @@ device-list head and protected server roster before issuing any member
 challenge. A changed roster requires a new server review. A reviewed server
 without a live inventory is listed by name. The server check also works when
 no member process has been reviewed. Members without an eligible review stay visible.
+The same check lists hosts from the signed device list, including offline
+hosts. For each host the Mac checks its current encrypted channels for a
+verified welcome at the reviewed membership head and trust generation.
+Reading a welcome uses its original receipt time. Losing the channel or
+observing a different head withdraws that report.
 The Mac issues up to eight challenges at a time and reads each original nonce
 after allowing the responders five seconds to answer. The result counts reports
 verified during the inspection. Different batches can finish at different

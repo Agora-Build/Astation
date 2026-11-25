@@ -310,8 +310,28 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
                 h.channel.checkDeadline()
             }
             XCTAssertEqual(h.channel.phase, .closed, reason)
+            XCTAssertFalse(h.channel.hasLiveVerifierReport(hostID: "host", in: gate), reason)
             XCTAssertThrowsError(try gate.authorize(request, log: f.log), reason)
         }
+    }
+
+    @MainActor
+    func testInspectingAnExistingChannelUsesItsOriginalWelcomeAndCannotAuthorizeSigning() async throws {
+        let f = try VerifierFixture()
+        var tick: UInt64 = 100
+        let (channelGate, _) = try f.confirmedGate(now: { tick })
+        let inspection = try RemoteVerifierSigningGate(log: f.log, verifiers: f.roster, now: { tick })
+        let channel = VerifierChannelHarness(gate: channelGate, welcome: f.welcome(), now: { tick })
+        XCTAssertEqual(inspection.enrolledHostIDs, ["host"])
+        XCTAssertFalse(channel.channel.hasLiveVerifierReport(hostID: "host", in: inspection))
+        try await channel.welcome()
+        tick = 1_099
+        XCTAssertTrue(channel.channel.hasLiveVerifierReport(hostID: "host", in: inspection))
+        XCTAssertFalse(channel.channel.hasLiveVerifierReport(hostID: "another-host", in: inspection))
+        XCTAssertThrowsError(try inspection.authorize(f.review().signingRequest(managerID: "manager"), log: f.log))
+        tick = 1_100
+        XCTAssertFalse(channel.channel.hasLiveVerifierReport(hostID: "host", in: inspection))
+        XCTAssertEqual(channel.channel.phase, .ready, "Inspection must not depend on a timely close callback")
     }
 
     @MainActor
@@ -335,6 +355,7 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         h.channel.receive(Data(), from: h.route)
         XCTAssertTrue(changed)
         XCTAssertEqual(h.channel.phase, .ready)
+        XCTAssertFalse(h.channel.hasLiveVerifierReport(hostID: "host", in: gate))
         XCTAssertThrowsError(try gate.authorize(request, log: f.log))
     }
 
@@ -362,6 +383,7 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
             let (gate, _) = try f.confirmedGate()
             let h = VerifierChannelHarness(gate: gate, welcome: f.welcome(inventory: inventory))
             try await h.welcome()
+            XCTAssertFalse(h.channel.hasLiveVerifierReport(hostID: "host", in: gate))
             XCTAssertNoThrow(try h.channel.perform(.list))
             XCTAssertThrowsError(try gate.authorize(request, log: f.log))
             h.channel.disconnect()
