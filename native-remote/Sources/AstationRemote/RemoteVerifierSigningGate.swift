@@ -62,26 +62,33 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     private let genesisHash: String
     private let head: LogHead
     private let hostGenerations: [String: UInt64]
+    private let firstServiceExpiry: UInt64?
+    private let wall: () -> UInt64
+    private var serviceClock: (wall: UInt64, tick: UInt64)
     private let now: () -> UInt64
     private var states: [RemoteVerifierID: State]
 
     /// A roster is valid for one exact signed head. Changing membership requires a fresh roster
     /// and fresh reports; an unsigned server response cannot silently remove an offline verifier.
     public convenience init(log: MembershipLog, verifiers: [RemoteVerifierID],
+                wall: @escaping () -> UInt64 = { UInt64(max(0, Date().timeIntervalSince1970 * 1000)) },
                 now: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws {
-        try self.init(log: log, verifiers: verifiers, includeMembership: false, now: now)
+        try self.init(log: log, verifiers: verifiers, includeMembership: false, wall: wall, now: now)
     }
 
     /// The signed list supplies all active members and hosts; the protected Station
     /// roster supplies its replica identities. None starts with live evidence.
     public convenience init(log: MembershipLog, station: RemoteStationVerifierRoster,
+                wall: @escaping () -> UInt64 = { UInt64(max(0, Date().timeIntervalSince1970 * 1000)) },
                 now: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws {
-        try self.init(log: log, verifiers: station.replicas.map(station.verifierID), includeMembership: true, now: now)
+        try self.init(log: log, verifiers: station.replicas.map(station.verifierID), includeMembership: true, wall: wall, now: now)
     }
 
     private init(log: MembershipLog, verifiers: [RemoteVerifierID], includeMembership: Bool,
-                 now: @escaping () -> UInt64) throws {
-        var required = Set(log.members().filter { $0.status == .active }.map { RemoteVerifierID.member($0.deviceId) })
+                 wall: @escaping () -> UInt64, now: @escaping () -> UInt64) throws {
+        let members = log.members().filter { $0.status == .active }
+        var required = Set(members.map { RemoteVerifierID.member($0.deviceId) })
+        firstServiceExpiry = members.filter { $0.kind == "service" }.map { $0.expiresAt ?? 0 }.min()
         var hosts: [String: UInt64] = [:]
         for entry in log.entries() {
             let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
@@ -107,6 +114,8 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         head = log.head()
         hostGenerations = hosts
         self.now = now
+        self.wall = wall
+        serviceClock = (wall(), now())
         states = Dictionary(uniqueKeysWithValues: roster.map { ($0, State()) })
     }
 
@@ -275,13 +284,25 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
               (body["seq"] as? NSNumber)?.uint64Value == head.seq + 1 else {
             throw RemoteVerifierGateError.staleMembership
         }
+        var expiry = firstServiceExpiry
         if action == "add" {
             guard let member = body["member"] as? [String: Any], let id = member["device_id"] as? String,
+                  let proposedExpiry = member["expires_at"] as? UInt64,
                   states[.member(id)]?.prospectiveRequest == request else {
                 throw RemoteVerifierGateError.unconfirmedVerifiers
             }
+            expiry = min(expiry ?? proposedExpiry, proposedExpiry)
         }
         let current = now()
+        if let expiry {
+            // A fresh replica report cannot extend signed membership through expiry or a clock rollback.
+            guard current >= serviceClock.tick else { throw RemoteVerifierGateError.staleConnection }
+            let elapsed = current - serviceClock.tick
+            let projected = serviceClock.wall.addingReportingOverflow(elapsed)
+            guard !projected.overflow else { throw RemoteVerifierGateError.staleConnection }
+            serviceClock = (max(wall(), projected.partialValue), current)
+            guard serviceClock.wall < expiry else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+        }
         guard states.values.allSatisfy({ state in
             guard state.connection != nil, let inventory = state.confirmed else { return false }
             if let deadline = state.validBefore, current >= deadline { return false }

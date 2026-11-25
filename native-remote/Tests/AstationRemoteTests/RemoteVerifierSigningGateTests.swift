@@ -614,7 +614,7 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         XCTAssertThrowsError(try missing.authorize(request, log: f.log), "The prospective service verifier must also be enumerated")
         let roster = f.roster + [.member("service")]
         var time: UInt64 = 100
-        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster, now: { time })
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster, wall: { f.clock.wallMs }, now: { time })
         let newActions: Set<String> = ["host_enc_key", "host_sender_readmit", "host_sender_revoke", "project_remove", "project_set"]
         let v1 = VerifierInventory(version: 1, actions: verifierInventory().actions.filter { !newActions.contains($0) })
         var service: RemoteVerifierSigningGate.Connection?
@@ -663,7 +663,8 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         var time: UInt64 = 100
         let required = f.roster.filter { if case .stationReplica = $0 { return false }; return true }
             + roster.replicas.map(roster.verifierID) + [.member(service)]
-        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, now: { time })
+        var wall = f.clock.wallMs
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, wall: { wall }, now: { time })
         for id in f.roster {
             if case .stationReplica = id { continue }
             let connection = try gate.connect(id)
@@ -708,6 +709,14 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         XCTAssertThrowsError(try gate.authorize(request, log: f.log), "The shortest finite service/replica lifetime expired")
         XCTAssertThrowsError(try source.receive(snapshot(), for: source.begin()), "Replaying old bytes cannot extend their lifetime")
         XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        // A fresh lease on every replica still expires at the signed service deadline.
+        wall = f.clock.wallMs + 3_600_000 - 1
+        try source.receive(snapshot(lifetime: 1_000), for: source.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        wall += 1
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        wall = f.clock.wallMs
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "A wall clock correction cannot restore expired evidence")
         source.retire()
         XCTAssertThrowsError(try source.begin())
     }
@@ -735,7 +744,9 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         let roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
         let required = f.roster.filter { if case .stationReplica = $0 { return false }; return true }
             + roster.replicas.map(roster.verifierID) + [.member(id)]
-        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, now: { 100 })
+        var wall = f.clock.wallMs
+        var tick: UInt64 = 100
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, wall: { wall }, now: { tick })
         for verifier in f.roster {
             if case .stationReplica = verifier { continue }
             let connection = try gate.connect(verifier)
@@ -774,6 +785,11 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         XCTAssertNil(f.log.member(deviceId: id))
         var wrong = request; wrong.bodyJson = body.replacingOccurrences(of: "\"account\"", with: "\"another-account\"")
         XCTAssertThrowsError(try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: [id], prospectiveRequest: wrong))
+        wall = f.clock.wallMs + 3_600_000 - 1
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        wall = f.clock.wallMs
+        tick += 1
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Elapsed time exhausted the proposed membership before the replica leases")
         source.retire()
         XCTAssertThrowsError(try gate.authorize(request, log: f.log))
     }
