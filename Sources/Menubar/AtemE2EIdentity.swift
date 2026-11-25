@@ -353,7 +353,7 @@ final class AtemE2EIdentity {
               request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: request.keyId)) else {
             throw AtemIdentityError.identityChanged
         }
-        if [.project, .hostSender, .hostEncKey].contains(request.purpose) {
+        if try membershipRequiredVersion(bodyJson: body) != nil {
             guard authorizeNewMembership != nil else { throw AtemIdentityError.invalidState }
         }
         try authorizeNewMembership?(request)
