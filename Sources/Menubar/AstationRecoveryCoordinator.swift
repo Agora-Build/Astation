@@ -1360,6 +1360,39 @@ extension AstationRecoveryCoordinator {
 
     var processReviewAvailable: Bool { confirmProcessRoster != nil }
 
+    struct MemberProcessReview: Equatable {
+        enum Status: Equatable {
+            case needsReview, previousRevision, expiredService
+            case reviewed(slots: Int)
+        }
+        let member: String
+        let status: Status
+    }
+
+    /// Include every active signed-list member, even when none of its processes are online.
+    func memberProcessReviews() throws -> [MemberProcessReview] {
+        guard !busy, !uncertain, let log = membershipLog, log.frozen() == nil,
+              log.accountId() == accountID else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        let head = log.head(), genesis = log.genesisHash(), wall = now().wallMs
+        let rosters = saved.processRosters?[relayURL] ?? [:]
+        return try log.members().filter { $0.status == .active }.map { member in
+            let id = member.deviceId
+            let status: MemberProcessReview.Status
+            if member.kind == "service" && (member.expiresAt ?? 0) <= wall {
+                status = .expiredService
+            } else if let roster = rosters[id] {
+                guard roster.member == id, roster.origin == relayURL, roster.genesis == genesis,
+                      roster.sequence > 0, roster.sequence <= head.seq else { throw RemoteRecoveryError.invalidCheckpoint }
+                if roster.sequence == head.seq {
+                    guard roster.headHash == head.hash else { throw RemoteRecoveryError.invalidCheckpoint }
+                    status = .reviewed(slots: try roster.slots().count)
+                } else { status = .previousRevision }
+            } else { status = .needsReview }
+            return MemberProcessReview(member: id, status: status)
+        }.sorted { $0.member < $1.member }
+    }
+
     func reviewedProcessSlots(member: String, log: MembershipLog) throws -> [RemoteMemberVerifierSlot] {
         guard !uncertain, let roster = saved.processRosters?[relayURL]?[member], roster.member == member,
               roster.origin == relayURL, log.accountId() == accountID, log.frozen() == nil,
