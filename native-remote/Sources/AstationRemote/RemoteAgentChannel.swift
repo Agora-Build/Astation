@@ -188,9 +188,11 @@ public final class RemoteAgentChannel {
     }
 
     /// Read the current channel without changing its verifier connection or renewing its welcome.
-    public func hasLiveVerifierReport(hostID: String, in gate: RemoteVerifierSigningGate) -> Bool {
+    public func hasLiveVerifierReport(hostID: String, in gate: RemoteVerifierSigningGate,
+                                      requirement: VerifierRequirement? = nil) -> Bool {
         guard phase == .ready, let verifierWelcome else { return false }
-        return gate.hasHostReport(verifierWelcome.info, id: hostID, receivedAt: verifierWelcome.receivedAt)
+        return gate.hasHostReport(verifierWelcome.info, id: hostID, receivedAt: verifierWelcome.receivedAt,
+            requirement: requirement)
     }
 
     /// Caller retains request IDs durably before submitting; this adapter never retries a command.

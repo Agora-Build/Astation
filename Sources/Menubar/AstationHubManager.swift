@@ -376,11 +376,17 @@ class AstationHubManager: ObservableObject {
     }
 
     @MainActor func hostsWithLiveVerifierReports(in gate: RemoteVerifierSigningGate) -> Set<String> {
+        Set(verifierHostChannels(gate, requirement: nil).keys)
+    }
+
+    @MainActor func verifierHostChannels(_ gate: RemoteVerifierSigningGate,
+                                         requirement: VerifierRequirement?) -> [String: Set<UUID>] {
         let links = Array(r9Connections.values) + Array(policyR9Connections.values)
         let current = links.filter { $0.isCurrent && $0.context.account == e2eDataAccount }
-        return Set(Dictionary(grouping: current, by: { $0.context.device }).compactMap { host, channels in
-            channels.allSatisfy { $0.hasLiveVerifierReport(in: gate) } ? host : nil
-        })
+        return Dictionary(grouping: current, by: { $0.context.device }).compactMapValues { channels in
+            guard channels.allSatisfy({ $0.hasLiveVerifierReport(in: gate, requirement: requirement) }) else { return nil }
+            return Set(channels.map(\.generation))
+        }
     }
 
     @MainActor func verifierTransport(current: @escaping @MainActor @Sendable () -> Bool) throws -> RemoteRecoveryHTTP {

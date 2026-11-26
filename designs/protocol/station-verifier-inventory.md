@@ -416,6 +416,15 @@ hosts. For each host the Mac checks its current encrypted channels for a
 verified welcome at the reviewed membership head and trust generation.
 Reading a welcome uses its original receipt time. Losing the channel or
 observing a different head withdraws that report.
+
+When approving service enrollment with launch, message or notify, the Mac
+checks the SDK requirement for the exact membership entry against every
+enrolled host. Hosts outside the service's scope also verify the device
+list. Every current session and policy channel for each host must report
+the required action and version. The Mac compares the channel generations
+and reviewed Station roster before and after owner confirmation and at the
+signing key. Delivery of an already signed append uses its saved bytes.
+The independent all-participant check is still required for a new signature.
 The Mac issues up to eight challenges at a time and reads each original nonce
 after allowing the responders five seconds to answer. The result counts reports
 verified during the inspection. Different batches can finish at different
