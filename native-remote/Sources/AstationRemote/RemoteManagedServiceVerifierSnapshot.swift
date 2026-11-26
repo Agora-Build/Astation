@@ -111,7 +111,7 @@ public final class RemoteManagedServiceVerifierEvidence {
     /// The same protected service key and replica processes must answer on both
     /// sides of owner confirmation. The lease starts before token acquisition.
     public func refreshEnrollment(using transport: any RemoteManagedServiceVerifierTransport,
-                                  current: () throws -> Void) async throws {
+                                  current: () throws -> Void) async throws -> [UInt64] {
         guard prospective != nil else { throw RemoteVerifierGateError.unsupportedEntry }
         let expected = try begin()
         do {
@@ -128,6 +128,7 @@ public final class RemoteManagedServiceVerifierEvidence {
             try receive(snapshot, for: expected)
             try requireEnrollment(log: log)
             reviewedGenerations = generations
+            return generations
         } catch {
             failed(expected)
             throw error

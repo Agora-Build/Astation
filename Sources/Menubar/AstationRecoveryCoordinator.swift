@@ -1556,7 +1556,7 @@ extension AstationRecoveryCoordinator {
     func serviceStationVerifier(for approval: RemoteServiceApproval, current: @escaping @MainActor @Sendable () -> Bool,
         transport: @escaping (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteManagedServiceVerifierTransport
     ) -> (MembershipLog) async throws -> ((MembershipLog) throws -> Void) {
-        var source: RemoteManagedServiceVerifierEvidence?
+        var sources: [RemoteManagedServiceVerifierEvidence] = []
         var reviewedRoster: RemoteStationVerifierRoster?
         func checkContext(_ log: MembershipLog) throws {
             guard current(), !Task.isCancelled, !uncertain, approval.stationOrigin == relayURL,
@@ -1568,23 +1568,34 @@ extension AstationRecoveryCoordinator {
             try requireDurableRecoveryCheckpoint()
         }
         return { log in
-            if source == nil {
+            if sources.isEmpty {
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: self.managerID)
                 let service = try RemoteServiceReview(approval: approval).serviceID
                 guard let roster = try self.acceptedStationVerifierRoster() else { throw RemoteVerifierGateError.invalidRoster }
                 reviewedRoster = roster
                 try checkContext(log)
-                let gate = try RemoteVerifierSigningGate(log: log, station: roster, prospectiveServiceID: service,
-                    wall: { self.now().wallMs }, now: self.verifierTime)
-                source = try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: log,
-                    memberIDs: [service], prospectiveRequest: request)
+                let existing = log.members().filter { $0.kind == "service" && $0.status == .active }.map(\.deviceId).sorted()
+                // The proposed key binds every page to the same enrollment. Separate gates
+                // preserve each page's original deadline, even when later pages are fresh.
+                sources = try stride(from: 0, to: max(1, existing.count), by: 63).map { start in
+                    let ids = (existing[start..<min(start + 63, existing.count)] + [service]).sorted()
+                    let gate = try RemoteVerifierSigningGate(log: log, station: roster, prospectiveServiceID: service,
+                        wall: { self.now().wallMs }, now: self.verifierTime)
+                    return try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: log,
+                        memberIDs: ids, prospectiveRequest: request)
+                }
             }
-            guard let source else { throw RemoteVerifierGateError.invalidRoster }
             try checkContext(log)
-            try await source.refreshEnrollment(using: transport(current)) { try checkContext(log) }
+            let carrier = try transport(current)
+            var generations: [UInt64]?
+            for source in sources {
+                let reported = try await source.refreshEnrollment(using: carrier) { try checkContext(log) }
+                guard generations == nil || generations == reported else { throw RemoteVerifierGateError.staleConnection }
+                generations = reported
+            }
             return { latest in
                 try checkContext(latest)
-                try source.requireEnrollment(log: latest)
+                for source in sources { try source.requireEnrollment(log: latest) }
             }
         }
     }
