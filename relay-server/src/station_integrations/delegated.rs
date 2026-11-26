@@ -109,21 +109,12 @@ impl StationIntegrations {
         }
     }
 
-    fn report_control_binding(&self) -> String {
-        json!([
-            self.binding.issuer,
-            self.binding.portal_origin,
-            self.binding.station_origin
-        ])
-        .to_string()
-    }
-
     async fn initialize_report_control(&self, resume: Option<&str>) -> Result<(), ()> {
         let resume = resume
             .map(uuid::Uuid::parse_str)
             .transpose()
             .map_err(|_| ())?;
-        let key = self.report_control_binding();
+        let key = self.binding.report_control_binding();
         let mut tx = self.policies.0.begin().await.map_err(|_| ())?;
         self.app.recovery.lock_delegated_recovery(&mut tx).await.map_err(|_| ())?;
         let initial = vec![ReportControlEvent::Resume(
@@ -173,7 +164,7 @@ impl StationIntegrations {
             if self.app.recovery.lock_delegated_recovery(&mut tx).await.is_err() {
                 return;
             }
-            let key = self.report_control_binding();
+            let key = self.binding.report_control_binding();
             let Ok((value, in_flight)) = sqlx::query_as::<_, (Value, Option<String>)>(
                 "SELECT events,in_flight FROM station_delegated_reporting WHERE binding=$1 FOR UPDATE")
                 .bind(&key).fetch_one(&mut *tx).await else { return };
@@ -387,6 +378,71 @@ mod tests {
         assert_eq!(after_reports, report_state, "recovery does not resume a stopped report client");
         drop(runtime);
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_recovery_retains_the_shared_reporting_journal_across_restore() {
+        use crate::remote_api::recovery::delegated_recovery::{plan::prepare_with_sources, Binding};
+        let (db, runtime, _) = super::super::tests::fixture_at_station(
+            "https://auth.example", None, "https://station-dev.agora.build",
+        ).await;
+        let origin = &runtime.binding.station_origin;
+        runtime.app.recovery.configure_delegated(origin, 1).await.unwrap();
+        let resume = uuid::Uuid::new_v4().to_string();
+        runtime.initialize_report_control(Some(&resume)).await.unwrap();
+        let a = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        let b = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        assert_ne!(a, b);
+        let key = runtime.binding.report_control_binding();
+        let claim = uuid::Uuid::new_v4().to_string();
+        sqlx::query("UPDATE station_delegated_reporting SET in_flight=$2 WHERE binding=$1")
+            .bind(&key).bind(&claim).execute(&db.pool).await.unwrap();
+        let fence = Binding::new(origin, 2).unwrap();
+        fence.initialize(&db.pool, true).await.unwrap();
+        let replica = db.reconnect(3).await;
+        let (one, two) = tokio::join!(
+            prepare_with_sources(&db.pool, &fence, &a, None, Some(&runtime.binding), None),
+            prepare_with_sources(&replica, &fence, &b, None, Some(&runtime.binding), None),
+        );
+        let report = one.unwrap()["reporting_history"].clone();
+        assert_eq!(two.unwrap()["reporting_history"], report);
+        assert_eq!(report["distinct_journals"], 1);
+        assert_eq!(report["observed_uncertain_delivery"], true);
+        assert!(!report.to_string().contains(&claim));
+        assert!(!report.to_string().contains(&resume));
+        let archived: Value = sqlx::query_scalar("SELECT journal FROM station_delegated_reporting_history")
+            .fetch_one(&replica).await.unwrap();
+        assert_eq!(archived["resume_ids"], json!([resume]));
+        assert_eq!(archived["in_flight"], claim);
+        let mut other = runtime.binding.clone();
+        other.portal_origin = "https://another-portal.example".into();
+        let separate = prepare_with_sources(&replica, &fence, &a, None, Some(&other), None).await.unwrap();
+        assert_eq!(separate["reporting_history"]["distinct_journals"], 0);
+        assert!(separate["reporting_history"]["current_evidence_hash"].is_null());
+
+        // A later restore can retain a stop instead of the outstanding delivery.
+        let events = json!([ReportControlEvent::Stop(runtime.binding.report_client_id.clone())]);
+        sqlx::query("UPDATE station_delegated_reporting SET events=$2,in_flight=NULL WHERE binding=$1")
+            .bind(&key).bind(events).execute(&db.pool).await.unwrap();
+        let next = Binding::new(origin, 3).unwrap();
+        next.initialize(&replica, true).await.unwrap();
+        let review = prepare_with_sources(&replica, &next, &a, None, Some(&runtime.binding), None).await.unwrap();
+        let retained = &review["reporting_history"];
+        assert_eq!(retained["distinct_journals"], 2);
+        assert_eq!(retained["observed_stopped_client"], true);
+        assert_eq!(retained["observed_uncertain_delivery"], true);
+        assert_ne!(retained["current_evidence_hash"], report["current_evidence_hash"]);
+        sqlx::query("DELETE FROM station_delegated_report_resumptions WHERE binding=$1")
+            .bind(&key).execute(&db.pool).await.unwrap();
+        sqlx::query("DELETE FROM station_delegated_reporting WHERE binding=$1")
+            .bind(&key).execute(&db.pool).await.unwrap();
+        let missing = prepare_with_sources(&db.pool, &next, &a, None, Some(&runtime.binding), None).await.unwrap();
+        assert!(missing["reporting_history"]["current_evidence_hash"].is_null());
+        assert_eq!(missing["reporting_history"]["distinct_journals"], 2);
+        assert_eq!(missing["recovery_ready"], false);
+        drop((runtime, replica));
+        db.cleanup().await;
     }
 
     #[tokio::test]

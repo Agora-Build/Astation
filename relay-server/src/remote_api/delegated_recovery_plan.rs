@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 #[path = "delegated_portal_services.rs"]
 mod portal_services;
+#[path = "delegated_reporting_history.rs"]
+mod reporting_history;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
@@ -139,6 +141,7 @@ pub(crate) async fn prepare_with_sources(
             "source": source,
         }))?.into();
         report["portal_service_evidence"] = source;
+        report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
     }
     tx.commit().await?;
     Ok(report)
