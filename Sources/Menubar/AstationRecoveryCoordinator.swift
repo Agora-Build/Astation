@@ -2689,7 +2689,7 @@ extension AstationRecoveryCoordinator {
         try controls().cancelUnsigned(recordID: review.body.recordId, authorJournal: readControlJournal)
     }
 
-    func refreshControlActivity(stationOrigin: String? = nil, current: () -> Bool) async throws -> [RemoteControlActivity] {
+    func refreshControlActivity(stationOrigin: String? = nil, current: @escaping () -> Bool) async throws -> [RemoteControlActivity] {
         try begin(); defer { busy = false }
         guard delegatedControlsAvailable, current(), let kit = try currentKit(), let anchor = membershipLog else {
             throw AstationDelegatedControlError.notVerified
@@ -2704,21 +2704,56 @@ extension AstationRecoveryCoordinator {
         try requireControlActivitySource(origin: origin, log: log)
         let activity = try controls(stationOrigin: origin).activity(log: log)
         let ids = activity.filter(\.signed).map { $0.body.recordId }
-        var reports: [String: RemoteControlApplicationState] = [:]
-        for offset in stride(from: 0, to: ids.count, by: 64) {
-            let page = try await transport.controlStatus(genesisHash: kit.genesisHash,
-                recordIDs: Array(ids[offset..<min(offset + 64, ids.count)]), expected: log.head())
-            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-            try requireControlActivitySource(origin: origin, log: log)
-            reports.merge(page) { _, new in new }
+        func readStatus(_ station: String, _ transport: RemoteControlStatusTransport,
+            _ recordIDs: [String]) async throws -> [String: RemoteControlApplicationState] {
+            var result: [String: RemoteControlApplicationState] = [:]
+            for offset in stride(from: 0, to: recordIDs.count, by: 64) {
+                let batch = Array(recordIDs[offset..<min(offset + 64, recordIDs.count)])
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                try requireControlActivitySource(origin: station, log: log)
+                let page = try await transport.controlStatus(genesisHash: kit.genesisHash, recordIDs: batch, expected: log.head())
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                try requireControlActivitySource(origin: station, log: log)
+                guard Set(page.keys) == Set(batch) else { throw RemoteRecoveryTransportError.invalidResponse }
+                result.merge(page) { _, new in new }
+            }
+            return result
         }
+        let reports = try await readStatus(origin, transport, ids)
+        // Query only destinations named by this signed record, once its source
+        // reports application. A storage receipt cannot settle a peer's effects.
+        var peerIDs: [String: [String]] = [:]
+        for row in activity where row.signed && reports[row.body.recordId] == .effectsReported {
+            for peer in row.additionalStations.keys { peerIDs[peer, default: []].append(row.body.recordId) }
+        }
+        guard peerIDs.count <= 63 else { throw RemoteRecoveryError.requiresReview }
+        // Each reviewed Station has at most one status call in flight. A slow peer
+        // cannot serialize the timeouts of every other peer behind it.
+        let peerReports = await withTaskGroup(of: (String, [String: RemoteControlApplicationState]?).self) { group in
+            for (peer, recordIDs) in peerIDs {
+                group.addTask { @MainActor in
+                    guard current(), !Task.isCancelled,
+                          (try? self.requireControlActivitySource(origin: origin, log: log)) != nil,
+                          let peerTransport = try? self.controlActivitySource(origin: peer, log: log) as? RemoteControlStatusTransport
+                    else { return (peer, nil) }
+                    return (peer, try? await readStatus(peer, peerTransport, recordIDs))
+                }
+            }
+            var observations: [String: [String: RemoteControlApplicationState]] = [:]
+            for await (peer, states) in group { observations[peer] = states }
+            return observations
+        }
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try requireControlActivitySource(origin: origin, log: log)
         // Reject a changed list even if a delayed status response looked complete.
         let latest = try await refreshedLog(genesis: kit.genesisHash, transport: source)
         guard current(), !Task.isCancelled, latest.head() == log.head() else { throw RemoteChannelError.staleLink }
         try requireManager(latest)
         try requireDelegatedControl(latest)
         try requireControlActivitySource(origin: origin, log: latest)
-        return try controls(stationOrigin: origin).activity(log: latest, status: reports)
+        let availablePeers = try peerReports.isEmpty ? [] : controlActivityOrigins(latest)
+        return try controls(stationOrigin: origin).activity(log: latest, status: reports,
+            additionalStatus: peerReports.filter { availablePeers.contains($0.key) })
     }
 
     func resumeControlDelivery(portal: PortalIntegrationHTTP, current: @escaping () -> Bool) {

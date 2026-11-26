@@ -9,13 +9,14 @@ final class RemoteControlRemindersTests: XCTestCase {
     private let station = "https://station.example"
     private func row(id: String = UUID().uuidString.lowercased(), account: String = "account",
         replacement: String? = nil, signed: Bool = true, removed: Bool = true,
-        applied: RemoteControlApplicationState? = nil, additional: [String: Bool] = [:]) -> RemoteControlActivity {
+        applied: RemoteControlApplicationState? = nil, additional: [String: Bool] = [:],
+        peerReports: [String: RemoteControlApplicationState] = [:]) -> RemoteControlActivity {
         RemoteControlActivity(body: ControlRecordBody(accountId: account, genesisHash: genesis, origin: nil,
             feedId: nil, principal: "host:private-host", principalKey: nil, signer: "member:private-manager",
             action: "interrupt_running", interruptRunning: nil, revokeSeq: 3, recordId: id,
             issuedAt: 100, integrationId: nil, by: "owner"), signed: signed, stationStored: true,
             portalPending: false, managerReviewRequired: removed, replacementRecordID: replacement,
-            application: applied, additionalStations: additional)
+            application: applied, additionalStations: additional, additionalApplications: peerReports)
     }
 
     func testRestartDeduplicatesAndDailyReminderDoesNotPersistStopContent() throws {
@@ -47,7 +48,7 @@ final class RemoteControlRemindersTests: XCTestCase {
         XCTAssertTrue(try book.offer(stationOrigin: station, activity: [second], now: 86_400_400))
     }
 
-    func testSelectedApplicationCannotHideOtherDestinationsAndSignedReplacementNeedsNoFreshReview() throws {
+    func testSignedReplacementKeepsReminderUntilEveryCoveredHostReportsApplication() throws {
         let id = UUID().uuidString.lowercased()
         XCTAssertTrue(RemoteControlReminders.reviewIDs([row(applied: .effectsReported)]).isEmpty)
         XCTAssertEqual(RemoteControlReminders.reviewIDs([row(id: id, applied: .effectsReported,
@@ -55,10 +56,26 @@ final class RemoteControlRemindersTests: XCTestCase {
         let copy = row(signed: false, removed: false)
         let original = row(replacement: copy.body.recordId)
         XCTAssertEqual(RemoteControlReminders.reviewIDs([original, copy]), [original.body.recordId])
-        let signedCopy = row(id: copy.body.recordId, removed: false)
-        XCTAssertTrue(RemoteControlReminders.reviewIDs([original, signedCopy]).isEmpty)
+        for state: RemoteControlApplicationState? in [nil, .unknown, .awaitingApplication] {
+            let pendingCopy = row(id: copy.body.recordId, removed: false, applied: state)
+            XCTAssertEqual(RemoteControlReminders.reviewIDs([original, pendingCopy]), [original.body.recordId])
+        }
+        let appliedCopy = row(id: copy.body.recordId, removed: false, applied: .effectsReported)
+        XCTAssertTrue(RemoteControlReminders.reviewIDs([original, appliedCopy]).isEmpty)
         let removedCopy = row(id: copy.body.recordId)
         XCTAssertEqual(RemoteControlReminders.reviewIDs([original, removedCopy]), [original.body.recordId, copy.body.recordId])
+    }
+
+    func testReplacementChainNeedsApplicationAtEveryApprovedDestination() {
+        let peer = "https://peer.example", id = UUID().uuidString.lowercased()
+        let second = row(replacement: id, additional: [peer: true])
+        let original = row(replacement: second.body.recordId, additional: [peer: true])
+        for state: RemoteControlApplicationState? in [nil, .unknown, .awaitingApplication, .effectsReported] {
+            let final = row(id: id, removed: false, applied: .effectsReported, additional: [peer: true],
+                peerReports: state.map { [peer: $0] } ?? [:])
+            let pending = RemoteControlReminders.reviewIDs([final, original, second])
+            XCTAssertEqual(pending, state == .effectsReported ? [] : [original.body.recordId, second.body.recordId])
+        }
     }
 
     func testStationsAndAccountAnchorsCannotShareReminderEvidence() throws {

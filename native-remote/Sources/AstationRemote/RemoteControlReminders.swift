@@ -39,9 +39,19 @@ public final class RemoteControlReminders {
     }
 
     public static func reviewIDs(_ activity: [RemoteControlActivity]) -> Set<String> {
-        let replacements = Set(activity.filter { $0.signed && !$0.requiresManagerReview }.map { $0.body.recordId })
-        return Set(activity.filter {
-            $0.requiresManagerReview && !($0.replacementRecordID.map(replacements.contains) ?? false)
+        let byID = Dictionary(activity.map { ($0.body.recordId, $0) }, uniquingKeysWith: { first, _ in first })
+        return Set(activity.filter { row in
+            guard row.requiresManagerReview else { return false }
+            // A second manager can lose access before their replacement takes effect.
+            // Follow the saved copies to the last signed stop that hosts must apply.
+            var copy = row
+            var visited = Set<String>()
+            while let id = copy.replacementRecordID {
+                guard visited.insert(id).inserted, let next = byID[id] else { return true }
+                guard next.signed else { break }
+                copy = next
+            }
+            return !copy.allHostsApplied
         }.map { $0.body.recordId })
     }
 
