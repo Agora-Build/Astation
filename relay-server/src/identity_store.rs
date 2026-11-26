@@ -409,12 +409,27 @@ impl IdentityStore for InMemoryIdentityStore {
 /// Postgres-backed identity store (tables from `0003_astation_identity.sql`).
 #[derive(Clone)]
 pub struct PgIdentityStore {
+    room_ownership: Option<(String, String)>,
     pool: sqlx::PgPool,
 }
 
 impl PgIdentityStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self::for_station(pool, None)
+    }
+
+    pub(crate) fn for_station(pool: sqlx::PgPool, room_ownership: Option<(String, String)>) -> Self {
+        Self { pool, room_ownership }
+    }
+
+    async fn observe_bound_sessions(
+        &self, conn: &mut sqlx::PgConnection, sessions: &[&str],
+    ) -> Result<(), IdentityError> {
+        let Some((origin, issuer)) = &self.room_ownership else { return Ok(()); };
+        let rooms = sessions.iter().map(|id| format!("{}{id}", crate::auth::SESSION_ROOM_PREFIX))
+            .filter(|room| crate::auth::session_id_for_room(room).is_some()).collect();
+        crate::remote_api::recovery::delegated_recovery::observe_rooms(conn, origin, issuer, &rooms)
+            .await.map_err(db_err)
     }
 }
 
@@ -592,6 +607,9 @@ impl IdentityStore for PgIdentityStore {
         lock_astation(&mut tx, astation_id).await?;
         ensure_not_revoked(&mut tx, astation_id).await?;
         let ok = upsert_owned_binding(&mut tx, session_id, astation_id, now).await?;
+        if ok {
+            self.observe_bound_sessions(&mut tx, &[session_id]).await?;
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(if ok {
             BindOutcome::Bound
@@ -638,13 +656,16 @@ impl IdentityStore for PgIdentityStore {
             removed,
             ..Default::default()
         };
+        let mut bound = Vec::new();
         for sid in &listed {
             if upsert_owned_binding(&mut tx, sid, astation_id, now).await? {
+                bound.push(sid.as_str());
                 out.bound += 1;
             } else {
                 out.skipped += 1;
             }
         }
+        self.observe_bound_sessions(&mut tx, &bound).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(out)
     }

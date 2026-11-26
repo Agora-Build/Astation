@@ -753,7 +753,10 @@ For a built-in Station device list that predates room ownership capture, run
 registration evidence. The command uses the running Station's database, origin, token
 audience and issuer. It verifies saved relay and proxy proofs and records any
 current account registrations they identify. The JSON counts include stale
-routes, disputed rooms and rooms missing registration evidence. A new sign-in can supply a missing registration for a later run.
+routes, disputed rooms and rooms missing registration evidence. It also indexes
+current proofs for the next sign-in. After a host proves its route or this
+backfill runs, a later account registration or session binding on any replica
+rechecks the proof and retains the room owner in the same transaction.
 
 Delegated host-work recovery is separate from relay-key reset. The feature
 remains disabled. An opt-in build additionally requires

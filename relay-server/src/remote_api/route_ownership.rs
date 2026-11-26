@@ -49,6 +49,152 @@ pub(in crate::remote_api::recovery) async fn observe(
     Ok(())
 }
 
+// Serialize proof publication and a registration that can supply its owner.
+// Both take room locks before root locks, including when the proof is new.
+pub(in crate::remote_api::recovery) async fn lock_rooms(
+    connection: &mut PgConnection,
+    rooms: &[&str],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(room, 739185))
+         FROM unnest($1::text[]) AS r(room) ORDER BY room COLLATE \"C\"",
+    )
+    .bind(rooms)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+pub(in crate::remote_api::recovery) async fn index_proof(
+    connection: &mut PgConnection,
+    origin: &str,
+    issuer: &str,
+    route: &HostBinding,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO station_room_proofs (station_origin,issuer,genesis_hash,host_id,carrier,room,nonce)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (station_origin,issuer,genesis_hash,host_id,carrier)
+         DO UPDATE SET room=EXCLUDED.room, nonce=EXCLUDED.nonce",
+    )
+    .bind(origin).bind(issuer).bind(&route.genesis).bind(&route.host)
+    .bind(if route.proxy.is_some() { "proxy" } else { "relay" })
+    .bind(&route.room).bind(route.nonce.as_slice()).execute(connection).await?;
+    Ok(())
+}
+
+pub(crate) async fn observe_registration(
+    connection: &mut PgConnection,
+    origin: &str,
+    issuer: &str,
+    astation: &str,
+) -> Result<(), sqlx::Error> {
+    let sessions: Vec<String> = sqlx::query_scalar(
+        "SELECT session_id FROM session_bindings WHERE astation_id=$1
+         AND last_used_at > floor(extract(epoch FROM statement_timestamp()))::bigint - $2",
+    )
+    .bind(astation)
+    .bind(BINDING_TTL_SECS)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut rooms = BTreeSet::from([astation.to_owned()]);
+    for session in sessions {
+        let room = format!("{}{session}", crate::auth::SESSION_ROOM_PREFIX);
+        if session_id_for_room(&room).is_some() {
+            rooms.insert(room);
+        }
+    }
+    observe_rooms(connection, origin, issuer, &rooms).await
+}
+
+#[derive(sqlx::FromRow)]
+struct RoomProof {
+    genesis_hash: String,
+    host_id: String,
+    carrier: String,
+    room: String,
+    nonce: Vec<u8>,
+}
+
+pub(crate) async fn observe_rooms(
+    connection: &mut PgConnection,
+    origin: &str,
+    issuer: &str,
+    rooms: &BTreeSet<String>,
+) -> Result<(), sqlx::Error> {
+    if rooms.is_empty() {
+        return Ok(());
+    }
+    let rooms: Vec<_> = rooms.iter().map(String::as_str).collect();
+    lock_rooms(connection, &rooms).await?;
+    let candidates: Vec<RoomProof> = sqlx::query_as(
+        "SELECT genesis_hash,host_id,carrier,room,nonce FROM station_room_proofs
+         WHERE station_origin=$1 AND issuer=$2 AND room=ANY($3) ORDER BY genesis_hash",
+    )
+    .bind(origin)
+    .bind(issuer)
+    .bind(&rooms)
+    .fetch_all(&mut *connection)
+    .await?;
+    for group in candidates.chunk_by(|a, b| a.genesis_hash == b.genesis_hash) {
+        let genesis = &group[0].genesis_hash;
+        let state = load_root(connection, genesis).await?;
+        let Some((root, log)) = state.and_then(|value| validated_root(genesis, value).ok()) else {
+            tracing::warn!("Skipping uninspectable proved room during account registration");
+            continue;
+        };
+        let mut current = BTreeSet::new();
+        for candidate in group {
+            let routes = if candidate.carrier == "proxy" {
+                &root.proxies
+            } else {
+                &root.routes
+            };
+            if routes.get(&candidate.host_id).is_some_and(|route| {
+                route.room == candidate.room
+                    && route.nonce.as_slice() == candidate.nonce
+                    && verified(&log, &candidate.host_id, &candidate.carrier, route)
+            }) {
+                current.insert(candidate.room.as_str());
+            }
+        }
+        let current: Vec<_> = current.into_iter().collect();
+        observe(connection, origin, issuer, genesis, &current).await?;
+    }
+    Ok(())
+}
+
+async fn load_root(
+    connection: &mut PgConnection,
+    genesis: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT CASE WHEN octet_length(state::text) <= $2 THEN state END
+         FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE",
+    )
+    .bind(genesis)
+    .bind(super::MAX_STATE as i64)
+    .fetch_optional(connection)
+    .await
+    .map(Option::flatten)
+}
+
+fn validated_root(genesis: &str, state: Value) -> Result<(Root, Membership), sqlx::Error> {
+    let root: Root = serde_json::from_value(state).map_err(|_| invalid_root())?;
+    let hash = atem_client::Hash32::from_hex(genesis).map_err(|_| invalid_root())?;
+    let mut log = Membership::from_stored(&root.account, &hash, &root.membership)
+        .map_err(|_| invalid_root())?;
+    log.advance(&crate::remote_api::recovery::now());
+    Ok((root, log))
+}
+
+fn verified(log: &Membership, host: &str, carrier: &str, route: &HostBinding) -> bool {
+    log.frozen().is_none()
+        && route.host == host
+        && route.proxy.is_some() == (carrier == "proxy")
+        && route.valid(log)
+}
+
 fn routes<'a>(
     root: &'a Root,
     log: &'a Membership,
@@ -57,13 +203,7 @@ fn routes<'a>(
         .into_iter()
         .flat_map(move |(carrier, routes)| {
             routes.iter().map(move |(host, route)| {
-                let proved = log.frozen().is_none()
-                    && route.host == *host
-                    && route.proxy.is_some() == (carrier == "proxy")
-                    && log
-                        .host(host)
-                        .is_some_and(|h| h.host_trust_gen == route.host_trust_gen)
-                    && route.valid(log);
+                let proved = verified(log, host, carrier, route);
                 (carrier, host, route, proved)
             })
         })
@@ -75,7 +215,6 @@ pub(crate) async fn migrate(
     issuer: &str,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
-    use crate::remote_api::recovery::{now, MAX_STATE};
     if !super::canonical_genesis(genesis)
         || !crate::account_identity::built_in_station(origin)
         || !crate::account_identity::station_origin(issuer)
@@ -83,30 +222,37 @@ pub(crate) async fn migrate(
         return Err(invalid_root());
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .execute(&mut *tx)
-        .await?;
     sqlx::query("SET LOCAL statement_timeout='5s'")
         .execute(&mut *tx)
         .await?;
-    let state: Option<Value> = sqlx::query_scalar(
-        "SELECT CASE WHEN octet_length(state::text) <= $2 THEN state END
-         FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE",
+    // Find the room locks before taking the root lock. A route may switch
+    // during discovery; retry the backfill if the new room was not locked.
+    let rooms_to_lock: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT room FROM remote_recovery_roots r
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+             jsonb_path_query_array(r.state, '$.routes.*.room')
+             || jsonb_path_query_array(r.state, '$.proxies.*.room')) AS t(room)
+         WHERE genesis_hash=$1",
     )
     .bind(genesis)
-    .bind(MAX_STATE as i64)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    let root: Root =
-        serde_json::from_value(state.ok_or_else(invalid_root)?).map_err(|_| invalid_root())?;
-    let hash = atem_client::Hash32::from_hex(genesis).map_err(|_| invalid_root())?;
-    let mut log = Membership::from_stored(&root.account, &hash, &root.membership)
-        .map_err(|_| invalid_root())?;
-    log.advance(&now());
+    let locked: BTreeSet<_> = rooms_to_lock.iter().map(String::as_str).collect();
+    lock_rooms(&mut tx, &locked.iter().copied().collect::<Vec<_>>()).await?;
+    let state = load_root(&mut tx, genesis)
+        .await?
+        .ok_or_else(invalid_root)?;
+    let (root, log) = validated_root(genesis, state)?;
     let mut rooms = BTreeSet::new();
     let mut stale_routes = 0;
     for (_, _, route, proved) in routes(&root, &log) {
         if proved {
+            if !locked.contains(route.room.as_str()) {
+                return Err(sqlx::Error::Protocol(
+                    "route changed during room migration; retry".into(),
+                ));
+            }
+            index_proof(&mut tx, origin, issuer, route).await?;
             rooms.insert(route.room.as_str());
         } else {
             stale_routes += 1;

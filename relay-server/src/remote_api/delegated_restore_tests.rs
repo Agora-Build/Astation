@@ -1070,3 +1070,281 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
     replica.close().await;
     database.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_registration_preserves_previously_proved_session_room() {
+    use crate::account_store::{AccountStore, PgAccountStore};
+    use crate::cluster::ConnRef;
+    use crate::identity_store::{IdentityStore, PgIdentityStore};
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let portal = inspection_portal();
+    let store = RecoveryStore::postgres_for_station(
+        database.pool.clone(),
+        Some(ORIGIN),
+        Some(ORIGIN),
+        Some(&portal.issuer),
+    );
+    let f = fixture();
+    f.publish(&store).await;
+    let session = crate::auth::create_session("local-host");
+    let room = format!("session-{}", session.id);
+    let identity = PgIdentityStore::new(database.pool.clone());
+    let now = chrono::Utc::now().timestamp();
+    identity.bind(&session.id, "phone", now).await.unwrap();
+    let challenge = HostChallenge::new(&room);
+    let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+    store
+        .admit_host(
+            &message,
+            challenge.nonce,
+            &room,
+            "host-a",
+            ConnRef::new("host", "replica-a"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let replica = database.reconnect(2).await;
+    // A pre-index deployment retains the same proof in its recovery root.
+    sqlx::query("DELETE FROM station_room_proofs")
+        .execute(&replica)
+        .await
+        .unwrap();
+    let backfill = super::super::super::delegated_recovery::migrate_room_owners(
+        &replica,
+        ORIGIN,
+        &portal.issuer,
+        &f.log.genesis_hash().to_hex(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(backfill["without_registration_evidence"], 1);
+    let account = "ab00000000000000000000000001";
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice')")
+        .bind(&portal.issuer)
+        .bind(account)
+        .execute(&replica)
+        .await
+        .unwrap();
+    let accounts = PgAccountStore::for_station(
+        replica.clone(),
+        Some((ORIGIN.into(), portal.issuer.clone())),
+    );
+    // Lose the transaction at commit, then retry on the same retained proof.
+    sqlx::query("CREATE FUNCTION fail_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit failed'; END $$")
+        .execute(&replica).await.unwrap();
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_observation AFTER INSERT ON station_proved_room_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_observation()")
+        .execute(&replica).await.unwrap();
+    assert!(accounts
+        .register("phone", "alice", "Phone", now)
+        .await
+        .is_err());
+    assert_eq!(accounts.subject_for_astation("phone").await.unwrap(), None);
+    sqlx::query("DROP TRIGGER fail_observation ON station_proved_room_owners")
+        .execute(&replica)
+        .await
+        .unwrap();
+    accounts
+        .register("phone", "alice", "Phone", now)
+        .await
+        .unwrap();
+    identity.unbind(&session.id, "phone").await.unwrap();
+
+    let retained: Option<(String, bool)> = sqlx::query_as(
+        "SELECT account_subject,conflicted FROM station_proved_room_owners
+         WHERE station_origin=$1 AND issuer=$2 AND genesis_hash=$3 AND room=$4",
+    )
+    .bind(ORIGIN)
+    .bind(&portal.issuer)
+    .bind(f.log.genesis_hash().to_hex())
+    .bind(&room)
+    .fetch_optional(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, Some((account.to_string(), false)));
+    replica.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_session_bind_and_resync_capture_only_current_scoped_proofs() {
+    use crate::account_store::{AccountStore, PgAccountStore};
+    use crate::cluster::ConnRef;
+    use crate::identity_store::{IdentityStore, PgIdentityStore, BINDING_TTL_SECS};
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let portal = inspection_portal();
+    let f = fixture();
+    let store = RecoveryStore::postgres_for_station(
+        database.pool.clone(),
+        Some(ORIGIN),
+        Some(ORIGIN),
+        Some(&portal.issuer),
+    );
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let alice = "ab00000000000000000000000001";
+    sqlx::query("INSERT INTO account_identities VALUES ($1,$2,'alice')")
+        .bind(&portal.issuer)
+        .bind(alice)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let replica = database.reconnect(3).await;
+    let scope = Some((ORIGIN.into(), portal.issuer.clone()));
+    let accounts = PgAccountStore::for_station(replica.clone(), scope.clone());
+    let identity = PgIdentityStore::for_station(replica.clone(), scope);
+    let now = chrono::Utc::now().timestamp();
+    accounts
+        .register("phone", "alice", "Phone", now)
+        .await
+        .unwrap();
+    let count = || {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_proved_room_owners")
+            .fetch_one(&replica)
+    };
+
+    for (index, session) in (0..2).map(|i| (i, crate::auth::create_session("local-host"))) {
+        let room = format!("session-{}", session.id);
+        let challenge = HostChallenge::new(&room);
+        let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+        store
+            .admit_host(
+                &message,
+                challenge.nonce,
+                &room,
+                "host-a",
+                ConnRef::new("host", "replica-a"),
+            )
+            .await
+            .unwrap();
+        let saved = saved(&replica, &genesis).await;
+        let current_count = count().await.unwrap();
+        for scope in [
+            None,
+            Some((ORIGIN.into(), "https://other.example".into())),
+            Some(("https://station.agora.build".into(), portal.issuer.clone())),
+        ] {
+            let other = PgIdentityStore::for_station(replica.clone(), scope);
+            other.bind(&session.id, "phone", now).await.unwrap();
+            assert_eq!(count().await.unwrap(), current_count);
+            other.unbind(&session.id, "phone").await.unwrap();
+        }
+
+        identity
+            .bind(&session.id, "phone", now - BINDING_TTL_SECS)
+            .await
+            .unwrap();
+        assert_eq!(count().await.unwrap(), current_count);
+        sqlx::query("UPDATE remote_recovery_roots SET state=jsonb_set(state,'{routes,host-a,host_trust_gen}','0') WHERE genesis_hash=$1")
+            .bind(&genesis).execute(&replica).await.unwrap();
+        identity.bind(&session.id, "phone", now).await.unwrap();
+        assert_eq!(count().await.unwrap(), current_count);
+        sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+            .bind(&saved)
+            .bind(&genesis)
+            .execute(&replica)
+            .await
+            .unwrap();
+
+        if index == 0 {
+            identity.bind(&session.id, "phone", now).await.unwrap();
+        } else {
+            identity
+                .replace_all("phone", std::slice::from_ref(&session.id), now)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count().await.unwrap(), current_count + 1);
+        identity.unbind(&session.id, "phone").await.unwrap();
+    }
+    let indexed: i64 = sqlx::query_scalar("SELECT count(*) FROM station_room_proofs")
+        .fetch_one(&replica)
+        .await
+        .unwrap();
+    assert_eq!(indexed, 1, "a replacement route replaces its index entry");
+    replica.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_concurrent_proof_and_registration_retain_identity_room_owner() {
+    use crate::account_store::{AccountStore, PgAccountStore};
+    use crate::cluster::ConnRef;
+    use std::time::Duration;
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let portal = inspection_portal();
+    let f = fixture();
+    let store = RecoveryStore::postgres_for_station(
+        database.pool.clone(),
+        Some(ORIGIN),
+        Some(ORIGIN),
+        Some(&portal.issuer),
+    );
+    f.publish(&store).await;
+    let subject = "ab00000000000000000000000001";
+    sqlx::query("INSERT INTO account_identities VALUES ($1,$2,'alice')")
+        .bind(&portal.issuer)
+        .bind(subject)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let replica = database.reconnect(2).await;
+    let accounts =
+        PgAccountStore::for_station(replica.clone(), Some((ORIGIN.into(), portal.issuer)));
+    let room = "phone";
+    let challenge = HostChallenge::new(room);
+    let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+    let mut gate = database.pool.begin().await.unwrap();
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    super::super::super::delegated_recovery::route_ownership::lock_rooms(&mut gate, &[room])
+        .await
+        .unwrap();
+    let host = tokio::spawn(async move {
+        store
+            .admit_host(
+                &message,
+                challenge.nonce,
+                room,
+                "host-a",
+                ConnRef::new("host", "first"),
+            )
+            .await
+            .unwrap();
+    });
+    let signin = tokio::spawn(async move {
+        accounts
+            .register(room, "alice", "Phone", chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks waiter JOIN pg_locks owner USING (locktype,database,classid,objid,objsubid)
+                 WHERE owner.pid=$1 AND owner.locktype='advisory' AND owner.granted AND NOT waiter.granted",
+            ).bind(blocker).fetch_one(&database.pool).await.unwrap();
+            if waiting == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("both replicas must queue on the same room");
+    gate.commit().await.unwrap();
+    host.await.unwrap();
+    signin.await.unwrap();
+    let retained: (String, bool) =
+        sqlx::query_as("SELECT account_subject,conflicted FROM station_proved_room_owners")
+            .fetch_one(&replica)
+            .await
+            .unwrap();
+    assert_eq!(retained, (subject.into(), false));
+    replica.close().await;
+    database.cleanup().await;
+}
