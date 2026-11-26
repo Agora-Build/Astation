@@ -1600,7 +1600,7 @@ extension AstationRecoveryCoordinator {
         }
     }
 
-    func serviceNativeVerifier(for approval: RemoteServiceApproval,
+    func serviceMemberProcessVerifier(for approval: RemoteServiceApproval,
         current: @escaping @MainActor @Sendable () -> Bool,
         transport: @escaping (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport,
         waitForReport: @escaping () async throws -> Void = { try await Task.sleep(for: .seconds(5)) }
@@ -1628,8 +1628,13 @@ extension AstationRecoveryCoordinator {
             _ = try membership()
             let first = owner == nil
             if first {
-                let natives = log.members().filter { $0.kind == "native" && $0.status == .active }
-                let slots = try natives.flatMap { try self.reviewedProcessSlots(member: $0.deviceId, log: log) }
+                // A managed service key can also have independently reviewed SDK processes.
+                // Keep their slots required across membership revisions until reviewed again.
+                let rosters = self.saved.processRosters?[self.relayURL] ?? [:]
+                let participants = log.members().filter { member in
+                    member.status == .active && (member.kind == "native" || rosters[member.deviceId] != nil)
+                }
+                let slots = try participants.flatMap { try self.reviewedProcessSlots(member: $0.deviceId, log: log) }
                 guard !slots.isEmpty, self.saved.verifierHistoryRoots?[self.relayURL] == approval.genesisHash else {
                     throw RemoteVerifierGateError.invalidRoster
                 }
