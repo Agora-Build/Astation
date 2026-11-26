@@ -185,7 +185,8 @@ public final class RemoteControlPublication {
 
     /// Includes completed deliveries: a storage receipt does not settle host application.
     public func activity(log: MembershipLog,
-        status: [String: RemoteControlApplicationState] = [:]) throws -> [RemoteControlActivity] {
+        status: [String: RemoteControlApplicationState] = [:],
+        additionalStatus: [String: [String: RemoteControlApplicationState]] = [:]) throws -> [RemoteControlActivity] {
         try available()
         try check(log)
         return try saved.operations.map { operation in
@@ -205,7 +206,10 @@ public final class RemoteControlPublication {
                 replacementRecordID: try saved.operations.first(where: { $0.resignsRecordID == body.recordId })
                     .map { try Self.body($0.bodyJSON).recordId },
                 application: operation.recordJSON == nil ? nil : status[body.recordId],
-                additionalStations: operation.additionalStations ?? [:])
+                additionalStations: operation.additionalStations ?? [:],
+                additionalApplications: (operation.additionalStations ?? [:]).keys.reduce(into: [:]) { result, origin in
+                    result[origin] = additionalStatus[origin]?[body.recordId]
+                })
         }.sorted {
             if $0.body.issuedAt != $1.body.issuedAt { return $0.body.issuedAt > $1.body.issuedAt }
             return $0.body.recordId < $1.body.recordId

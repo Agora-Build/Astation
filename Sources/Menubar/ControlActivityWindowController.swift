@@ -111,7 +111,15 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         let action = row.body.action == "revoke" ? "Revoke" : "Interrupt"
         let portal = row.portalPending ? "\nPortal mirror is still pending." : ""
         let stations = row.additionalStations.keys.sorted().map {
-            "\n\($0): " + (row.additionalStations[$0] == true ? "Stored - host application not checked" : "Delivery pending")
+            origin in
+            let status: String
+            switch row.additionalApplications[origin] {
+            case .effectsReported: status = "All covered hosts applied the stop"
+            case .awaitingApplication: status = "Waiting for covered hosts"
+            case .unknown: status = "Station has no matching stored stop"
+            case nil: status = row.additionalStations[origin] == true ? "Stored - host application not checked" : "Delivery pending"
+            }
+            return "\n\(origin): " + status
         }.joined()
         return "\(action) \(row.body.principal)\n\(row.summary)\nRecord: \(row.body.recordId)\nSigner: \(row.body.signer)\(portal)\(stations)"
     }
@@ -123,7 +131,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private func display(_ activity: [RemoteControlActivity]) {
         let previous = selected?.body.recordId
         rows = activity
-        reviewRows = activity.filter(\.requiresManagerReview)
+        let pending = RemoteControlReminders.reviewIDs(activity)
+        reviewRows = activity.filter { pending.contains($0.body.recordId) }
         stops.removeAllItems()
         stops.addItems(withTitles: reviewRows.map { $0.body.principal + " - " + $0.body.recordId })
         if let index = reviewRows.firstIndex(where: { $0.body.recordId == previous }) { stops.selectItem(at: index) }
@@ -137,8 +146,18 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         let ready = task == nil && exportPanel == nil && current?() == true && coordinator?.delegatedControlsAvailable == true &&
             (stationOrigin == nil || stationOrigin == coordinator?.relayURL)
         let replacement = selected?.replacementRecordID.flatMap { id in rows.first { $0.body.recordId == id } }
-        review.title = replacement?.signed == true ? "Retry Saved Copy" : "Review with Current Manager..."
-        review.isEnabled = ready && selected != nil
+        if let replacement, replacement.signed {
+            let stored = replacement.stationStored && replacement.additionalStations.values.allSatisfy { $0 }
+            if replacement.managerReviewRequired {
+                review.title = "Review the Newer Copy"
+            } else {
+                review.title = stored ? "Waiting for Host Reports" : "Retry Saved Copy"
+            }
+            review.isEnabled = ready && !stored && !replacement.managerReviewRequired
+        } else {
+            review.title = "Review with Current Manager..."
+            review.isEnabled = ready && selected != nil
+        }
         cancel.isEnabled = ready && replacement?.signed == false
         stops.isEnabled = ready && !reviewRows.isEmpty
         refresh.isEnabled = task == nil && exportPanel == nil

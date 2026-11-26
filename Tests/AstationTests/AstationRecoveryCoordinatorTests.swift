@@ -171,6 +171,8 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     var controlStatusWaiter: CheckedContinuation<Void, Never>?
     var holdControlStatus = false
     var statusReads: [[String]] = []
+    private var controlApplication: RemoteControlApplicationState? = .awaitingApplication
+    func setControlApplication(_ state: RemoteControlApplicationState?) { controlApplication = state }
     var syncReads: [UInt64] = []
     var holdControlSync = false
     var controlSyncWaiter: CheckedContinuation<Void, Never>?
@@ -257,7 +259,8 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
         XCTAssertEqual(log?.head(), expected)
         statusReads.append(recordIDs)
         if holdControlStatus { await withCheckedContinuation { controlStatusWaiter = $0 } }
-        return Dictionary(uniqueKeysWithValues: recordIDs.map { ($0, .awaitingApplication) })
+        guard let controlApplication else { throw RemoteRecoveryTransportError.invalidResponse }
+        return Dictionary(uniqueKeysWithValues: recordIDs.map { ($0, controlApplication) })
     }
 
     func dropControlReply(disableEntries: Bool = false) { loseControlReply = true; outageAfterControlReply = disableEntries }
@@ -5481,6 +5484,12 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertTrue(delivered.stationStored)
         XCTAssertEqual(delivered.recordJSON, pending.recordJSON)
         XCTAssertEqual(h.ownerRequests.count, confirmations + 2, "delivery retry cannot reuse or request an approval")
+        let pendingActivity = try await resumed.refreshControlActivity(current: { true })
+        XCTAssertEqual(RemoteControlReminders.reviewIDs(pendingActivity), [body.recordId])
+        await h.relay.setControlApplication(.effectsReported)
+        let appliedActivity = try await resumed.refreshControlActivity(current: { true })
+        XCTAssertTrue(RemoteControlReminders.reviewIDs(appliedActivity).isEmpty)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 2)
         let final = await h.relay.controls()
         XCTAssertEqual(final, sent)
     }
@@ -5620,6 +5629,44 @@ extension AstationRecoveryCoordinatorTests {
         do { _ = try await delayed.value; XCTFail("retired context accepted a Station status") }
         catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
         XCTAssertNil(try coordinator.localControlActivity().first?.application)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+    }
+
+    func testControlActivityChecksOnlySignedDestinationsAndRetiresDelayedPeerReports() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example", unrelated = "https://other.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin), other = RecoveryMemoryRelay(stationOrigin: unrelated)
+        var destinations: [String: RemoteControlStationTransport] = [origin: second]
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in destinations })
+        _ = try await revokedSender(coordinator, harness: h)
+        await second.replaceLog(try await coordinator.hostSenderMembership())
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        _ = try await coordinator.commitHostInterrupt(review, current: { true })
+        let confirmations = h.ownerRequests.count
+        destinations[unrelated] = other
+        await h.relay.setControlApplication(.effectsReported)
+        for state: RemoteControlApplicationState? in [.awaitingApplication, .unknown, nil, .effectsReported] {
+            await second.setControlApplication(state)
+            let rows = try await coordinator.refreshControlActivity(current: { true })
+            let row = try XCTUnwrap(rows.first)
+            XCTAssertEqual(row.additionalApplications[origin], state)
+            XCTAssertEqual(row.allHostsApplied, state == .effectsReported)
+        }
+        await second.holdNextControlStatus()
+        let delayed = Task { try await coordinator.refreshControlActivity(current: { true }) }
+        for _ in 0..<100 {
+            if await second.controlStatusWaiter != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let waiting = await second.controlStatusWaiter != nil
+        XCTAssertTrue(waiting)
+        destinations.removeValue(forKey: origin)
+        await second.releaseControlStatus()
+        let retired = try await delayed.value
+        XCTAssertEqual(retired.first?.allHostsApplied, false)
+        XCTAssertEqual(retired.first?.additionalApplications, [:])
+        let peerReads = await second.statusReads, unrelatedReads = await other.statusReads
+        XCTAssertEqual(peerReads, Array(repeating: [review.recordID], count: 5))
+        XCTAssertTrue(unrelatedReads.isEmpty)
         XCTAssertEqual(h.ownerRequests.count, confirmations)
     }
 

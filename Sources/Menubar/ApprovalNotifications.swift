@@ -367,12 +367,11 @@ private struct ControlReviewBannerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("Saved stops need manager review", systemImage: "exclamationmark.shield.fill").font(.headline)
+                Label("Saved stops awaiting confirmation", systemImage: "exclamationmark.shield.fill").font(.headline)
                 Spacer()
                 Button(action: dismiss) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Dismiss alert")
             }
-            Text("\(count) saved stop\(count == 1 ? "" : "s") may need a fresh manager signature.")
-            Text("Review current access before confirming a new copy.").font(.caption)
+            Text("\(count) saved stop\(count == 1 ? "" : "s") still need\(count == 1 ? "s" : "") a signature or host confirmation.")
             HStack { Spacer(); Button("Review Control Activity", action: review).buttonStyle(.borderedProminent) }
         }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))

@@ -22,10 +22,15 @@ public struct RemoteControlActivity: Equatable, Sendable {
     public let application: RemoteControlApplicationState?
     public let additionalStations: [String: Bool]
 
-    /// Application evidence is selected-Station only. Additional storage receipts
-    /// cannot settle a removed signer's stop on those Stations' receiving hosts.
+    public private(set) var additionalApplications: [String: RemoteControlApplicationState] = [:]
+
+    public var allHostsApplied: Bool {
+        signed && application == .effectsReported &&
+            additionalStations.keys.allSatisfy { additionalApplications[$0] == .effectsReported }
+    }
+
     public var requiresManagerReview: Bool {
-        managerReviewRequired && (application != .effectsReported || !additionalStations.isEmpty)
+        managerReviewRequired && (replacementRecordID != nil || !allHostsApplied)
     }
 
     public var summary: String {
