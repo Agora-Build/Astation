@@ -828,6 +828,11 @@ review lists any missing or lower signing-store row in
 `service_clock_evidence.reservation_shortfalls` with its previously observed
 value. Changing plans or replicas preserves these observations. If the signing
 store is unconfigured, the review lists the retained observations separately.
+The Portal comparison also uses those observations to identify services that
+belong to this device list. `prior_signing_registrations` lists the exact
+service and key, highest observed time, and current checkpoint policy when the
+live registration is absent, lower, or unavailable. A historical observation
+alone cannot establish current coverage or authorize a signature.
 Before signing any new service control records, Station requires the independent
 database to cover the observed floor for that key. A positive observation for
 another key of the same service also blocks signing. Only the independent
