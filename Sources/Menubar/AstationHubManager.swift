@@ -58,7 +58,7 @@ class AstationHubManager: ObservableObject {
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
     private var accountGeneration = UUID() {
-        didSet { verifierReportTask?.cancel() }
+        didSet { verifierReportTasks.values.forEach { $0.cancel() } }
     }
     var integrationAccountGeneration: UUID { accountGeneration }
     private struct StationRegistrationContext: Equatable {
@@ -330,7 +330,7 @@ class AstationHubManager: ObservableObject {
         didSet { updateVerifierPolling() }
     }
     private var verifierReportTimer: Timer?
-    private var verifierReportTask: Task<Void, Never>?
+    private var verifierReportTasks: [String: Task<Void, Never>] = [:]
     private var verifierWakeGeneration = UUID()
     @MainActor private var approvalPushHints: RemotePushHints?
     @MainActor private var approvalPushScope: String?
@@ -350,10 +350,10 @@ class AstationHubManager: ObservableObject {
     var controlReviewNotificationsEnabled: (@MainActor () -> Bool)?
 
     @MainActor private func updateVerifierPolling() {
-        verifierReportTask?.cancel()
+        verifierReportTasks.values.forEach { $0.cancel() }
         verifierReportTimer?.invalidate()
         verifierReportTimer = nil
-        guard accountRecovery?.hasLocalVerifierSlot == true else { return }
+        guard accountRecovery?.localVerifierOrigins.isEmpty == false else { return }
         let tick: @MainActor @Sendable () -> Void = { [weak self] in self?.pollLocalVerifier() }
         verifierReportTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in
             MainActor.assumeIsolated { tick() }
@@ -405,14 +405,16 @@ class AstationHubManager: ObservableObject {
     }
 
     @MainActor private func pollLocalVerifier() {
-        guard verifierReportTask == nil, let coordinator = accountRecovery, coordinator.hasLocalVerifierSlot,
+        guard let coordinator = accountRecovery,
               let current = try? verifierContext(for: coordinator) else { return }
-        verifierReportTask = Task { [weak self] in
-            defer { self?.verifierReportTask = nil }
-            // A missing session or locked key is retried on the next tick without opening UI.
-            try? await coordinator.answerVerifierChallenges(current: current) { active in
-                guard let self else { throw AccountLoginError.changed }
-                return try self.verifierTransport(current: active)
+        for origin in coordinator.localVerifierOrigins where verifierReportTasks[origin] == nil {
+            verifierReportTasks[origin] = Task { [weak self] in
+                defer { self?.verifierReportTasks[origin] = nil }
+                // A slow Station must not hold up another slot's short-lived challenge.
+                try? await coordinator.answerVerifierChallenges(at: origin, current: current) { active in
+                    guard let self else { throw AccountLoginError.changed }
+                    return try self.verifierTransport(for: origin, current: active)
+                }
             }
         }
     }
@@ -900,7 +902,7 @@ class AstationHubManager: ObservableObject {
         sessionExpiryTimer?.invalidate()
         controlReviewTimer?.invalidate()
         verifierReportTimer?.invalidate()
-        verifierReportTask?.cancel()
+        verifierReportTasks.values.forEach { $0.cancel() }
         identityRelayPathMonitor?.cancel()
         identityRelayTask?.cancel(with: .goingAway, reason: nil)
         if let core = coreHandle {
@@ -2955,7 +2957,7 @@ class AstationHubManager: ObservableObject {
         guard !systemIsSleeping else { return }
         systemIsSleeping = true
         verifierWakeGeneration = UUID()
-        verifierReportTask?.cancel()
+        verifierReportTasks.values.forEach { $0.cancel() }
         resumeRelayAfterSleep = identityRelayReconnectGeneration > 0
         Log.info("[Sessions] Mac sleeping; closing session transports and releasing local authority")
         refreshSessionConnections()
