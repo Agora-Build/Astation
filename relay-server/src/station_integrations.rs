@@ -148,6 +148,7 @@ impl StationIntegrations {
         let verifier =
             OidcVerifier::new(&binding.issuer, &binding.station_origin, "astation.remote")
                 .map_err(|_| ())?;
+        app.recovery.configure_session_ownership(&binding)?;
         Ok(Arc::new(Self {
             app,
             binding,

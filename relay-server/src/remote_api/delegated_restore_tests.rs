@@ -786,3 +786,152 @@ async fn postgres_delegated_inspection_resolves_session_rooms_without_extending_
     replica.close().await;
     database.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_reassignment() {
+    use crate::cluster::ConnRef;
+    use crate::identity_store::{IdentityStore, PgIdentityStore, BINDING_TTL_SECS};
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::integration_feed::PolicyStore;
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = RecoveryStore::postgres(database.pool.clone());
+    let portal = inspection_portal();
+    store.configure_session_ownership(&portal).unwrap();
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let account = "ab00000000000000000000000001";
+    let other = "ab00000000000000000000000002";
+    sqlx::query("INSERT INTO account_identities VALUES ($1,$2,'alice'),($1,$3,'bob')")
+        .bind(&portal.issuer)
+        .bind(account)
+        .bind(other)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO astation_accounts VALUES ('phone','alice','test','group',0,0)")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let policies = PolicyStore(database.pool.clone());
+    let initial = policies.load(&portal).await.unwrap();
+    let body = json!({"cursor":0,"changes":[],"checkpoint":{"at":"2026-11-24T10:00:00.000Z",
+        "accounts":{"complete":true,"disabled":[]},"bindings":[],"integrations":[]}});
+    let cut = PortalCheckpoint::parse(&serde_json::to_vec(&body).unwrap(), &portal).unwrap();
+    policies
+        .commit(&initial, &initial.apply_checkpoint(cut, 1).unwrap())
+        .await
+        .unwrap();
+
+    let session = crate::auth::create_session("local-test-host");
+    let identity = PgIdentityStore::new(database.pool.clone());
+    let now = chrono::Utc::now().timestamp();
+    identity.bind(&session.id, "phone", now).await.unwrap();
+    let room = format!("session-{}", session.id);
+    let challenge = HostChallenge::new(&room);
+    let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+    let replica = database.reconnect(3).await;
+    let count = || {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_proved_session_owners")
+            .fetch_one(&replica)
+    };
+    assert!(store
+        .admit_host(
+            &message,
+            [0; 32],
+            &room,
+            "host-a",
+            ConnRef::new("bad", "local")
+        )
+        .await
+        .is_err());
+    assert_eq!(count().await.unwrap(), 0);
+
+    // A failed route commit cannot leave behind ownership evidence.
+    sqlx::query("CREATE FUNCTION fail_route() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'route commit failed'; END $$")
+        .execute(&replica).await.unwrap();
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_route AFTER UPDATE ON remote_recovery_roots DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_route()")
+        .execute(&replica).await.unwrap();
+    assert!(store
+        .admit_host(
+            &message,
+            challenge.nonce,
+            &room,
+            "host-a",
+            ConnRef::new("failed", "local")
+        )
+        .await
+        .is_err());
+    assert_eq!(count().await.unwrap(), 0);
+    sqlx::query("DROP TRIGGER fail_route ON remote_recovery_roots")
+        .execute(&replica)
+        .await
+        .unwrap();
+
+    store
+        .admit_host(
+            &message,
+            challenge.nonce,
+            &room,
+            "host-a",
+            ConnRef::new("accepted", "local"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    assert_eq!(count().await.unwrap(), 1);
+    let origin = Binding::new(ORIGIN, 1).unwrap();
+    let route = || async {
+        inspect_root(&replica, &origin, &genesis, Some(&portal))
+            .await
+            .unwrap()["root"]["route_ownership"]["retained_routes"][0]
+            .clone()
+    };
+    identity
+        .bind(&session.id, "phone", now - BINDING_TTL_SECS)
+        .await
+        .unwrap();
+    let expired = route().await;
+    assert_eq!(expired["session_binding"], "expired");
+    assert_eq!(expired["owner_source"], "retained_session");
+    identity.unbind(&session.id, "phone").await.unwrap();
+    let missing = route().await;
+    assert_eq!(missing["session_binding"], "missing");
+    assert_eq!(missing["owner_source"], "retained_session");
+    assert!(!missing.to_string().contains(account));
+
+    // A new proof through a different account cannot silently transfer ownership.
+    sqlx::query("UPDATE astation_accounts SET agora_user='bob' WHERE astation_id='phone'")
+        .execute(&replica)
+        .await
+        .unwrap();
+    identity.bind(&session.id, "phone", now).await.unwrap();
+    assert_eq!(route().await["owner_source"], "unresolved");
+    let restarted = RecoveryStore::postgres(replica.clone());
+    restarted.configure_session_ownership(&portal).unwrap();
+    let challenge = HostChallenge::new(&room);
+    let fresh = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+    restarted
+        .admit_host(
+            &fresh,
+            challenge.nonce,
+            &room,
+            "host-a",
+            ConnRef::new("reconnect", "other"),
+        )
+        .await
+        .unwrap();
+    identity.unbind(&session.id, "phone").await.unwrap();
+    assert_eq!(route().await["owner_source"], "unresolved");
+    let first: (String, bool) =
+        sqlx::query_as("SELECT account_subject,conflicted FROM station_proved_session_owners")
+            .fetch_one(&replica)
+            .await
+            .unwrap();
+    assert_eq!(first, (account.to_owned(), true));
+    drop(restarted);
+    replica.close().await;
+    database.cleanup().await;
+}

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 
 #[path = "route_ownership.rs"]
-mod route_ownership;
+pub(super) mod route_ownership;
 
 #[path = "delegated_recovery_plan.rs"]
 pub(crate) mod plan;

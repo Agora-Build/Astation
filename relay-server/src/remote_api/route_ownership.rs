@@ -1,4 +1,4 @@
-//! Inspect the durable sources for built-in Station room migration.
+//! Ownership evidence for proved routes on the built-in Station.
 use super::{invalid_root, Membership, Root};
 use crate::auth::session_id_for_room;
 use crate::identity_store::BINDING_TTL_SECS;
@@ -7,6 +7,39 @@ use crate::integration_feed::{FeedBinding, PolicyStore};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Called after checking the host proof, in the transaction that publishes its
+/// route. The account comes from Station registration, never from the host.
+pub(in crate::remote_api::recovery) async fn observe_session(
+    connection: &mut PgConnection,
+    scope: &FeedBinding,
+    genesis: &str,
+    session: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO station_proved_session_owners AS retained
+           (station_origin,issuer,genesis_hash,session_id,account_subject,conflicted)
+         SELECT $1,$2,$3,s.session_id::uuid,i.subject,
+                direct.astation_id IS NOT NULL AND direct.agora_user <> a.agora_user
+         FROM session_bindings s
+         JOIN astation_accounts a ON a.astation_id=s.astation_id
+         JOIN account_identities i ON i.principal=a.agora_user AND i.issuer=$2
+         LEFT JOIN astation_accounts direct ON direct.astation_id='session-' || s.session_id
+         WHERE s.session_id=$4 AND i.subject ~ '^ab[0-9A-HJKMNP-TV-Z]{26}$'
+           AND s.last_used_at > floor(extract(epoch FROM statement_timestamp()))::bigint - $5
+         ON CONFLICT (station_origin,issuer,genesis_hash,session_id)
+         DO UPDATE SET conflicted=TRUE WHERE NOT retained.conflicted AND
+             (retained.account_subject <> EXCLUDED.account_subject OR EXCLUDED.conflicted)",
+    )
+    .bind(&scope.station_origin)
+    .bind(&scope.issuer)
+    .bind(genesis)
+    .bind(session)
+    .bind(BINDING_TTL_SECS)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
 
 pub(super) async fn inspect(
     connection: &mut PgConnection,
@@ -74,12 +107,25 @@ pub(super) async fn inspect(
          WHERE s.session_id=ANY($2)",
     )
     .bind(&portal.issuer)
-    .bind(session_ids)
+    .bind(&session_ids)
     .bind(BINDING_TTL_SECS)
     .fetch_all(&mut *connection)
     .await?
     .into_iter()
     .map(|(id, current, subject)| (id, (current, subject)))
+    .collect();
+    let retained: BTreeMap<_, _> = sqlx::query_as::<_, (String, String, bool)>(
+        "SELECT session_id::text, account_subject, conflicted FROM station_proved_session_owners
+         WHERE station_origin=$1 AND issuer=$2 AND genesis_hash=$3 AND session_id=ANY($4::text[]::uuid[])",
+    )
+    .bind(&portal.station_origin)
+    .bind(&portal.issuer)
+    .bind(&genesis)
+    .bind(&session_ids)
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .map(|(id, owner, conflict)| (id, (owner, conflict)))
     .collect();
     let registrations: BTreeMap<String, Option<String>> = sqlx::query_as(
         "SELECT a.astation_id,i.subject FROM astation_accounts a LEFT JOIN account_identities i
@@ -122,19 +168,26 @@ pub(super) async fn inspect(
         let mut row = json!({"host_id":host,"carrier":carrier,"proof":"verified",
             "registered_room_owner":room_owner});
         if let Some(id) = session_id_for_room(&route.room) {
-            let (status, session_owner) = match sessions.get(id) {
-                None => ("missing", None),
-                Some((false, _)) => ("expired", None),
-                Some((true, Some(s))) if account_id(s) => ("current", Some(s.as_str())),
-                Some((true, _)) => ("unresolved", None),
+            let session = sessions.get(id);
+            let status = match session {
+                None => "missing",
+                Some((false, _)) => "expired",
+                Some((true, Some(s))) if account_id(s) => "current",
+                Some(_) => "unresolved",
             };
             row["session_binding"] = json!(status);
             if let Some(candidate) = candidate {
-                let direct = registrations.get(&route.room);
-                if session_owner != Some(candidate)
-                    || direct.is_some_and(|s| s.as_deref() != Some(candidate))
-                {
+                let current_owner = session.and_then(|(_, owner)| owner.as_deref());
+                let durable = retained.get(id);
+                let conflict = registrations
+                    .get(&route.room)
+                    .is_some_and(|s| s.as_deref() != Some(candidate))
+                    || session.is_some() && current_owner != Some(candidate)
+                    || durable.is_some_and(|(owner, disputed)| *disputed || owner != candidate);
+                if conflict || (status != "current" && durable.is_none()) {
                     source = "unresolved";
+                } else if status != "current" {
+                    source = "retained_session";
                 }
             }
         }
