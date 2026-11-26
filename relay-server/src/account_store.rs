@@ -789,13 +789,19 @@ impl AccountStore for InMemoryAccountStore {
 }
 
 pub struct PgAccountStore {
+    room_ownership: Option<(String, String)>,
     pool: sqlx::PgPool,
     verifier: Arc<dyn AccountIdentityVerifier>,
 }
 
 impl PgAccountStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
+        Self::for_station(pool, None)
+    }
+
+    pub(crate) fn for_station(pool: sqlx::PgPool, room_ownership: Option<(String, String)>) -> Self {
         Self {
+            room_ownership,
             pool,
             verifier: configured_verifier(),
         }
@@ -1336,6 +1342,12 @@ impl AccountStore for PgAccountStore {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        }
+        if let Some((origin, issuer)) = &self.room_ownership {
+            lock_astation_bindings(&mut tx, astation_id).await?;
+            crate::remote_api::recovery::delegated_recovery::observe_registration(
+                &mut tx, origin, issuer, astation_id,
+            ).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -1933,11 +1945,11 @@ mod tests {
     async fn postgres_identity_bindings_survive_restart_and_preserve_existing_data() {
         let database = TestDatabase::migrated("ACCOUNT_TEST_DATABASE_URL",4).await;
         let pool = database.pool.clone();
-        let store = PgAccountStore { pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
+        let store = PgAccountStore { room_ownership:None, pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
         store.register("old","same-subject","Old Mac",1).await.unwrap();
         let principal = store.verify_access_token("one").await.unwrap().subject;
         store.register("new",&principal,"New Mac",1).await.unwrap();
-        let restart = PgAccountStore { pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
+        let restart = PgAccountStore { room_ownership:None, pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
         assert_eq!(restart.principal_for_identity("https://one.example", "same-subject").await.unwrap(), Some(principal.clone()));
         assert_eq!(restart.principal_for_identity("https://missing.example", "same-subject").await.unwrap(), None);
         assert_eq!(restart.principal_for_identity("https://one.example", &principal).await.unwrap(), None);

@@ -832,6 +832,9 @@ impl RecoveryStore {
     async fn database_apply(&self, connection: &mut sqlx::PgConnection, genesis: &str,
         subject: Option<&str>, hash: Hash32, operation: Operation) -> Result<Reply, sqlx::Error>
     {
+        if let (Operation::HostRoute { room, .. }, Some(_)) = (&operation, &self.room_ownership) {
+            delegated_recovery::route_ownership::lock_rooms(connection, &[room]).await?;
+        }
         let saved = Self::locked_root(connection, genesis).await?;
         if saved.as_ref().is_some_and(|(owner, _)| subject.is_some_and(|subject| owner != subject)) {
             return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
@@ -846,15 +849,18 @@ impl RecoveryStore {
             None => None,
         };
         let proved_room = match (&operation, self.room_ownership.as_ref()) {
-            (Operation::HostRoute { room, .. }, Some(scope)) =>
-                Some((scope, room.clone())),
+            (Operation::HostRoute { room, proxy, .. }, Some(scope)) => Some((scope, room.clone(), proxy.is_some())),
             _ => None,
         };
         let (root, reply) = match apply(root, hash, operation, now()) {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
-        if let Some(((origin, issuer), room)) = proved_room {
+        if let Some(((origin, issuer), room, proxy)) = proved_room {
+            let routes = if proxy { &root.proxies } else { &root.routes };
+            let binding = reply.1.0["binding"]["host"].as_str().and_then(|host| routes.get(host))
+                .ok_or_else(|| sqlx::Error::Protocol("missing verified host binding".into()))?;
+            delegated_recovery::route_ownership::index_proof(connection, origin, issuer, binding).await?;
             delegated_recovery::route_ownership::observe(connection, origin, issuer, genesis, &[&room]).await?;
         }
         Self::save_root(connection, genesis, &owner, root).await?;

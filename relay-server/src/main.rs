@@ -751,17 +751,21 @@ async fn serve() {
                 .await
                 .expect("Failed to run vault migrations");
             tracing::info!("Vault + knowledge + identity storage ready (Postgres)");
+            let public_origin = std::env::var("PUBLIC_BASE_URL").ok();
+            let audience = std::env::var("ACCOUNT_OIDC_AUDIENCE").ok();
+            let issuer = std::env::var("ACCOUNT_OIDC_ISSUER").ok();
+            let room_ownership = account_identity::room_ownership_scope(
+                public_origin.as_deref(), audience.as_deref(), issuer.as_deref(),
+            );
             (
                 Arc::new(vault_store::PgVaultStore::new(pool.clone())),
                 Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
-                Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
-                Arc::new(account_store::PgAccountStore::new(pool.clone())),
+                Arc::new(identity_store::PgIdentityStore::for_station(pool.clone(), room_ownership.clone())),
+                Arc::new(account_store::PgAccountStore::for_station(pool.clone(), room_ownership)),
                 Arc::new(push_tokens::PgPushTokenStore::new(pool.clone())),
                 remote_api::recovery::RecoveryStore::postgres_for_station(
                     pool,
-                    std::env::var("PUBLIC_BASE_URL").ok().as_deref(),
-                    std::env::var("ACCOUNT_OIDC_AUDIENCE").ok().as_deref(),
-                    std::env::var("ACCOUNT_OIDC_ISSUER").ok().as_deref(),
+                    public_origin.as_deref(), audience.as_deref(), issuer.as_deref(),
                 ),
             )
         }
