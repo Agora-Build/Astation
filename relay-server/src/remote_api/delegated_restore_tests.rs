@@ -361,6 +361,67 @@ async fn postgres_delegated_recovery_never_bootstraps_missing_history_or_reopens
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_bootstrap_recognizes_independent_recovery_history() {
+    // These three tables can be restored without either a feed or a fence row.
+    for retained in [
+        "INSERT INTO station_delegated_reporting(binding,events) VALUES ('report', '[]')",
+        "INSERT INTO station_verifier_rosters(origin,generation,replicas)
+         VALUES ('https://old-station.example', 1, '[\"a\"]')",
+        "INSERT INTO station_integration_policy(binding,checkpoint,recovery_generation,recovery_revision)
+         VALUES ('portal','{}',2,1)",
+    ] {
+        let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+        sqlx::query(retained).execute(&db.pool).await.unwrap();
+        let first = RecoveryStore::postgres(db.pool.clone());
+        let replica = RecoveryStore::postgres(db.reconnect(2).await);
+        let (a, b) = tokio::join!(
+            first.configure_delegated(ORIGIN, 1),
+            replica.configure_delegated(ORIGIN, 1),
+        );
+        assert!(a.is_err() && b.is_err(), "{retained}");
+        let status = inspect(&db.pool, ORIGIN).await.unwrap().unwrap();
+        assert_eq!(status.reason, "history_missing");
+        assert!(!status.ready);
+        drop((first, replica));
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_bootstrap_distinguishes_registration_from_a_signing_reservation() {
+    use crate::service_signing_ceilings::SigningCeilings;
+    let signing = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    let writer = SigningCeilings::fixture(signing.pool.clone()).await;
+    let genesis = fixture().log.genesis_hash().to_hex();
+    let key = "a".repeat(64);
+    writer.register_new_key("account", &genesis, "svc-probe", &key).await.unwrap();
+
+    for reserved in [false, true] {
+        let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+        // Normal Portal polling and service provisioning can predate first activation.
+        sqlx::query("INSERT INTO station_integration_policy(binding,checkpoint) VALUES ('portal','{}')")
+            .execute(&db.pool).await.unwrap();
+        if reserved {
+            writer.reserve("account", &genesis, "svc-probe", &key, 0, 1..=2).await.unwrap();
+        }
+        let store = RecoveryStore::postgres(db.pool.clone());
+        let ceilings = SigningCeilings::connect(&db.pool, (*signing.pool.connect_options()).clone())
+            .await.unwrap();
+        assert!(store.signing_ceilings.set(ceilings).is_ok());
+        assert_eq!(store.configure_delegated(ORIGIN, 1).await.is_ok(), !reserved);
+        let status = inspect(&db.pool, ORIGIN).await.unwrap().unwrap();
+        assert_eq!(status.ready, !reserved);
+        assert_eq!(status.reason, if reserved { "history_missing" } else { "initialized" });
+        drop(store);
+        db.cleanup().await;
+    }
+    drop(writer);
+    signing.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_fence_waits_for_the_write_boundary_and_survives_restart() {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 6).await;
     let store = RecoveryStore::postgres(database.pool.clone());

@@ -246,12 +246,16 @@ operational input: the code cannot detect an unannounced restore that reuses
 both the old configuration and the old database.
 
 Migration `0015` stores the highest generation and a ready/fenced state per
-Station origin. Initial generation `1` can bootstrap only when there is no
-delegated feed history in the database. Existing history with no recovery row,
+Station origin. At initial generation `1`, Station checks for retained feeds,
+delegated reporting journals, verifier rosters, recovery-stamped Portal
+checkpoints and positive reservations in the configured signing database.
+A regular Portal checkpoint or unused service-key registration can precede
+first activation. Existing delegated history with no recovery row,
 a missing row at any later generation, or an increased generation closes a
 durable fence. A stale generation cannot lower it; the same generation cannot
 reopen it. Changing the Station origin does not bypass the history check.
-Initialize all genuinely new origins sharing a database before creating feeds.
+Initialize all genuinely new origins sharing a database before starting delegated
+reporting, registering verifier replicas or creating feeds.
 
 The server refuses delegated startup if the generation is absent, malformed,
 stale or fenced, or if fence initialization cannot commit. Running upgraded

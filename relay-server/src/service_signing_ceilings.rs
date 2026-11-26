@@ -74,6 +74,13 @@ impl SigningCeilings {
         writable.then_some(()).ok_or(())
     }
 
+    pub(crate) async fn has_reservations(&self) -> Result<bool, sqlx::Error> {
+        // Key provisioning can register an unused key before delegated work starts.
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM station_service_signing_ceilings WHERE highest_ms > 0)")
+            .fetch_one(&self.0)
+            .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn fixture(pool: PgPool) -> Self {
         sqlx::raw_sql(include_str!("../signing-store/schema.sql"))

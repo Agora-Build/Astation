@@ -195,7 +195,7 @@ impl RecoveryStore {
             return Err("delegated recovery binding cannot change in a running store");
         }
         if let Some(pool) = &self.pool {
-            let status = binding.initialize(pool, false).await
+            let status = binding.initialize_with_signing_store(pool, false, self.signing_ceilings.get()).await
                 .map_err(|_| "cannot establish durable delegated recovery fence")?;
             if !status.ready || status.generation != generation {
                 return Err("delegated recovery is fenced; complete snapshot recovery is required");

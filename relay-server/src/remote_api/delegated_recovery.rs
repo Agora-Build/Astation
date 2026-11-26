@@ -1,6 +1,7 @@
 //! Operational rollback fence. The configured generation must live outside the
 //! restored backup; neither a feed UUID nor wall-clock time proves later history.
 use super::{RecoveryStore, Root, MAX_STATE};
+use crate::service_signing_ceilings::SigningCeilings;
 use atem_client::{membership::Membership, Hash32};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -58,6 +59,15 @@ impl Binding {
     /// Initialization is safe only before any delegated history exists. A new
     /// generation can close a fence, but cannot reopen it or recreate lost stops.
     pub async fn initialize(&self, pool: &PgPool, fence: bool) -> Result<Status, sqlx::Error> {
+        self.initialize_with_signing_store(pool, fence, None).await
+    }
+
+    pub(super) async fn initialize_with_signing_store(
+        &self,
+        pool: &PgPool,
+        fence: bool,
+        signing: Option<&SigningCeilings>,
+    ) -> Result<Status, sqlx::Error> {
         let mut tx = pool.begin().await?;
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtextextended('station-delegated-recovery', 0))",
@@ -69,20 +79,17 @@ impl Binding {
             .bind(&self.origin).fetch_optional(&mut *tx).await?;
         let next = match saved {
             None => {
-                let history: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM remote_recovery_roots WHERE state->'delegated' IS NOT NULL AND state->'delegated' <> '{}'::jsonb)")
-                    .fetch_one(&mut *tx).await?;
+                let reason = if fence {
+                    "operator_fenced"
+                } else if self.generation != 1 || has_delegated_history(&mut tx, signing).await? {
+                    "history_missing"
+                } else {
+                    "initialized"
+                };
                 Status {
                     generation: self.generation,
-                    ready: self.generation == 1 && !history && !fence,
-                    reason: if fence {
-                        "operator_fenced"
-                    } else if history || self.generation != 1 {
-                        "history_missing"
-                    } else {
-                        "initialized"
-                    }
-                    .into(),
+                    ready: reason == "initialized",
+                    reason: reason.into(),
                 }
             }
             Some(mut saved) => {
@@ -129,6 +136,26 @@ impl Binding {
                 "delegated recovery fence or generation changed".into(),
             ))
         }
+    }
+}
+
+async fn has_delegated_history(
+    connection: &mut PgConnection,
+    signing: Option<&SigningCeilings>,
+) -> Result<bool, sqlx::Error> {
+    // As with retained feeds, changing the public origin cannot turn a restored
+    // Station into a fresh installation. Plans and observations reference the fence.
+    let retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM station_delegated_reporting)
+             OR EXISTS (SELECT 1 FROM station_verifier_rosters)
+             OR EXISTS (SELECT 1 FROM station_integration_policy WHERE recovery_generation IS NOT NULL)
+             OR EXISTS (SELECT 1 FROM remote_recovery_roots WHERE state->'delegated' <> '{}'::jsonb)",
+    )
+    .fetch_one(connection)
+    .await?;
+    match signing {
+        Some(store) if !retained => store.has_reservations().await,
+        _ => Ok(retained),
     }
 }
 
