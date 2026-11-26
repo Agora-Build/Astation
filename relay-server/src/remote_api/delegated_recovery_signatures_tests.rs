@@ -802,6 +802,15 @@ async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and
     let read = "SELECT records FROM station_delegated_snapshot_stops";
     let staged: Value = sqlx::query_scalar(read).fetch_one(&second).await.unwrap();
     assert_eq!(staged, json!([source.object().to_json()]));
+    // Lost response: a second replica must recover the committed receipt even
+    // when a new write of the same component would fail at commit.
+    sqlx::raw_sql("CREATE FUNCTION reject_staging() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected commit failure'; END; $$;
+        CREATE CONSTRAINT TRIGGER reject_staging AFTER UPDATE ON station_delegated_snapshot_stops
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_staging()")
+        .execute(&database.pool).await.unwrap();
+    assert_eq!(stage(&second, &binding, &genesis, review).await.unwrap(), receipt);
+
     // A fresh copy for a still-authorized signer leaves the exact original usable.
     let updated = submit(&second, &binding, &genesis, &plan,
         &input(&plan, &source, fresh(&f, &plan, &source, 1000))).await.unwrap();
@@ -810,11 +819,6 @@ async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and
     assert!(stage(&database.pool, &binding, &genesis, review).await.is_err());
 
     // No receipt or new component can escape a failed transaction commit.
-    sqlx::raw_sql("CREATE FUNCTION reject_staging() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN RAISE EXCEPTION 'injected commit failure'; END; $$;
-        CREATE CONSTRAINT TRIGGER reject_staging AFTER UPDATE ON station_delegated_snapshot_stops
-        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_staging()")
-        .execute(&database.pool).await.unwrap();
     assert!(stage(&database.pool, &binding, &genesis, next).await.is_err());
     let retained: String = sqlx::query_scalar("SELECT reconstruction_hash FROM station_delegated_snapshot_stops")
         .fetch_one(&second).await.unwrap();

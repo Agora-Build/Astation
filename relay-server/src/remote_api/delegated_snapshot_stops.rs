@@ -83,21 +83,32 @@ pub(crate) async fn stage(
     }
     let records = sources.assemble(&log, &binding.origin, &plan)?;
     let records_hash = source_hash(&records)?;
-    // Exact replica retries also verify what was saved. A newer review may
-    // replace this derived component; its source evidence is retained separately.
+    // The fence and root are locked. Only a changed review replaces a row.
+    // An exact retry after a lost response verifies the committed component below.
     let changed = sqlx::query(
         "INSERT INTO station_delegated_snapshot_stops AS s (plan_id,reconstruction_hash,records)
          VALUES ($1,$2,$3) ON CONFLICT (plan_id) DO UPDATE
          SET reconstruction_hash=EXCLUDED.reconstruction_hash,records=EXCLUDED.records
-         WHERE s.reconstruction_hash<>EXCLUDED.reconstruction_hash OR s.records=EXCLUDED.records",
+         WHERE s.reconstruction_hash<>EXCLUDED.reconstruction_hash",
     )
     .bind(&plan.plan_id)
     .bind(expected)
     .bind(&records)
     .execute(&mut *tx)
     .await?;
-    if changed.rows_affected() != 1 {
-        return Err(invalid());
+    if changed.rows_affected() == 0 {
+        let matches: bool = sqlx::query_scalar(
+            "SELECT records=$3 FROM station_delegated_snapshot_stops
+             WHERE plan_id=$1 AND reconstruction_hash=$2",
+        )
+        .bind(&plan.plan_id)
+        .bind(expected)
+        .bind(&records)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !matches {
+            return Err(invalid());
+        }
     }
     tx.commit().await?;
     Ok(json!({

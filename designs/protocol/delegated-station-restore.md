@@ -885,6 +885,9 @@ against reuse. A cover, hold or release must name the feed that contains it.
 
 The transaction saves the signed component under the plan ID. Its receipt gives
 the candidate feed ID, reconstruction hash, record count and records hash.
+If the response is lost, repeat the command with the same hash on either
+replica. It verifies the saved records and returns the original receipt
+without rewriting them. A mismatch refuses the receipt.
 After new evidence, repeat preparation and stage against the new hash. The live
 feed and its ACK ledger continue to refer to the old feed. The complete snapshot
 still requires participant and service evidence, current covers and holds,
