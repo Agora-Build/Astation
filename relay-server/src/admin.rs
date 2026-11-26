@@ -7,6 +7,7 @@ use crate::cluster::redis::RedisConn;
 use crate::identity_store::{IdentityStore, PgIdentityStore};
 
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
+       station-relay-server admin migrate-room-owners <genesis_hash>\n\
        station-relay-server admin delegated-recovery status|fence\n\
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
@@ -67,8 +68,10 @@ pub async fn main(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("delegated-recovery") {
         return delegated_recovery(&args[1..]).await;
     }
-    let astation_id = match args {
-        [command, id] if command == "forget-key" && !id.is_empty() => id.clone(),
+    let (command, id) = match args {
+        [command, id] if command == "forget-key" && !id.is_empty() => (command, id),
+        [command, genesis] if command == "migrate-room-owners"
+            && crate::remote_api::recovery::delegated_recovery::canonical_genesis(genesis) => (command, genesis),
         _ => {
             eprintln!("{USAGE}");
             return 2;
@@ -89,6 +92,22 @@ pub async fn main(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if command == "migrate-room-owners" {
+        let scope = crate::account_identity::room_ownership_scope(
+            std::env::var("PUBLIC_BASE_URL").ok().as_deref(),
+            std::env::var("ACCOUNT_OIDC_AUDIENCE").ok().as_deref(),
+            std::env::var("ACCOUNT_OIDC_ISSUER").ok().as_deref(),
+        );
+        let Some((origin, issuer)) = scope else {
+            eprintln!("Room ownership migration requires the built-in Station's origin and Auth configuration");
+            return 2;
+        };
+        return match crate::remote_api::recovery::delegated_recovery::migrate_room_owners(&pool, &origin, &issuer, id).await {
+            Ok(report) => { println!("{report}"); 0 }
+            Err(_) => { eprintln!("Could not migrate this device list's room ownership evidence"); 1 }
+        };
+    }
+    let astation_id = id;
     let identity = PgIdentityStore::new(pool);
     let bus = match std::env::var("REDIS_URL").ok().filter(|url| !url.trim().is_empty()) {
         Some(url) => match RedisConn::connect_checked(&url).await {
@@ -100,7 +119,7 @@ pub async fn main(args: &[String]) -> i32 {
         },
         None => None,
     };
-    match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
+    match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), astation_id).await {
         Ok(outcome) => {
             if outcome.deleted {
                 println!("Deleted the relay key of {astation_id}.");

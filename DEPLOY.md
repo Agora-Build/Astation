@@ -748,6 +748,13 @@ the room code could register first (see "First-use squatting" in
 `DELETE /api/pair/:code` is refused with `409` for a code that has a registered
 key; use `admin forget-key`, not the API, to manage such rooms.
 
+For a built-in Station device list that predates room ownership capture, run
+`station-relay-server admin migrate-room-owners <genesis_hash>` to recover its
+registration evidence. The command uses the running Station's database, origin, token
+audience and issuer. It verifies saved relay and proxy proofs and records any
+current account registrations they identify. The JSON counts include stale
+routes, disputed rooms and rooms missing registration evidence. A new sign-in can supply a missing registration for a later run.
+
 Delegated host-work recovery is separate from relay-key reset. The feature
 remains disabled. An opt-in build additionally requires
 `STATION_DELEGATED_HOST_WORK=true`, normalized `PUBLIC_BASE_URL` and

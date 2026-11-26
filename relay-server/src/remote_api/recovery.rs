@@ -676,10 +676,7 @@ impl RecoveryStore {
     }
 
     pub(crate) fn postgres_for_station(pool: PgPool, public_origin: Option<&str>, audience: Option<&str>, issuer: Option<&str>) -> Arc<Self> {
-        let room_ownership = audience
-            .and_then(|aud| crate::account_identity::configured_integration_origin(public_origin, aud).ok())
-            .filter(|origin| crate::account_identity::built_in_station(origin))
-            .zip(issuer.filter(|iss| crate::account_identity::station_origin(iss)).map(str::to_owned));
+        let room_ownership = crate::account_identity::room_ownership_scope(public_origin, audience, issuer);
         Arc::new(Self {
             pool: Some(pool),
             memory: None,
@@ -860,7 +857,7 @@ impl RecoveryStore {
             Err(reply) => return Ok(reply),
         };
         if let Some(((origin, issuer), room)) = proved_room {
-            delegated_recovery::route_ownership::observe(connection, origin, issuer, genesis, &room).await?;
+            delegated_recovery::route_ownership::observe(connection, origin, issuer, genesis, &[&room]).await?;
         }
         Self::save_root(connection, genesis, &owner, root).await?;
         Ok(reply)

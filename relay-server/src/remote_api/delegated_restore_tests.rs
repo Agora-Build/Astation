@@ -665,6 +665,33 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
         "verified"
     );
 
+    // Both routes predate ownership capture. Only the proxy still proves its
+    // route, and the migration can run on a different replica with no host online.
+    use super::super::super::delegated_recovery::migrate_room_owners;
+    let migrate = || migrate_room_owners(&replica, ORIGIN, &portal.issuer, &genesis);
+    let source = saved(&database.pool, &genesis).await;
+    sqlx::query("CREATE FUNCTION fail_migration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'migration commit failed'; END $$")
+        .execute(&database.pool).await.unwrap();
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_migration AFTER INSERT ON station_proved_room_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_migration()")
+        .execute(&database.pool).await.unwrap();
+    assert!(migrate().await.is_err());
+    let count = || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_proved_room_owners")
+        .fetch_one(&database.pool);
+    assert_eq!(count().await.unwrap(), 0);
+    sqlx::query("DROP TRIGGER fail_migration ON station_proved_room_owners")
+        .execute(&database.pool).await.unwrap();
+    let migrated = json!({"proved_rooms":1,"with_registration_evidence":1,
+        "disputed":0,"without_registration_evidence":0,"stale_routes":1});
+    assert_eq!(migrate().await.unwrap(), migrated);
+    assert_eq!(migrate().await.unwrap(), migrated);
+    assert_eq!(count().await.unwrap(), 1);
+    assert_eq!(saved(&database.pool, &genesis).await, source);
+    assert!(migrate_room_owners(&replica, "https://custom.example", &portal.issuer, &genesis).await.is_err());
+    sqlx::query("UPDATE astation_accounts SET agora_user='alice' WHERE astation_id='phone'")
+        .execute(&database.pool).await.unwrap();
+    assert_eq!(migrate().await.unwrap()["disputed"], 1);
+    assert_eq!(migrate().await.unwrap()["with_registration_evidence"], 0);
+
     replica.close().await;
     database.cleanup().await;
 }
