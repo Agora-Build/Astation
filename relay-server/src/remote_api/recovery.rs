@@ -100,6 +100,8 @@ pub(crate) struct HostBinding {
     nonce: [u8; 32],
     proof: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegated_feed: Option<delegated::ProvedFeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyBinding>,
 }
 
@@ -346,20 +348,16 @@ impl RecoveryStore {
         self.delegated_changes.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_delegated(&self, binding: &HostBinding) -> bool {
-        let Some(origin) = self.delegated_origin.get() else { return false };
-        match self.with_root(&binding.genesis,
-            |root, log| root.current(binding)
-                && binding.valid(log) && log.frozen().is_none(),
-            |root, _| std::future::ready(root.delegated.contains_key(origin))).await
-        {
-            Some(true) => return true,
-            Some(false) => {},
-            None => return false,
-        }
-        self.perform_scoped(&binding.genesis, None, Operation::Delegated {
-            origin: origin.clone(), binding: Some(binding.clone()), command: delegated::Command::Ensure,
-        }).await.0 == StatusCode::OK
+        self.with_delegated_route(binding, || std::future::ready(())).await.is_some()
+    }
+
+    pub(crate) async fn with_delegated_route<T, F, Fut>(&self, binding: &HostBinding, action: F) -> Option<T>
+    where F: FnOnce() -> Fut, Fut: std::future::Future<Output = T> {
+        let origin = self.delegated_origin.get()?;
+        self.with_root(&binding.genesis, |root, log| delegated::current_link(root, log, origin, binding),
+            |_, _| action()).await
     }
 
     /// Snapshot and queue admission share the membership/route lock. A delayed
@@ -371,8 +369,7 @@ impl RecoveryStore {
     {
         let origin = self.delegated_origin.get()?;
         self.with_root(&binding.genesis,
-            |root, log| root.current(binding)
-                && binding.valid(log) && log.frozen().is_none(),
+            |root, log| delegated::current_link(root, log, origin, binding),
             |root, log| {
                 let response = match call {
                     Some(call) => delegated::response(root, origin, log, call, now().wall_ms),
@@ -439,6 +436,7 @@ impl RecoveryStore {
                     atem_id: atem_id.into(),
                     connection,
                     proxy,
+                    delegated_origin: self.delegated_origin.get().cloned(),
                 },
             )
             .await;
@@ -894,7 +892,7 @@ impl RecoveryStore {
 
 pub(super) enum Operation {
     IntegrationSnapshot,
-    HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef, proxy: Option<ProxyBinding> },
+    HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef, proxy: Option<ProxyBinding>, delegated_origin: Option<String> },
     RetireProxy(HostBinding),
     Append {
         entry: Entry,
@@ -982,13 +980,16 @@ fn apply(
         Operation::DeviceEnrollment(command) => device_enrollment::apply(&mut root.enrollments, command, clock.wall_ms)?,
         Operation::VerifierReport { origin, command } =>
             verifier_reports::apply(&mut root.verifier_reports, &log, &origin, command, clock.wall_ms)?,
-        Operation::HostRoute { text, nonce, room, atem_id, connection, proxy } => {
+        Operation::HostRoute { text, nonce, room, atem_id, connection, proxy, delegated_origin } => {
             let kind = if proxy.is_some() { RouteKind::Proxy } else { RouteKind::Relay };
             let route = verify_host_route_message_as(kind, &log, text.as_bytes(), &nonce, &room, &atem_id)
                 .map_err(|refusal| (StatusCode::BAD_REQUEST, Json(RelayReply::refused(&refusal).to_json())))?;
+            let delegated_feed = delegated_origin.as_deref()
+                .map(|origin| delegated::proved_feed(&mut root, origin, &log))
+                .transpose().map_err(|_| unavailable())?;
             let binding = HostBinding { genesis: hash.to_hex(), host: route.host_id.clone(),
                 host_trust_gen: log.host(&route.host_id).ok_or_else(unavailable)?.host_trust_gen,
-                connection, room, atem_id, nonce, proof: text, proxy };
+                connection, room, atem_id, nonce, proof: text, proxy, delegated_feed };
             let routes = if binding.proxy.is_some() { &mut root.proxies } else { &mut root.routes };
             let replaced = routes.insert(route.host_id.clone(), binding.clone());
             (StatusCode::OK, Json(json!({"binding":binding,"replaced":replaced,"verdict":RelayReply::ok(&route).to_json()})))

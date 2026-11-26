@@ -992,6 +992,13 @@ clock verification and atomic publication.
    gate. Old feed requests are refused; delayed old responses cannot cross the
    new socket/trust association. Execution remains subject to the rollout gate.
 
+When a relay or local proxy proves a host, Station binds that connection to
+the active Station origin and feed ID in the same transaction. A replacement
+feed requires a fresh proof before the host can fetch control data or acknowledge
+effects. Station checks the feed again when writing queued control frames.
+The ACK names the feed the host just read, even when the acknowledged stop
+retains its original signature from an earlier feed.
+
 ## Retention
 
 Keep feed records for at least 30 days, and each principal's latest state for

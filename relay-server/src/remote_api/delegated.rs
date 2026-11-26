@@ -36,6 +36,13 @@ pub(super) struct Stored {
     report_control_hash: Option<String>,
 }
 
+/// Station-local receipt of the feed active when it accepted this socket's proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ProvedFeed {
+    origin: String,
+    feed_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeliveryRetry {
     attempts: u32,
@@ -332,6 +339,9 @@ impl Stored {
         ack: &ControlAck,
         now: u64,
     ) -> Result<(), Fault> {
+        if ack.feed_id != self.feed_id {
+            return Err(Fault::Forbidden(RefusedCall::ControlAck));
+        }
         let link = LinkAssociation {
             account_id: log.account_id().into(),
             genesis_hash: log.genesis_hash(),
@@ -739,6 +749,17 @@ pub(super) fn ensure(root: &mut Root, origin: &str, log: &Membership) -> Result<
     Ok(())
 }
 
+pub(super) fn proved_feed(root: &mut Root, origin: &str, log: &Membership) -> Result<ProvedFeed, Fault> {
+    ensure(root, origin, log)?;
+    Ok(ProvedFeed { origin: origin.into(), feed_id: root.delegated[origin].feed_id.clone() })
+}
+
+pub(super) fn current_link(root: &Root, log: &Membership, origin: &str, binding: &HostBinding) -> bool {
+    binding.delegated_feed.as_ref().is_some_and(|proof| proof.origin == origin
+        && root.delegated.get(origin).is_some_and(|feed| feed.feed_id == proof.feed_id))
+        && root.current(binding) && binding.valid(log) && log.frozen().is_none()
+}
+
 pub(super) fn heads(root: &Root, origin: &str, log: &Membership, now: u64) -> Result<Value, Fault> {
     root.delegated
         .get(origin)
@@ -957,11 +978,15 @@ pub(super) fn apply(
         return Err(Fault::Invalid);
     }
     if let Some(binding) = binding {
-        if !root.current(binding) || !binding.valid(log) {
-            return Err(Fault::Invalid);
+        if !current_link(root, log, origin, binding) {
+            return Err(match command {
+                Command::Ack(_) => Fault::Forbidden(RefusedCall::ControlAck),
+                _ => Fault::Invalid,
+            });
         }
+    } else {
+        ensure(root, origin, log)?;
     }
-    ensure(root, origin, log)?;
     match command {
         Command::Ensure => heads(root, origin, log, now),
         Command::Ack(ack) => {
