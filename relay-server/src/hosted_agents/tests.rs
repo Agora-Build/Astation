@@ -220,7 +220,7 @@ struct HostScenario {
     busy_initializations: usize,
     pending_approval: bool,
     lose_submit_reply: bool,
-    handles: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    handles: Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Receiver<()>)>>,
     host_work: bool,
     mark_png: Option<Vec<u8>>,
     mark_hold: bool,
@@ -258,9 +258,11 @@ async fn controlled_host_scenario(
         };
         assert_eq!(open["event"], "open");
         let handle = open["channel"].as_str().unwrap().to_owned();
-        if let Some(handles) = &scenario.handles {
-            handles.send(handle.clone()).unwrap();
-        }
+        let mut observed_close = scenario.handles.as_ref().map(|handles| {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            handles.send((handle.clone(), receiver)).unwrap();
+            sender
+        });
         let init = next_client_json(&mut socket).await;
         if attachment < scenario.busy_initializations {
             let reply = atem_client::channel::responder::InitLimiter::busy()
@@ -383,6 +385,10 @@ async fn controlled_host_scenario(
         loop {
             let frame = next_client_json(&mut socket).await;
             if frame["event"] == "close" {
+                if let Some(sender) = observed_close.take() {
+                    assert_eq!(frame["channel"], handle);
+                    sender.send(()).unwrap();
+                }
                 break;
             }
             let plain: Value = serde_json::from_slice(
@@ -1166,7 +1172,7 @@ async fn postgres_dispatch_failure_preserves_mutation_recovery_without_replaying
             client::HostedConnection::open(&runtime, &context, &fingerprint, "host-a")
                 .await
                 .unwrap();
-        let handle = incoming_handles.recv().await.unwrap();
+        let (handle, observed_close) = incoming_handles.recv().await.unwrap();
         let target = json!(connection.attached.target("ses-aaaaaaaaaaaa").unwrap());
         let mut body = fields.clone();
         body["target"] = target.clone();
@@ -1217,6 +1223,13 @@ async fn postgres_dispatch_failure_preserves_mutation_recovery_without_replaying
                 json!({"error":{"code":"delivery_uncertain"},"request_id":fields["request_id"],"target":target,"recovery":"query_receipts"})
             );
         }
+        // The simulated host handles one channel at a time; finish this close
+        // before opening the next attachment on its shared WebSocket.
+        drop(connection);
+        tokio::time::timeout(std::time::Duration::from_secs(3), observed_close)
+            .await
+            .unwrap()
+            .unwrap();
     }
     tokio::time::timeout(std::time::Duration::from_secs(3), host)
         .await
