@@ -397,11 +397,13 @@ final class IntegrationApprovalViewController: NSViewController {
                 let context = try? hub.verifierContext(for: coordinator)
                 let verifyHosts = try coordinator.serviceHostVerifier(for: approval,
                     current: { context?() == true }, channels: hub.verifierHostChannels(_:requirement:))
+                let verifyStation = coordinator.serviceStationVerifier(for: approval,
+                    current: { context?() == true }, transport: hub.verifierTransport(current:))
                 let result = try await coordinator.approveService(approval, portal: portal,
                     authorizeNewOperations: { [hub] log in
                         try hub.validateServiceHosts(review, log: log)
                         try verifyHosts(log)
-                    },
+                    }, refreshServiceReports: verifyStation,
                     current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
                 guard epoch == generation, let current = contextCurrent, current() else { return }
                 self.approval = nil; reviewText.stringValue = ""

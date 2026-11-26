@@ -78,10 +78,12 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
 
     /// The signed list supplies all active members and hosts; the protected Station
     /// roster supplies its replica identities. None starts with live evidence.
-    public convenience init(log: MembershipLog, station: RemoteStationVerifierRoster,
+    public convenience init(log: MembershipLog, station: RemoteStationVerifierRoster, prospectiveServiceID: String? = nil,
                 wall: @escaping () -> UInt64 = { UInt64(max(0, Date().timeIntervalSince1970 * 1000)) },
                 now: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws {
-        try self.init(log: log, verifiers: station.replicas.map(station.verifierID), includeMembership: true, wall: wall, now: now)
+        var verifiers = station.replicas.map(station.verifierID)
+        if let prospectiveServiceID { verifiers.append(.member(prospectiveServiceID)) }
+        try self.init(log: log, verifiers: verifiers, includeMembership: true, wall: wall, now: now)
     }
 
     private init(log: MembershipLog, verifiers: [RemoteVerifierID], includeMembership: Bool,
@@ -283,6 +285,17 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     /// Recheck at the actual signing boundary, after the owner's confirmation, using the fresh log.
     /// A disconnected consumer or a changed roster/head invalidates the authorization.
     public func authorize(_ request: SignRequest, log: MembershipLog) throws {
+        try requireReports(request, log: log, participants: nil)
+    }
+
+    /// Only the protected service and the replicas serving it. The account-wide signer
+    /// separately calls authorize for its complete inventory.
+    func requireServiceReports(_ request: SignRequest, log: MembershipLog, participants: [RemoteVerifierID]) throws {
+        guard !participants.isEmpty else { throw RemoteVerifierGateError.invalidRoster }
+        try requireReports(request, log: log, participants: participants)
+    }
+
+    private func requireReports(_ request: SignRequest, log: MembershipLog, participants: [RemoteVerifierID]?) throws {
         guard let json = request.bodyJson,
               request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: json, keyID: request.keyId)),
               let body = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
@@ -317,11 +330,14 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
             serviceClock = (max(wall(), projected.partialValue), current)
             guard serviceClock.wall < expiry else { throw RemoteVerifierGateError.unconfirmedVerifiers }
         }
-        guard states.values.allSatisfy({ state in
+        func supports(_ state: State) -> Bool {
             guard state.connection != nil, let inventory = state.confirmed else { return false }
             if let deadline = state.validBefore, current >= deadline { return false }
             return inventory.version >= minimum && inventory.actions.contains(action)
-        }) else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+        }
+        let confirmed = participants.map { ids in ids.allSatisfy { states[$0].map(supports) == true } }
+            ?? states.values.allSatisfy(supports)
+        guard confirmed else { throw RemoteVerifierGateError.unconfirmedVerifiers }
     }
 
 }

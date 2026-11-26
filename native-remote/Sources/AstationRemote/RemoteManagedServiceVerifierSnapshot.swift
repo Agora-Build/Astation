@@ -64,6 +64,7 @@ public final class RemoteManagedServiceVerifierEvidence {
     private var poll: (id: Poll, station: RemoteStationVerifierEvidence.Poll)?
     private var connections: [RemoteVerifierSigningGate.Connection] = []
     private var retired = false
+    private var reviewedGenerations: [UInt64]?
 
     public init(gate: RemoteVerifierSigningGate, roster: RemoteStationVerifierRoster, log: MembershipLog, memberIDs: [String],
                 prospectiveRequest: SignRequest? = nil) throws {
@@ -105,6 +106,38 @@ public final class RemoteManagedServiceVerifierEvidence {
         let next = Poll(id: UUID())
         poll = (next, station.begin())
         return next
+    }
+
+    /// The same protected service key and replica processes must answer on both
+    /// sides of owner confirmation. The lease starts before token acquisition.
+    public func refreshEnrollment(using transport: any RemoteManagedServiceVerifierTransport,
+                                  current: () throws -> Void) async throws {
+        guard prospective != nil else { throw RemoteVerifierGateError.unsupportedEntry }
+        let expected = try begin()
+        do {
+            try current()
+            let snapshot = try await transport.managedServiceVerifiers(genesisHash: log.genesisHash(),
+                memberIDs: members, expected: log.head())
+            try Task.checkCancellation()
+            try current()
+            let generations = snapshot.station.replicas.compactMap(\.connectionGeneration)
+            guard generations.count == roster.replicas.count,
+                  reviewedGenerations == nil || reviewedGenerations == generations else {
+                throw RemoteVerifierGateError.staleConnection
+            }
+            try receive(snapshot, for: expected)
+            try requireEnrollment(log: log)
+            reviewedGenerations = generations
+        } catch {
+            failed(expected)
+            throw error
+        }
+    }
+
+    public func requireEnrollment(log: MembershipLog) throws {
+        guard !retired, poll == nil, let prospective else { throw RemoteVerifierGateError.staleConnection }
+        try gate.requireServiceReports(prospective.request, log: log,
+            participants: roster.replicas.map(roster.verifierID) + members.map(RemoteVerifierID.member))
     }
 
     public func receive(_ snapshot: RemoteManagedServiceVerifierSnapshot, for expected: Poll) throws {

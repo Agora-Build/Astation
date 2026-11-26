@@ -425,6 +425,16 @@ the required action and version. The Mac compares the channel generations
 and reviewed Station roster before and after owner confirmation and at the
 signing key. Delivery of an already signed append uses its saved bytes.
 The independent all-participant check is still required for a new signature.
+
+For a proposed Station-managed service, the approval also queries the selected
+Station for the proposed key and its replica reports before and after owner
+confirmation. Both replies must identify the same reviewed replica processes.
+The private-key check uses the exact enrollment request, the signed service
+expiry and the shortest replica lease. A missing key, replaced replica or
+expired lease requires a fresh attempt. Network time after owner confirmation
+counts toward its 30-second window. A retry of a saved signature skips both
+polls.
+
 The Mac issues up to eight challenges at a time and reads each original nonce
 after allowing the responders five seconds to answer. The result counts reports
 verified during the inspection. Different batches can finish at different
