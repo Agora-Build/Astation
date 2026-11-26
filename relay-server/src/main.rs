@@ -757,7 +757,12 @@ async fn serve() {
                 Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
                 Arc::new(account_store::PgAccountStore::new(pool.clone())),
                 Arc::new(push_tokens::PgPushTokenStore::new(pool.clone())),
-                remote_api::recovery::RecoveryStore::postgres(pool),
+                remote_api::recovery::RecoveryStore::postgres_for_station(
+                    pool,
+                    std::env::var("PUBLIC_BASE_URL").ok().as_deref(),
+                    std::env::var("ACCOUNT_OIDC_AUDIENCE").ok().as_deref(),
+                    std::env::var("ACCOUNT_OIDC_ISSUER").ok().as_deref(),
+                ),
             )
         }
         _ => {

@@ -626,7 +626,7 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
         }
     }
     for (version, state, account, source) in [
-        (1, "bound", alice, "portal_binding"),
+        (1, "bound", alice, "unresolved"),
         (2, "released", alice, "no_bound_owner"),
         (3, "bound", bob, "portal_binding"),
         (4, "unbound", bob, "no_bound_owner"),
@@ -796,9 +796,11 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
     use crate::integration_feed::PolicyStore;
 
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
-    let store = RecoveryStore::postgres(database.pool.clone());
     let portal = inspection_portal();
-    store.configure_session_ownership(&portal).unwrap();
+    let built_in = |pool| RecoveryStore::postgres_for_station(
+        pool, Some(ORIGIN), Some(ORIGIN), Some(&portal.issuer),
+    );
+    let store = built_in(database.pool.clone());
     let f = fixture();
     f.publish(&store).await;
     let genesis = f.log.genesis_hash().to_hex();
@@ -834,7 +836,7 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
     let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
     let replica = database.reconnect(3).await;
     let count = || {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_proved_session_owners")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM station_proved_room_owners")
             .fetch_one(&replica)
     };
     assert!(store
@@ -848,6 +850,19 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
         .await
         .is_err());
     assert_eq!(count().await.unwrap(), 0);
+
+    for (origin, audience, issuer) in [
+        ("https://custom.example", "https://custom.example", portal.issuer.as_str()),
+        (ORIGIN, "https://station.agora.build", portal.issuer.as_str()),
+        (ORIGIN, ORIGIN, "https://other-issuer.example"),
+    ] {
+        let independent = RecoveryStore::postgres_for_station(
+            replica.clone(), Some(origin), Some(audience), Some(issuer),
+        );
+        independent.admit_host(&message, challenge.nonce, &room, "host-a",
+            ConnRef::new("independent", "local")).await.unwrap();
+        assert_eq!(count().await.unwrap(), 0);
+    }
 
     // A failed route commit cannot leave behind ownership evidence.
     sqlx::query("CREATE FUNCTION fail_route() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'route commit failed'; END $$")
@@ -909,8 +924,7 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
         .unwrap();
     identity.bind(&session.id, "phone", now).await.unwrap();
     assert_eq!(route().await["owner_source"], "unresolved");
-    let restarted = RecoveryStore::postgres(replica.clone());
-    restarted.configure_session_ownership(&portal).unwrap();
+    let restarted = built_in(replica.clone());
     let challenge = HostChallenge::new(&room);
     let fresh = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
     restarted
@@ -926,11 +940,21 @@ async fn postgres_delegated_proved_session_owner_survives_expiry_and_refuses_rea
     identity.unbind(&session.id, "phone").await.unwrap();
     assert_eq!(route().await["owner_source"], "unresolved");
     let first: (String, bool) =
-        sqlx::query_as("SELECT account_subject,conflicted FROM station_proved_session_owners")
+        sqlx::query_as("SELECT account_subject,conflicted FROM station_proved_room_owners")
             .fetch_one(&replica)
             .await
             .unwrap();
     assert_eq!(first, (account.to_owned(), true));
+
+    // An identity room has no session binding. Its registration at proof time
+    // still prevents migration to the root's owner if that registration goes away.
+    admit(&restarted, &f, "identity-room").await;
+    sqlx::query("DELETE FROM astation_accounts WHERE astation_id='phone'")
+        .execute(&replica).await.unwrap();
+    let room = route().await;
+    assert_eq!(room["registered_room_owner"], "unregistered");
+    assert_eq!(room["owner_source"], "unresolved");
+    assert!(room.get("session_binding").is_none());
     drop(restarted);
     replica.close().await;
     database.cleanup().await;

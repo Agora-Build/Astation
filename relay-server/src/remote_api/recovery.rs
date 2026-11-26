@@ -170,7 +170,7 @@ pub(crate) struct VerificationAuthority {
 pub struct RecoveryStore {
     pool: Option<PgPool>,
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
-    session_ownership: OnceLock<crate::integration_feed::FeedBinding>,
+    room_ownership: Option<(String, String)>,
     delegated_origin: OnceLock<String>,
     delegated_recovery: OnceLock<delegated_recovery::Binding>,
     recovery_review_only: OnceLock<()>,
@@ -181,16 +181,6 @@ pub struct RecoveryStore {
 
 impl RecoveryStore {
     pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
-
-    pub(crate) fn configure_session_ownership(&self, binding: &crate::integration_feed::FeedBinding) -> Result<(), ()> {
-        if crate::integration_checkpoint::PortalCheckpoint::built_in(binding) {
-            let current = self.session_ownership.get_or_init(|| binding.clone());
-            if current.issuer != binding.issuer || current.station_origin != binding.station_origin {
-                return Err(());
-            }
-        }
-        Ok(())
-    }
 
     pub(crate) async fn configure_delegated(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
         if self.recovery_review_only.get().is_some() {
@@ -672,7 +662,7 @@ impl RecoveryStore {
         Arc::new(Self {
             pool: None,
             memory: None,
-            session_ownership: OnceLock::new(),
+            room_ownership: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -682,10 +672,18 @@ impl RecoveryStore {
         })
     }
     pub fn postgres(pool: PgPool) -> Arc<Self> {
+        Self::postgres_for_station(pool, None, None, None)
+    }
+
+    pub(crate) fn postgres_for_station(pool: PgPool, public_origin: Option<&str>, audience: Option<&str>, issuer: Option<&str>) -> Arc<Self> {
+        let room_ownership = audience
+            .and_then(|aud| crate::account_identity::configured_integration_origin(public_origin, aud).ok())
+            .filter(|origin| crate::account_identity::built_in_station(origin))
+            .zip(issuer.filter(|iss| crate::account_identity::station_origin(iss)).map(str::to_owned));
         Arc::new(Self {
             pool: Some(pool),
             memory: None,
-            session_ownership: OnceLock::new(),
+            room_ownership,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -730,7 +728,7 @@ impl RecoveryStore {
         Arc::new(Self {
             pool: None,
             memory: Some(Mutex::new(HashMap::new())),
-            session_ownership: OnceLock::new(),
+            room_ownership: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -852,17 +850,17 @@ impl RecoveryStore {
             },
             None => None,
         };
-        let session = match (&operation, self.session_ownership.get()) {
+        let proved_room = match (&operation, self.room_ownership.as_ref()) {
             (Operation::HostRoute { room, .. }, Some(scope)) =>
-                crate::auth::session_id_for_room(room).map(|id| (scope, id.to_owned())),
+                Some((scope, room.clone())),
             _ => None,
         };
         let (root, reply) = match apply(root, hash, operation, now()) {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
-        if let Some((scope, session_id)) = session {
-            delegated_recovery::route_ownership::observe_session(connection, scope, genesis, &session_id).await?;
+        if let Some(((origin, issuer), room)) = proved_room {
+            delegated_recovery::route_ownership::observe(connection, origin, issuer, genesis, &room).await?;
         }
         Self::save_root(connection, genesis, &owner, root).await?;
         Ok(reply)
