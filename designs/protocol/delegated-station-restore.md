@@ -800,6 +800,28 @@ observations, and whether any ended with a stopped client or outstanding deliver
 A missing live journal has a null current hash. Earlier observations remain
 available to reconcile before reopening. Preparation sends no report or resume.
 
+At reporter startup, Station checks that the live event sequence extends every
+archived sequence for the same issuer, Portal and Station. It restores consumed
+resume IDs in the journal transaction before considering the configured resume.
+A missing stop or a conflicting prefix keeps the reporter closed. An archived
+delivery claim that disappeared requires a fresh explicit resume unless the
+live journal already records a subsequent resume. The initial client uses no
+resume ID. Each later resume requires one distinct consumed ID. If the live
+and archived evidence together cannot account for those IDs, the reporter
+stays closed, including when the operator repeats an earlier ID.
+
+If the restored journal lost a stop or an outstanding delivery, run
+`station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>`
+with the same Portal reporting configuration, while the recovery generation is
+closed. The preparation report includes `reporting_history.retained_stop_or_claim_hash`
+when an archived observation ended with either condition. An earlier preparation's
+saved hash can also identify the source. Station verifies the selected archive
+against the live row and all other observations. Incompatible histories require
+reconciliation. On success it restores the exact stopped event sequence or
+outstanding claim and the consumed resume IDs in one transaction. Repeating the
+command returns the same receipt. The reporting worker stays held until its
+normal explicit resume, and the deployment recovery fence stays closed.
+
 A Station in recovery review mode fetches the existing authenticated Portal checkpoint
 after observing its configured closed generation. At commit it takes a shared lock
 on the same fence and compares the policy revision. A late response from a previous

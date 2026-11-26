@@ -9,6 +9,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin migrate-room-owners <genesis_hash>\n\
        station-relay-server admin delegated-recovery status|fence\n\
+       station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>\n\
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
@@ -174,6 +175,11 @@ async fn delegated_recovery(args: &[String]) -> i32 {
     let (fence, root, files, plan_or_hash) = match args {
         [command] if command == "status" => (false, None, None, None),
         [command] if command == "fence" => (true, None, None, None),
+        [command, hash] if command == "restore-report-stop"
+            && crate::remote_api::recovery::delegated_recovery::canonical_genesis(hash) =>
+        {
+            (false, None, None, Some(hash))
+        }
         [command, genesis]
             if matches!(command.as_str(), "inspect" | "prepare") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
@@ -315,6 +321,18 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 eprintln!("could not {command} the retained delegated recovery state");
                 1
             }
+        };
+    }
+    if let Some(hash) = plan_or_hash {
+        let Ok(Some(portal)) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+            eprintln!("valid Portal reporting configuration is required");
+            return 1;
+        };
+        return match crate::remote_api::recovery::delegated_recovery::plan::reporting_history::restore_stop(
+            &pool, &binding, &portal, hash,
+        ).await {
+            Ok(receipt) => { println!("{receipt}"); 0 }
+            Err(_) => { eprintln!("could not restore the selected reporting stop or outstanding delivery"); 1 }
         };
     }
     let result = if fence {
