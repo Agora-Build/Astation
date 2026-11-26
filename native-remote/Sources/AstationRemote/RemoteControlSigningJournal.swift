@@ -22,7 +22,9 @@ public final class RemoteControlSigningJournal {
         var exposedReport: String?
         var supersededBy: RemoteControlRecoveryContext?
         var abandoned: Bool?
-        var isHeld: Bool { supersededBy == nil && abandoned != true }
+        var published: Bool?
+        var hasTerminalReceipt: Bool { abandoned == true || published == true }
+        var isHeld: Bool { supersededBy == nil && !hasTerminalReceipt }
 
         func request(log: MembershipLog, id: Data, since: UInt64, member: String, nowMs: UInt64) throws -> SignerReportRequest {
             try SignerReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + member,
@@ -141,9 +143,12 @@ public final class RemoteControlSigningJournal {
               barrier.signedRecords.count == barrier.records.count else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
+        guard barrier.abandoned != true || barrier.published != true else {
+            throw RemoteControlPublicationError.invalidCheckpoint
+        }
         if let successor = barrier.supersededBy {
             try successor.validate()
-            guard barrier.abandoned != true, successor.accountID == context.accountID, successor.genesisHash == context.genesisHash,
+            guard !barrier.hasTerminalReceipt, successor.accountID == context.accountID, successor.genesisHash == context.genesisHash,
                   successor.stationOrigin == origin, successor.generation > context.generation,
                   successor.planID != context.planID else { throw RemoteControlPublicationError.invalidCheckpoint }
         }
@@ -322,7 +327,7 @@ public final class RemoteControlSigningJournal {
         if let prior = saved.barriers?[origin] {
             // Never replace a different plan using a caller-supplied generation,
             // or mistake a restored outbox for the disappearance of a frozen draft.
-            if prior.abandoned == true {
+            if prior.hasTerminalReceipt {
                 guard context.generation > prior.context.generation, context.planID != prior.context.planID else {
                     throw RemoteControlPublicationError.requiresReview
                 }
@@ -425,13 +430,20 @@ public final class RemoteControlSigningJournal {
     }
 
     public func reconcileAbandonment(_ proof: RemoteStationAbandonment) throws {
+        try reconcilePlanEnd(proof.receipt)
+    }
+
+    public func reconcilePlanEnd(_ proof: RemoteStationPlanEnd) throws {
         guard !operating else { throw RemoteControlPublicationError.busy }
         try checkStorage()
         let held = proof.context
         guard var barrier = saved.barriers?[held.stationOrigin], barrier.context == held, barrier.isHeld else {
             throw RemoteControlPublicationError.requiresReview
         }
-        barrier.abandoned = true
+        switch proof.outcome {
+        case .abandoned: barrier.abandoned = true
+        case .published: barrier.published = true
+        }
         try endBarrier(barrier)
     }
 

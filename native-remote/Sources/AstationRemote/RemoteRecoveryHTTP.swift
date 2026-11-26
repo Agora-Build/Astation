@@ -64,9 +64,19 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// Only an authenticated GET to this plan's Station can construct this proof.
-public struct RemoteStationAbandonment: Sendable {
+public struct RemoteStationPlanEnd: Sendable {
+    public enum Outcome: String, Sendable { case abandoned, published }
+    public let outcome: Outcome
     let context: RemoteControlRecoveryContext
-    fileprivate init(context: RemoteControlRecoveryContext) { self.context = context }
+    fileprivate init(context: RemoteControlRecoveryContext, outcome: Outcome) {
+        self.context = context
+        self.outcome = outcome
+    }
+}
+
+public struct RemoteStationAbandonment: Sendable {
+    let receipt: RemoteStationPlanEnd
+    fileprivate init(receipt: RemoteStationPlanEnd) { self.receipt = receipt }
 }
 
 /// An SDK-decoded challenge received from the selected Station for this exact plan.
@@ -236,7 +246,7 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         return review
     }
 
-    public func abandonment(of held: RemoteControlRecoveryContext) async throws -> RemoteStationAbandonment? {
+    public func planEnd(for held: RemoteControlRecoveryContext) async throws -> RemoteStationPlanEnd? {
         try held.validate()
         guard held.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
         let (_, data) = try await perform(url: path(held.genesisHash, "control/recovery/" + held.planID + "/outcome"), method: "GET")
@@ -247,11 +257,18 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
               body["origin"] as? String == stationOrigin, body["generation"] as? String == String(held.generation),
               body["plan_id"] as? String == held.planID, body["candidate_feed_id"] as? String == held.candidateFeedID,
               body["source_hash"] as? String == held.sourceHash else { throw RemoteRecoveryTransportError.invalidResponse }
-        switch body["outcome"] as? String {
-        case "abandoned": return RemoteStationAbandonment(context: held)
-        case "pending": return nil
-        default: throw RemoteRecoveryTransportError.invalidResponse
+        guard let raw = body["outcome"] as? String else { throw RemoteRecoveryTransportError.invalidResponse }
+        if raw == "pending" { return nil }
+        guard let outcome = RemoteStationPlanEnd.Outcome(rawValue: raw) else {
+            throw RemoteRecoveryTransportError.invalidResponse
         }
+        return RemoteStationPlanEnd(context: held, outcome: outcome)
+    }
+
+    public func abandonment(of held: RemoteControlRecoveryContext) async throws -> RemoteStationAbandonment? {
+        guard let end = try await planEnd(for: held) else { return nil }
+        guard end.outcome == .abandoned else { throw RemoteRecoveryTransportError.invalidResponse }
+        return RemoteStationAbandonment(receipt: end)
     }
 
     public func signerChallenge(for context: RemoteControlRecoveryContext, memberID: String, slot: String,

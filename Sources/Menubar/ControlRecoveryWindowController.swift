@@ -290,11 +290,18 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
             let current = { self.isCurrent(access, epoch: epoch) && access.canSign() }
             do {
-                let ended = try await access.coordinator.checkSigningHold(heldPlan, current: current)
+                let outcome = try await access.coordinator.checkSigningHold(heldPlan, current: current)
                 guard current() else { return }
-                if ended { preparation = nil }
-                status.stringValue = ended ? "Station abandoned this plan. Its signing hold has ended."
-                    : "Station still has this plan pending. Its signing hold continues."
+                switch outcome {
+                case .published:
+                    preparation = nil
+                    status.stringValue = "Station published the recovered feed. Its signing hold has ended."
+                case .abandoned:
+                    preparation = nil
+                    status.stringValue = "Station abandoned this plan. Its signing hold has ended."
+                case nil:
+                    status.stringValue = "Station still has this plan pending. Its signing hold continues."
+                }
             } catch {
                 guard current() else { return }
                 status.stringValue = "Could not verify the plan's end. " + error.localizedDescription
