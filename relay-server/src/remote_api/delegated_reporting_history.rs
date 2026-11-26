@@ -4,6 +4,16 @@ use crate::remote_api::recovery::delegated::ReportControlEvent;
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use sqlx::PgConnection;
+use std::collections::HashSet;
+
+fn operator_resume_count(events: &[ReportControlEvent]) -> Result<usize, sqlx::Error> {
+    // The first Resume installs the initial client. Every later Resume is
+    // committed together with one distinct operator ID.
+    let Some((ReportControlEvent::Resume(_), later)) = events.split_first() else {
+        return Err(invalid());
+    };
+    Ok(later.iter().filter(|event| matches!(event, ReportControlEvent::Resume(_))).count())
+}
 
 /// Restore an operator-selected stopped or outstanding journal while all
 /// reporters are fenced. An enabled observation cannot authorize a resume.
@@ -71,7 +81,8 @@ pub(crate) async fn reconcile_report_restart(
     let key = portal.report_control_binding();
     let mut rows = sqlx::query_as::<_, (String, Option<Value>)>(
         "SELECT h.evidence_hash, CASE WHEN octet_length(h.journal::text) <= $3 THEN h.journal END
-         FROM station_delegated_reporting_history h WHERE h.origin=$1 AND h.binding=$2",
+         FROM station_delegated_reporting_history h WHERE h.origin=$1 AND h.binding=$2
+         ORDER BY jsonb_array_length(h.journal->'events')",
     )
     .bind(&portal.station_origin)
     .bind(&key)
@@ -79,14 +90,22 @@ pub(crate) async fn reconcile_report_restart(
     .fetch(&mut *connection);
     let mut needs_resume = false;
     let mut has_history = false;
+    let mut archived_ids = HashSet::new();
     while let Some((hash, journal)) = rows.try_next().await? {
         let journal = journal.ok_or_else(invalid)?;
-        if source_hash(&journal)? != hash || !journal["resume_ids"].is_array() {
+        if source_hash(&journal)? != hash {
             return Err(invalid());
         }
         let prior: Vec<ReportControlEvent> =
             serde_json::from_value(journal["events"].clone()).map_err(|_| invalid())?;
         let later = events.strip_prefix(prior.as_slice()).ok_or_else(invalid)?;
+        for value in journal["resume_ids"].as_array().ok_or_else(invalid)? {
+            archived_ids.insert(uuid::Uuid::parse_str(value.as_str().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?);
+        }
+        if archived_ids.len() > operator_resume_count(&prior)? {
+            return Err(invalid());
+        }
         if !journal["in_flight"].is_null() {
             let claim = journal["in_flight"].as_str().ok_or_else(invalid)?;
             needs_resume |= in_flight != Some(claim)
@@ -100,11 +119,16 @@ pub(crate) async fn reconcile_report_restart(
         // operator's request, in the same transaction as any resulting resume.
         sqlx::query(
             "INSERT INTO station_delegated_report_resumptions(binding,resume_id)
-             SELECT DISTINCT h.binding, prior.id::uuid FROM station_delegated_reporting_history h
-             CROSS JOIN LATERAL jsonb_array_elements_text(h.journal->'resume_ids') AS prior(id)
-             WHERE h.origin=$1 AND h.binding=$2 ON CONFLICT DO NOTHING",
+             SELECT $1, id::uuid FROM unnest($2::text[]) AS prior(id) ON CONFLICT DO NOTHING",
         )
-        .bind(&portal.station_origin).bind(&key).execute(connection).await?;
+        .bind(&key).bind(archived_ids.iter().map(ToString::to_string).collect::<Vec<_>>())
+        .execute(&mut *connection).await?;
+        let consumed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM station_delegated_report_resumptions WHERE binding=$1",
+        ).bind(&key).fetch_one(connection).await?;
+        if consumed != operator_resume_count(events)? as i64 {
+            return Err(invalid());
+        }
     }
     Ok(needs_resume)
 }

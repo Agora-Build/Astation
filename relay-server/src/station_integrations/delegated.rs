@@ -505,6 +505,15 @@ mod tests {
         let fresh = uuid::Uuid::new_v4().to_string();
         runtime.initialize_report_control(Some(&fresh)).await.unwrap();
         runtime.initialize_report_control(None).await.unwrap();
+        // A partial restore can retain the Resume event and lose its consumed
+        // ID. Restarting with that same ID must not authorize another resume.
+        sqlx::query("DELETE FROM station_delegated_report_resumptions WHERE binding=$1 AND resume_id=$2::uuid")
+            .bind(&key).bind(&fresh).execute(&db.pool).await.unwrap();
+        assert!(runtime.initialize_report_control(None).await.is_err());
+        assert!(runtime.initialize_report_control(Some(&fresh)).await.is_err());
+        sqlx::query("INSERT INTO station_delegated_report_resumptions(binding,resume_id) VALUES ($1,$2::uuid)")
+            .bind(&key).bind(&fresh).execute(&db.pool).await.unwrap();
+        runtime.initialize_report_control(Some(&fresh)).await.unwrap();
         let consumed_ids: i64 = sqlx::query_scalar("SELECT count(*) FROM station_delegated_report_resumptions WHERE binding=$1")
             .bind(&key).fetch_one(&db.pool).await.unwrap();
         assert_eq!(consumed_ids, 2);
@@ -515,6 +524,12 @@ mod tests {
         prepare_with_sources(&db.pool, &fence, &genesis, None, Some(&runtime.binding), None).await.unwrap();
         sqlx::query("UPDATE station_delegated_recovery SET ready=true WHERE origin=$1")
             .bind(origin).execute(&db.pool).await.unwrap();
+        sqlx::query("DELETE FROM station_delegated_report_resumptions WHERE binding=$1 AND resume_id=$2::uuid")
+            .bind(&key).bind(&fresh).execute(&db.pool).await.unwrap();
+        runtime.initialize_report_control(Some(&fresh)).await.unwrap();
+        let last: Value = sqlx::query_scalar("SELECT events->-1 FROM station_delegated_reporting WHERE binding=$1")
+            .bind(&key).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(last, json!(ReportControlEvent::Stop(runtime.binding.report_client_id.clone())));
         sqlx::query("UPDATE station_delegated_reporting SET events=$2 WHERE binding=$1")
             .bind(&key).bind(&events).execute(&db.pool).await.unwrap();
         assert!(runtime.initialize_report_control(Some(&uuid::Uuid::new_v4().to_string())).await.is_err());

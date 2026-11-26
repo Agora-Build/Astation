@@ -805,8 +805,10 @@ archived sequence for the same issuer, Portal and Station. It restores consumed
 resume IDs in the journal transaction before considering the configured resume.
 A missing stop or a conflicting prefix keeps the reporter closed. An archived
 delivery claim that disappeared requires a fresh explicit resume unless the
-live journal already records a subsequent resume. These checks apply before
-the worker can send its first report.
+live journal already records a subsequent resume. The initial client uses no
+resume ID. Each later resume requires one distinct consumed ID. If the live
+and archived evidence together cannot account for those IDs, the reporter
+stays closed, including when the operator repeats an earlier ID.
 
 If the restored journal lost a stop or an outstanding delivery, run
 `station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>`
