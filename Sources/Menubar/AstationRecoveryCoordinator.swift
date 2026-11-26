@@ -788,6 +788,7 @@ final class AstationRecoveryCoordinator {
     @discardableResult
     func approveService(_ approval: RemoteServiceApproval, portal: PortalIntegrationHTTP,
         authorizeNewOperations: ((MembershipLog) throws -> Void)? = nil,
+        refreshServiceReports: ((MembershipLog) async throws -> ((MembershipLog) throws -> Void))? = nil,
         confirmationClock: @escaping @Sendable () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         current: @escaping () -> Bool) async throws -> (record: PortalIntegrationRecord, membership: MembershipLog) {
         try begin(); defer { busy = false }
@@ -810,13 +811,18 @@ final class AstationRecoveryCoordinator {
                 let review = try RemoteServiceReview(approval: approval)
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
                 let authorizeInventory: ((SignRequest, MembershipLog) throws -> Void)?
+                var checkServiceReports: ((MembershipLog) throws -> Void)?
                 if !review.requiredHostFeatures.isEmpty {
                     guard let authorizeNewOperations else { throw StationIntegrationError.hostUpgradeRequired }
                     try authorizeNewOperations(committed)
+                    checkServiceReports = try await refreshServiceReports?(committed)
+                    try checkServiceReports?(committed)
+                    guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
                     guard let authorizeNewMembership else { throw RemoteVerifierGateError.unconfirmedVerifiers }
                     try authorizeNewMembership(request, committed)
                     authorizeInventory = { request, log in
                         try authorizeNewOperations(log)
+                        try checkServiceReports?(log)
                         try authorizeNewMembership(request, log)
                     }
                 } else { authorizeInventory = nil }
@@ -825,6 +831,10 @@ final class AstationRecoveryCoordinator {
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
+                if authorizeInventory != nil {
+                    checkServiceReports = try await refreshServiceReports?(latest)
+                    guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                }
                 try authorizeInventory?(request, latest)
                 let snapshot = latest.snapshot()
                 let signer = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
@@ -1540,6 +1550,42 @@ extension AstationRecoveryCoordinator {
             }
             if let checked, checked.links != live { throw RemoteVerifierGateError.staleConnection }
             checked = (roster, gate, live)
+        }
+    }
+
+    func serviceStationVerifier(for approval: RemoteServiceApproval, current: @escaping @MainActor @Sendable () -> Bool,
+        transport: @escaping (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteManagedServiceVerifierTransport
+    ) -> (MembershipLog) async throws -> ((MembershipLog) throws -> Void) {
+        var source: RemoteManagedServiceVerifierEvidence?
+        var reviewedRoster: RemoteStationVerifierRoster?
+        func checkContext(_ log: MembershipLog) throws {
+            guard current(), !Task.isCancelled, !uncertain, approval.stationOrigin == relayURL,
+                  log.accountId() == accountID, log.genesisHash() == approval.genesisHash,
+                  let latest = membershipLog, latest.head() == log.head(), latest.frozen() == nil,
+                  let reviewedRoster, try acceptedStationVerifierRoster() == reviewedRoster else {
+                throw RemoteVerifierGateError.staleMembership
+            }
+            try requireDurableRecoveryCheckpoint()
+        }
+        return { log in
+            if source == nil {
+                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: self.managerID)
+                let service = try RemoteServiceReview(approval: approval).serviceID
+                guard let roster = try self.acceptedStationVerifierRoster() else { throw RemoteVerifierGateError.invalidRoster }
+                reviewedRoster = roster
+                try checkContext(log)
+                let gate = try RemoteVerifierSigningGate(log: log, station: roster, prospectiveServiceID: service,
+                    wall: { self.now().wallMs }, now: self.verifierTime)
+                source = try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: log,
+                    memberIDs: [service], prospectiveRequest: request)
+            }
+            guard let source else { throw RemoteVerifierGateError.invalidRoster }
+            try checkContext(log)
+            try await source.refreshEnrollment(using: transport(current)) { try checkContext(log) }
+            return { latest in
+                try checkContext(latest)
+                try source.requireEnrollment(log: latest)
+            }
         }
     }
 
