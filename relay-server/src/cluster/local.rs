@@ -95,11 +95,17 @@ pub struct SocketOutbox {
     sent_frames: Arc<AtomicU64>,
 }
 
-/// Scoped control responses retain the exact authorization checked at enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameScope {
+    HostRoute,
+    DelegatedFeed,
+}
+
+/// Keep the exact authorization checked at enqueue through the socket write.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SocketFrame {
     pub text: String,
-    pub delegated: Option<crate::remote_api::recovery::HostBinding>,
+    pub(crate) route: Option<(FrameScope, crate::remote_api::recovery::HostBinding)>,
 }
 
 impl std::ops::Deref for SocketFrame {
@@ -180,7 +186,7 @@ impl LocalSockets {
     /// no longer) here, or its queue is full: the frame is dropped, and a
     /// queue full for `stall` closes the socket with 1013.
     pub fn send(&self, connection_id: &str, frame: String) -> bool {
-        self.enqueue(connection_id, SocketFrame { text: frame, delegated: None })
+        self.enqueue(connection_id, SocketFrame { text: frame, route: None })
     }
 
     fn enqueue(&self, connection_id: &str, frame: SocketFrame) -> bool {
@@ -240,8 +246,8 @@ impl LocalSockets {
         false
     }
 
-    pub(crate) fn send_delegated(&self, binding: &crate::remote_api::recovery::HostBinding, text: String) -> bool {
-        if self.enqueue(&binding.connection.conn, SocketFrame { text, delegated: Some(binding.clone()) }) { return true; }
+    pub(crate) fn send_scoped(&self, binding: &crate::remote_api::recovery::HostBinding, scope: FrameScope, text: String) -> bool {
+        if self.enqueue(&binding.connection.conn, SocketFrame { text, route: Some((scope, binding.clone())) }) { return true; }
         self.close_with(&binding.connection.conn, CLOSE_SLOW_CLIENT, "r9 queue unavailable");
         false
     }

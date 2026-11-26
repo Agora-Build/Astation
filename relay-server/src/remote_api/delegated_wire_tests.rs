@@ -73,18 +73,21 @@ async fn stale_feed_and_cross_account_ack_disclose_no_metadata_and_do_not_close_
         next_client_json(&mut socket).await,
         json!({"type":"relay","op":"control_sync_refused","code":"forbidden"})
     );
-    send_json(
-        &mut socket,
-        json!({"type":"relay","op":"control_ack",
-        "account_id":"other-account", "genesis_hash":f.log.genesis_hash().to_hex(),
-        "host_id":"host-a", "host_trust_gen":1, "origin":ORIGIN,
-        "feed_id":feed, "cursor":0, "results":[]}),
-    )
-    .await;
-    assert_eq!(
-        next_client_json(&mut socket).await,
-        json!({"type":"relay","op":"control_ack_refused","code":"forbidden"})
-    );
+    let stale = uuid::Uuid::new_v4().to_string();
+    for (account, feed_id) in [("other-account", feed), (f.log.account_id(), stale.as_str())] {
+        send_json(
+            &mut socket,
+            json!({"type":"relay","op":"control_ack",
+            "account_id":account, "genesis_hash":f.log.genesis_hash().to_hex(),
+            "host_id":"host-a", "host_trust_gen":1, "origin":ORIGIN,
+            "feed_id":feed_id, "cursor":0, "results":[]}),
+        )
+        .await;
+        assert_eq!(
+            next_client_json(&mut socket).await,
+            json!({"type":"relay","op":"control_ack_refused","code":"forbidden"})
+        );
+    }
     let call = json!({"type":"relay","op":"membership_fetch","after":1});
     assert!(matches!(
         ToStation::decode(call.to_string().as_bytes()),

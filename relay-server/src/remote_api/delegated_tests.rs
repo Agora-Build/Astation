@@ -687,6 +687,12 @@ async fn ack_is_atomic_cursor_alone_counts_nothing_and_restart_replays_one_repor
         json!([
         {"record_id":id,"effects":[{"effect":"revocation","result":"applied"}]}]),
     );
+    let mut previous_feed = valid.clone();
+    previous_feed.feed_id = uuid::Uuid::new_v4().to_string();
+    let refusal = acknowledge(&mut root, ORIGIN, &f.log, &binding, &previous_feed, f.created + 60_000)
+        .unwrap_err().refusal().unwrap();
+    assert_eq!(refusal, json!({"type":"relay","op":"control_ack_refused","code":"forbidden"}));
+    assert_eq!(serde_json::to_value(&root).unwrap(), before);
     acknowledge(&mut root, ORIGIN, &f.log, &binding, &valid, f.created).unwrap();
     let reports = root.delegated[ORIGIN]
         .ledger(ORIGIN, &f.log)
@@ -809,9 +815,12 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
     two.unwrap();
     let f = fixture();
     f.publish(&a).await;
-    let binding = admit(&a, &f, "shared").await;
-    let (one, two) = tokio::join!(a.prepare_delegated(&binding), b.prepare_delegated(&binding));
-    assert!(one && two);
+    let genesis = f.log.genesis_hash().to_hex();
+    let (binding, ensured) = tokio::join!(
+        admit(&a, &f, "shared"),
+        b.delegated_operation(&genesis, "alice", Command::Ensure)
+    );
+    assert_eq!(ensured.0, StatusCode::OK);
     let read = |result: Result<Option<Value>, Fault>| std::future::ready(result.unwrap().unwrap());
     let first = a
         .with_delegated_response(&binding, None, read)
@@ -861,6 +870,7 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
         .unwrap();
     assert_eq!(heads["feeds"][0]["head"], 1);
     assert_eq!(heads["feeds"][0]["feed_id"], first["feeds"][0]["feed_id"]);
+    assert_eq!(heads["feeds"][0]["feed_id"], ensured.1.0["feeds"][0]["feed_id"]);
     let denied = restarted
         .perform(&binding.genesis, "other-owner", append())
         .await;

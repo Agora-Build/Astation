@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::local::FrameScope;
 use crate::remote_api::recovery::{delegated::Fault, HostBinding};
 use atem_client::control::{CallRefused, RefusalCode, RefusedCall, ToStation};
 use futures_util::StreamExt;
@@ -79,10 +80,10 @@ impl RelayHub {
             return false;
         }
         match response {
-            Ok(Some(frame)) => self.local().send_delegated(binding, frame.to_string()),
+            Ok(Some(frame)) => self.local().send_scoped(binding, FrameScope::DelegatedFeed, frame.to_string()),
             Ok(None) => true,
             Err(fault) => match fault.refusal() {
-                Some(frame) => self.local().send_delegated(binding, frame.to_string()),
+                Some(frame) => self.local().send_scoped(binding, FrameScope::DelegatedFeed, frame.to_string()),
                 None => false,
             },
         }
@@ -92,9 +93,6 @@ impl RelayHub {
         let Some(store) = self.inner.recovery.get().filter(|s| s.delegated_enabled()) else {
             return true;
         };
-        if !store.prepare_delegated(binding).await {
-            return false;
-        }
         store
             .with_delegated_response(binding, None, |response| {
                 self.queue_delegated(binding, response)
@@ -136,9 +134,6 @@ impl RelayHub {
             return Ok(true);
         }
         let binding = binding.unwrap();
-        if !store.prepare_delegated(&binding).await {
-            return Err(());
-        }
         let sent = if let ToStation::ControlAck(ack) = call {
             let reply = store.acknowledge_delegated(&binding, ack).await;
             if reply.0 == axum::http::StatusCode::OK {
@@ -287,7 +282,7 @@ mod tests {
         // control response cannot prevent a queued #80 completion from flushing.
         assert!(hub
             .local()
-            .send_delegated(&binding, "obsolete heads".into()));
+            .send_scoped(&binding, FrameScope::DelegatedFeed, "obsolete heads".into()));
         assert!(hub
             .local()
             .send_required("queued", "deviceVerified completion".into()));

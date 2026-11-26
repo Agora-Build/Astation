@@ -391,7 +391,7 @@ impl RelayHub {
         let send = || async {
             if let Some(binding) = binding.as_ref().filter(|b| b.proxy.is_some()) {
                 if !self.proxy_current(connection).await { return false; }
-                return self.local().send_delegated(binding, frame);
+                return self.local().send_scoped(binding, crate::cluster::local::FrameScope::HostRoute, frame);
             }
             if required {
                 self.local().send_required(connection, frame)
@@ -2646,14 +2646,19 @@ where S: futures_util::Sink<Message> + Unpin {
 
 async fn write_socket_frame<S>(sink: &mut S, frame: crate::cluster::local::SocketFrame, hub: Option<&RelayHub>) -> bool
 where S: futures_util::Sink<Message> + Unpin {
-    let Some(binding) = frame.delegated else { return sink.send(Message::Text(frame.text)).await.is_ok() };
+    use crate::cluster::local::FrameScope;
+    let Some((scope, binding)) = frame.route else { return sink.send(Message::Text(frame.text)).await.is_ok() };
     let Some(hub) = hub else { return false };
     let Some(store) = hub.inner.recovery.get() else { return false };
-    let written = store.with_host_route(&binding, || async {
+    let write = || async {
         if hub.host_binding(&binding.connection.conn).as_ref() != Some(&binding)
             || !hub.delegated_peer_current(&binding).await { return None; }
         Some(sink.send(Message::Text(frame.text)).await.is_ok())
-    }).await.flatten();
+    };
+    let written = match scope {
+        FrameScope::HostRoute => store.with_host_route(&binding, write).await,
+        FrameScope::DelegatedFeed => store.with_delegated_route(&binding, write).await,
+    }.flatten();
     match written {
         Some(sent) => sent,
         // Discard obsolete control responses, including during a close flush.

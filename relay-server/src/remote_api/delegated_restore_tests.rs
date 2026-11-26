@@ -528,29 +528,13 @@ fn inspection_portal() -> crate::integration_feed::FeedBinding {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires isolated Postgres"]
-async fn postgres_delegated_inspection_resolves_proved_route_owners_across_replicas() {
+async fn admit_proxy(store: &RecoveryStore, f: &Fixture, connection: &str) -> HostBinding {
     use crate::cluster::ConnRef;
-    use crate::integration_checkpoint::PortalCheckpoint;
-    use crate::integration_feed::PolicyStore;
     use crate::remote_api::recovery::ProxyBinding;
     use atem_client::host_route::{
         host_route_message, sign_host_route_as, HostRouteBody, RouteKind,
     };
 
-    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
-    let store = RecoveryStore::postgres(database.pool.clone());
-    let f = fixture();
-    f.publish(&store).await;
-    let genesis = f.log.genesis_hash().to_hex();
-    let origin = Binding::new(ORIGIN, 1).unwrap();
-    let portal = inspection_portal();
-    let alice = "ab00000000000000000000000001";
-    let bob = "ab00000000000000000000000002";
-    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice'),($1,$3,'bob'),('https://other.example',$2,'legacy-user')")
-        .bind(&portal.issuer).bind(alice).bind(bob).execute(&database.pool).await.unwrap();
-    admit(&store, &f, "retained-relay").await;
     let challenge = HostChallenge::new("phone");
     let proof = host_route_message(
         &sign_host_route_as(
@@ -567,7 +551,7 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
             challenge.nonce,
             "phone",
             "host-a",
-            ConnRef::new("retained-proxy", "proxy-replica"),
+            ConnRef::new(connection, "proxy-replica"),
             ProxyBinding {
                 session: "session".into(),
                 generation: "epoch".into(),
@@ -576,7 +560,81 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
             "alice",
         )
         .await
-        .unwrap();
+        .unwrap().0
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_replacement_feed_requires_new_relay_and_proxy_proofs() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = RecoveryStore::postgres(database.pool.clone());
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let legacy = admit(&store, &f, "before-delegated").await;
+    assert!(saved(&database.pool, &genesis).await["routes"]["host-a"].get("delegated_feed").is_none());
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
+    assert!(!store.prepare_delegated(&legacy).await);
+    assert!(store.with_host_route(&legacy, || std::future::ready(())).await.is_some());
+
+    let old_relay = admit(&store, &f, "old-relay").await;
+    let old_proxy = admit_proxy(&store, &f, "old-proxy").await;
+    let replica = RecoveryStore::postgres(database.reconnect(2).await);
+    replica.configure_delegated(ORIGIN, 1).await.unwrap();
+    assert!(replica.prepare_delegated(&old_relay).await);
+    assert!(replica.prepare_delegated(&old_proxy).await);
+
+    // Model the committed replacement snapshot without exercising an operator reopen.
+    let mut snapshot: Root = serde_json::from_value(saved(&database.pool, &genesis).await).unwrap();
+    let previous_id = snapshot.delegated[ORIGIN].feed_id.clone();
+    let replacement = Stored::new(ORIGIN, &f.log).unwrap();
+    let current_ack = ack(&f, &replacement, 0, json!([]));
+    snapshot.delegated.insert(ORIGIN.into(), replacement);
+    let before = serde_json::to_value(snapshot).unwrap();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&before).bind(&genesis).execute(&database.pool).await.unwrap();
+    for socket in [&old_relay, &old_proxy] {
+        assert!(replica.with_delegated_response(socket, None, |_| std::future::ready(())).await.is_none());
+        assert!(!replica.prepare_delegated(socket).await);
+        let refused = replica.acknowledge_delegated(socket, current_ack.clone()).await;
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1.0, json!({"type":"relay","op":"control_ack_refused","code":"forbidden"}));
+    }
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+
+    let new_relay = admit(&store, &f, "new-relay").await;
+    let new_proxy = admit_proxy(&store, &f, "new-proxy").await;
+    let mut wrong_feed = current_ack.clone();
+    wrong_feed.feed_id = previous_id;
+    for socket in [&new_relay, &new_proxy] {
+        assert!(replica.prepare_delegated(socket).await);
+        assert_eq!(replica.acknowledge_delegated(socket, wrong_feed.clone()).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(replica.acknowledge_delegated(socket, current_ack.clone()).await.0, StatusCode::OK);
+    }
+    drop(replica);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_inspection_resolves_proved_route_owners_across_replicas() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::integration_feed::PolicyStore;
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = RecoveryStore::postgres(database.pool.clone());
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let origin = Binding::new(ORIGIN, 1).unwrap();
+    let portal = inspection_portal();
+    let alice = "ab00000000000000000000000001";
+    let bob = "ab00000000000000000000000002";
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice'),($1,$3,'bob'),('https://other.example',$2,'legacy-user')")
+        .bind(&portal.issuer).bind(alice).bind(bob).execute(&database.pool).await.unwrap();
+    admit(&store, &f, "retained-relay").await;
+    admit_proxy(&store, &f, "retained-proxy").await;
     // No relay directory, native app or host socket is available to the inspecting replica.
     drop(store);
     let replica = database.reconnect(2).await;
