@@ -1912,7 +1912,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     func testServiceApprovalChecksProtectedKeyAndBothReplicaProcessesThroughSigning() async throws {
-        enum Scenario: CaseIterable { case healthy, missingKey, missingExistingService, replacedReplica, expiredAtKey }
+        enum Scenario: CaseIterable { case healthy, missingKey, missingExistingService, replacedReplica, expiredAtKey, renewedPastReview }
         for scenario in Scenario.allCases {
             let h = RecoveryCoordinatorHarness(), portalServer = ServiceApprovalPortal()
             var extraTime: UInt64 = 0
@@ -1951,7 +1951,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     if scenario != .missingExistingService { existing["auth_key"] = existingAuth }
                     let rows = serverReview.candidate.replicas.map { id -> [String: Any] in
                         let replaced = scenario == .replacedReplica && call == 2 && id == serverReview.candidate.replicas.last
-                        return ["id": id, "connection_generation": replaced ? 2 : 1, "authorization_ms_left": 30_000,
+                        let shortLease = scenario == .renewedPastReview && call == 1 && id == serverReview.candidate.replicas.last
+                        return ["id": id, "connection_generation": replaced ? 2 : 1, "authorization_ms_left": shortLease ? 2_000 : 30_000,
                                 "verifier": ["version": inventory.version, "actions": inventory.actions]]
                     }
                     return try JSONSerialization.data(withJSONObject: ["origin": approval.stationOrigin, "account_id": log.accountId(),
@@ -1969,6 +1970,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 _ = try await coordinator.approveService(approval, portal: portal(portalServer), authorizeNewOperations: { _ in
                     checks += 1
                     if scenario == .expiredAtKey && checks == 3 { extraTime = 30_000 }
+                    if scenario == .renewedPastReview && checks == 3 { extraTime = 2_000 }
                 }, refreshServiceReports: reports, current: { true })
                 XCTAssertEqual(scenario, .healthy)
             } catch {
@@ -1976,7 +1978,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 case .healthy: XCTFail("healthy Station reports refused: \(error)")
                 case .missingKey, .missingExistingService: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
                 case .replacedReplica: XCTAssertEqual(error as? RemoteVerifierGateError, .staleConnection)
-                case .expiredAtKey: XCTAssertTrue(error is AtemError)
+                case .expiredAtKey, .renewedPastReview: XCTAssertTrue(error is AtemError)
                 }
             }
             let missing = scenario == .missingKey || scenario == .missingExistingService
