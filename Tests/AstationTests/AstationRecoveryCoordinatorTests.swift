@@ -213,13 +213,20 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     }
 
     func setVerifierRoster(generation: UInt64, replicas: [String]) { verifierGeneration = generation; verifierReplicas = replicas }
+    private var verifierConnection: UInt64?
+    func setVerifierConnection(_ value: UInt64?) { verifierConnection = value }
     func stationVerifiers(genesisHash: String) throws -> RemoteStationVerifierSnapshot {
         let log = try XCTUnwrap(log)
         XCTAssertEqual(genesisHash, log.genesisHash())
         let data = try JSONSerialization.data(withJSONObject: ["origin": controlStationOrigin,
             "roster_generation": verifierGeneration, "account_id": account, "genesis_hash": genesisHash,
             "head": ["seq": log.head().seq, "hash": log.head().hash],
-            "replicas": verifierReplicas.map { ["id": $0] }])
+            "replicas": verifierReplicas.map { id -> [String: Any] in
+                guard let verifierConnection else { return ["id": id] }
+                let inventory = verifierInventory()
+                return ["id": id, "connection_generation": verifierConnection, "authorization_ms_left": 30_000,
+                        "verifier": ["version": inventory.version, "actions": inventory.actions]]
+            }])
         return try RemoteStationVerifierSnapshot.decode(data, origin: controlStationOrigin, genesis: genesisHash,
             startedAt: RemoteVerifierSigningGate.evidenceTimeMilliseconds())
     }
@@ -2090,6 +2097,65 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let reads = await mailbox.reads
             XCTAssertEqual(Set(reads).count, scenario == .staleReview ? 0 : 3)
             XCTAssertEqual(reads.count, healthy ? 6 : Set(reads).count)
+        }
+    }
+
+    func testServiceApprovalRechecksPreviouslyReviewedStationAfterChangingSelection() async throws {
+        enum Scenario: CaseIterable { case healthy, unreviewed, offline, replaced, expiredAtKey }
+        let origin = "https://second.example"
+        for scenario in Scenario.allCases {
+            let h = RecoveryCoordinatorHarness(), other = RecoveryMemoryRelay(stationOrigin: origin)
+            let initial = try h.coordinator()
+            _ = try await initial.setup()
+            await other.replaceLog(try await initial.serviceMembership())
+            let selected = try h.coordinator(relayURL: origin, transport: other, confirmVerifierRoster: { _ in true },
+                confirmProcessRoster: { true })
+            if scenario == .unreviewed {
+                let review = try await selected.prepareProcessReview(member: selected.managerID, current: { true })
+                try await selected.acceptProcessReview(review, lines: ["desktop " + verifierReportProcess()], current: { true })
+            } else {
+                let roster = try await selected.prepareStationVerifierRoster(current: { true })
+                try await selected.acceptStationVerifierRoster(roster, current: { true })
+            }
+            if scenario != .offline { await other.setVerifierConnection(1) }
+            var ticks: UInt64 = 0, confirmations = 0
+            h.serviceOwnerConfirmation = { _, _ in
+                confirmations += 1
+                if scenario == .replaced { await other.setVerifierConnection(2) }
+                return true
+            }
+            var origins: [String] = []
+            let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in },
+                verifierTime: { RemoteVerifierSigningGate.evidenceTimeMilliseconds() + ticks })
+            let approval = try await service(coordinator, operations: ["launch", "view"])
+            try await coordinator.prepareService(approval)
+            let check = coordinator.serviceAdditionalStationVerifier(for: approval, current: { true }) { target, current in
+                XCTAssertTrue(current())
+                origins.append(target)
+                return other
+            }
+            let server = ServiceApprovalPortal()
+            await server.setScopes(["agent.launch", "agent.view"])
+            let before = h.identityCryptography.signingCalls
+            var checks = 0
+            do {
+                _ = try await coordinator.approveService(approval, portal: portal(server), authorizeNewOperations: { _ in
+                    checks += 1
+                    if scenario == .expiredAtKey && checks == 3 { ticks = 30_000 }
+                }, refreshServiceReports: check, current: { true })
+                XCTAssertEqual(scenario, .healthy)
+            } catch {
+                switch scenario {
+                case .healthy: XCTFail("Current peer Station was refused: \(error)")
+                case .unreviewed: XCTAssertEqual(error as? RemoteVerifierGateError, .invalidRoster)
+                case .offline, .replaced: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
+                case .expiredAtKey: XCTAssertTrue(error is AtemError)
+                }
+            }
+            if scenario == .unreviewed { XCTAssertEqual(origins, []) }
+            else { XCTAssertEqual(origins, Array(repeating: origin, count: scenario == .offline ? 1 : 2)) }
+            XCTAssertEqual(confirmations, scenario == .offline || scenario == .unreviewed ? 0 : 1)
+            XCTAssertEqual(h.identityCryptography.signingCalls, before + (scenario == .healthy ? 1 : 0))
         }
     }
 

@@ -390,8 +390,12 @@ class AstationHubManager: ObservableObject {
     }
 
     @MainActor func verifierTransport(current: @escaping @MainActor @Sendable () -> Bool) throws -> RemoteRecoveryHTTP {
+        try verifierTransport(for: stationRelayUrl, current: current)
+    }
+
+    @MainActor func verifierTransport(for origin: String, current: @escaping @MainActor @Sendable () -> Bool) throws -> RemoteRecoveryHTTP {
         guard current(), let owner = signedInAccount else { throw AccountLoginError.changed }
-        let origin = stationRelayUrl, auth = accountAuth
+        let auth = try origin == stationRelayUrl ? accountAuth : stationAuthorization(origin: origin)
         return try RemoteRecoveryHTTP(relayURL: origin, accessToken: {
             guard await current(), try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
             let token = try await auth.accessToken(relayURL: origin)

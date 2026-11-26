@@ -1600,6 +1600,58 @@ extension AstationRecoveryCoordinator {
         }
     }
 
+    func serviceAdditionalStationVerifier(for approval: RemoteServiceApproval, current: @escaping @MainActor @Sendable () -> Bool,
+        transport: @escaping (String, @escaping @MainActor @Sendable () -> Bool) throws -> any RemoteStationVerifierTransport
+    ) -> (MembershipLog) async throws -> ((MembershipLog) throws -> Void) {
+        var sources: [String: RemoteStationVerifierEvidence] = [:]
+        var reviewed: [String: RemoteStationVerifierRoster]?
+        func rosters(_ log: MembershipLog) throws -> [String: RemoteStationVerifierRoster] {
+            guard current(), !Task.isCancelled, !uncertain, relayURL == approval.stationOrigin,
+                  log.accountId() == accountID, log.genesisHash() == approval.genesisHash, log.frozen() == nil,
+                  membershipLog?.head() == log.head(), membershipLog?.frozen() == nil else {
+                throw RemoteVerifierGateError.staleMembership
+            }
+            try requireDurableRecoveryCheckpoint()
+            var result: [String: RemoteStationVerifierRoster] = [:]
+            let processOrigins = (saved.processRosters ?? [:]).compactMap { origin, reviews in
+                reviews.values.contains(where: { $0.genesis == approval.genesisHash }) ? origin : nil
+            }
+            let origins = retainedControlOrigins(log).union(processOrigins)
+                .union(try controlStationTransports(log).keys).subtracting([relayURL])
+            for origin in origins {
+                guard let entry = saved.verifierRosters?[origin], entry.genesis == approval.genesisHash,
+                      entry.roster.origin == origin else { throw RemoteVerifierGateError.invalidRoster }
+                result[origin] = entry.roster
+            }
+            return result
+        }
+        return { log in
+            let required = try rosters(log)
+            guard reviewed == nil || reviewed == required,
+                  let requirement = try membershipRequiredVersion(bodyJson: approval.bodyJSON)
+            else { throw RemoteVerifierGateError.staleMembership }
+            reviewed = required
+            for (origin, roster) in required.sorted(by: { $0.key < $1.key }) {
+                let source: RemoteStationVerifierEvidence
+                if let existing = sources[origin] { source = existing }
+                else {
+                    let gate = try RemoteVerifierSigningGate(log: log, station: roster, now: self.verifierTime)
+                    source = try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: log)
+                    sources[origin] = source
+                }
+                try await source.refreshApproval(using: try transport(origin, current), requirement: requirement) {
+                    guard try rosters(log) == required else { throw RemoteVerifierGateError.staleMembership }
+                }
+            }
+            let check: (MembershipLog) throws -> Void = { latest in
+                guard try rosters(latest) == required else { throw RemoteVerifierGateError.staleMembership }
+                for source in sources.values { try source.requireApproval(log: latest) }
+            }
+            try check(log)
+            return check
+        }
+    }
+
     func serviceMemberProcessVerifier(for approval: RemoteServiceApproval,
         current: @escaping @MainActor @Sendable () -> Bool,
         transport: @escaping (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport,

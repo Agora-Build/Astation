@@ -441,6 +441,16 @@ All pages must agree on the replica processes, and every page's original
 deadline still applies at signing. An external service whose key the Station
 cannot attest keeps enrollment pending until its independent carrier is available.
 
+Changing the selected Station preserves the other reviewed Stations for this
+device list. During approval, the Mac reads each additional Station's replica
+inventory with a token for that origin. Each response must match its protected
+roster, account and device-list head. The second read must identify the same
+replica processes, and the shortest lease from either read applies through
+signing. A known control destination or process review with no accepted server
+roster requires manager review before enrollment. These reads send only the
+device-list genesis to each Station. The Portal directory remains a source of
+discovery, separate from the protected list of participants.
+
 The Mac also obtains a signed challenge response from every protected process
 slot of every active native member. If a manager has reviewed SDK processes
 for an active service, each of those processes must also answer, even when

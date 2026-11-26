@@ -399,6 +399,8 @@ final class IntegrationApprovalViewController: NSViewController {
                     current: { context?() == true }, channels: hub.verifierHostChannels(_:requirement:))
                 let verifyStation = coordinator.serviceStationVerifier(for: approval,
                     current: { context?() == true }, transport: hub.verifierTransport(current:))
+                let verifyAdditionalStations = coordinator.serviceAdditionalStationVerifier(for: approval,
+                    current: { context?() == true }, transport: hub.verifierTransport(for:current:))
                 let verifyMembers = coordinator.serviceMemberProcessVerifier(for: approval,
                     current: { context?() == true }, transport: hub.verifierTransport(current:))
                 let result = try await coordinator.approveService(approval, portal: portal,
@@ -407,9 +409,11 @@ final class IntegrationApprovalViewController: NSViewController {
                         try verifyHosts(log)
                     }, refreshServiceReports: { log in
                         let station = try await verifyStation(log)
+                        let otherStations = try await verifyAdditionalStations(log)
                         let members = try await verifyMembers(log)
                         return { latest in
                             try members(latest)
+                            try otherStations(latest)
                             try station(latest)
                         }
                     },
