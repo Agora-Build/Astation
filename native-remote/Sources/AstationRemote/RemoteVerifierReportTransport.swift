@@ -81,6 +81,22 @@ public final class RemoteMemberVerifierPoller {
         try await poll(slot, readExisting: true)
     }
 
+    /// Bound concurrent Station requests while giving every slot its challenge
+    /// before waiting for replies. A post-confirmation read uses the original nonces.
+    public func pollSlots(_ slots: [RemoteMemberVerifierSlot], issue: Bool) async throws {
+        for start in stride(from: 0, to: slots.count, by: 8) {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for slot in slots[start..<min(start + 8, slots.count)] {
+                    group.addTask {
+                        if issue { _ = try await self.poll(slot) }
+                        else { _ = try await self.readIssuedChallenge(slot) }
+                    }
+                }
+                try await group.waitForAll()
+            }
+        }
+    }
+
     private func poll(_ slot: RemoteMemberVerifierSlot, readExisting: Bool) async throws -> Bool {
         guard !retired else { throw RemoteVerifierGateError.staleConnection }
         if Task.isCancelled { retire(); throw CancellationError() }

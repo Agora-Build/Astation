@@ -214,6 +214,17 @@ public final class RemoteMemberVerifierEvidence {
         for id in memberSlots.keys { try refreshMember(id) }
     }
 
+    /// Recheck every protected slot, including conflict history written by another process.
+    public func requireSupport(_ requirement: VerifierRequirement, log: MembershipLog, wallMs: UInt64) throws {
+        try refresh(log: log, wallMs: wallMs)
+        let time = now()
+        guard states.values.allSatisfy({ state in
+            guard !state.conflicted, state.pending == nil, state.consumed != nil,
+                  let deadline = state.validBefore, time < deadline, let inventory = state.inventory else { return false }
+            return inventory.version >= requirement.minimumVersion && inventory.actions.contains(requirement.action)
+        }) else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+    }
+
     public func retire() {
         retired = true
         for id in Array(connections.keys) { withdraw(id) }
