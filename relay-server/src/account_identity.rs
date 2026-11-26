@@ -245,6 +245,10 @@ pub(crate) fn integration_station_origin(value: &str) -> bool {
         })
 }
 
+pub(crate) fn built_in_station(origin: &str) -> bool {
+    matches!(origin, BUILT_IN_STATION_ORIGIN | "https://station-dev.agora.build")
+}
+
 pub(crate) fn configured_integration_origin(
     public_origin: Option<&str>,
     audience: &str,

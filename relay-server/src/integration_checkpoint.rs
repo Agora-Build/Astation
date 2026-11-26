@@ -80,10 +80,7 @@ fn exact_keys(value: &Value, keys: &[&str]) -> Result<(), ()> {
 
 impl PortalCheckpoint {
     pub(crate) fn built_in(binding: &FeedBinding) -> bool {
-        matches!(
-            binding.station_origin.as_str(),
-            "https://station.agora.build" | "https://station-dev.agora.build"
-        )
+        crate::account_identity::built_in_station(&binding.station_origin)
     }
 
     /// Call only for bytes fetched with this exact Station's report credential.
