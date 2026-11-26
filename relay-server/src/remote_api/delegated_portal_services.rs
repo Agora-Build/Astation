@@ -108,42 +108,54 @@ pub(super) async fn observe(
     // A key may have been provisioned before either membership or Portal
     // learned its fingerprint. Enumerate this list independently of both.
     let scope = json!({"issuer":portal.issuer,"station_origin":fence.origin,"owner":owner,"genesis":genesis});
-    // Provisioning stores the serialized context; the vault uses the tagged
-    // context as its primary key. Read both in the same statement snapshot.
-    let provisions: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT CASE WHEN octet_length(p.integration_id)=28 THEN p.integration_id END,
-                CASE WHEN octet_length(p.context)<=4096 THEN p.context END,
+    // Either table may survive a restore on its own. Compare the exact tagged
+    // storage contexts in one statement, scoped before the full join.
+    let keys: Vec<(Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "WITH provisions AS (
+            SELECT integration_id,context,fingerprint FROM station_integration_provisioning
+            WHERE binding=$1 AND context::jsonb @> $2
+         ), envelopes AS (
+            SELECT context,sealed,context::jsonb->1->>'integration_id' AS integration_id
+            FROM station_service_keys
+            WHERE context::jsonb->>0=$5 AND context::jsonb->1 @> $2
+         )
+         SELECT CASE WHEN octet_length(p.integration_id)>28 THEN '' ELSE p.integration_id END,
+                CASE WHEN octet_length(p.context)>4096 THEN ''
+                     ELSE COALESCE($4 || p.context || ']',k.context) END,
                 CASE WHEN octet_length(p.fingerprint)>64 THEN '' ELSE p.fingerprint END,
-                k.sealed
-         FROM station_integration_provisioning p LEFT JOIN station_service_keys k
-           ON $3 AND octet_length(p.context)<=4096 AND k.context=($4 || p.context || ']')
-         WHERE p.binding=$1 AND p.context::jsonb @> $2 ORDER BY p.integration_id LIMIT 4097",
+                CASE WHEN $3 THEN k.sealed END
+         FROM provisions p FULL JOIN envelopes k ON k.context=($4 || p.context || ']')
+         ORDER BY COALESCE(p.integration_id,k.integration_id), k.context LIMIT 4097",
     )
     .bind(portal.storage_key().map_err(|_| invalid())?)
     .bind(scope)
     .bind(vault.is_some())
     .bind(format!(r#"["{SERVICE_KEY_CONTEXT}","#))
+    .bind(SERVICE_KEY_CONTEXT)
     .fetch_all(&mut *connection)
     .await?;
-    if provisions.len() > 4096 {
+    if keys.len() > 4096 {
         return Err(invalid());
     }
     let mut managed_keys = BTreeSet::new();
     let mut authenticated_keys = BTreeSet::new();
     let mut protected = Vec::new();
     let mut pending = Vec::new();
+    let mut missing_provisioning = Vec::new();
     let ceilings = registrations.map(|rows| {
         rows.iter()
             .map(|r| ((r.service_id.as_str(), r.key_hash.as_str()), r.highest_ms))
             .collect::<BTreeMap<_, _>>()
     });
-    for (id, stored, key, sealed) in provisions {
-        let context: ServiceKeyContext = serde_json::from_str(&stored).map_err(|_| invalid())?;
-        if !crate::integration_feed::client_id(&id, "i-")
-            || context.integration_id != id
-            || context.service_id != format!("svc-{id}")
-            || (vault.is_some()
-                && serde_json::to_string(&context).map_err(|_| invalid())? != stored)
+    for (provision_id, stored, key, sealed) in keys {
+        let (tag, context): (String, ServiceKeyContext) =
+            serde_json::from_str(&stored).map_err(|_| invalid())?;
+        if tag != SERVICE_KEY_CONTEXT
+            || !crate::integration_feed::client_id(&context.integration_id, "i-")
+            || provision_id.as_ref().is_some_and(|id| id != &context.integration_id)
+            || context.service_id != format!("svc-{}", context.integration_id)
+            || ((vault.is_some() || provision_id.is_none())
+                && serde_json::to_string(&(tag, &context)).map_err(|_| invalid())? != stored)
             || key
                 .as_deref()
                 .is_some_and(|key| !super::super::canonical_genesis(key))
@@ -167,6 +179,7 @@ pub(super) async fn observe(
                             };
                         }
                         let status = match &key {
+                            None if provision_id.is_none() => "missing_provisioning",
                             None => "pending",
                             Some(expected) if expected == &fingerprint => "matched",
                             Some(_) => "mismatch",
@@ -183,6 +196,7 @@ pub(super) async fn observe(
             Some(key) => {
                 managed_keys.insert((context.service_id, key));
             }
+            None if provision_id.is_none() => missing_provisioning.push(context.service_id),
             None => pending.push(context.service_id),
         }
     }
@@ -262,6 +276,9 @@ pub(super) async fn observe(
         "portal_keys_without_attribution":unattributed,"services":rows});
     if vault.is_some() {
         evidence["protected_service_keys"] = json!(protected);
+    }
+    if !missing_provisioning.is_empty() {
+        evidence["envelopes_without_provisioning"] = json!(missing_provisioning);
     }
     if let (Some(bindings), Some(accounts)) = (&snapshot.bindings, &snapshot.accounts) {
         // A binding can advance without a feed event. Only commit this
