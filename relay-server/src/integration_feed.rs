@@ -391,6 +391,15 @@ impl PolicyCheckpoint {
         // Keep new observations ordered with the actual release through commit.
         sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 29))")
             .bind(self.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
+        let observed_denial: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM station_delegated_availability_fences
+             WHERE issuer=$1 AND portal_origin=$2 AND station_origin=$3
+               AND account IN ('', $4) AND minimum_cursor > $5)",
+        ).bind(&self.binding.issuer).bind(&self.binding.portal_origin).bind(&self.binding.station_origin)
+        .bind(owner).bind(self.cursor as i64).fetch_one(&mut *tx).await.map_err(|_| ())?;
+        if observed_denial {
+            return Ok(false);
+        }
         let veto: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                SELECT 1 FROM station_integration_policy p
@@ -575,11 +584,15 @@ impl PolicyStore {
         if result.rows_affected() != 1 {
             return Err(());
         }
-        if next.portal_snapshot_revision == Some(next.revision)
+        let changed_availability = next.availability != previous.availability || next.cursor != previous.cursor;
+        if (next.portal_snapshot_revision == Some(next.revision) || changed_availability)
             && crate::integration_checkpoint::PortalCheckpoint::built_in(&next.binding)
         {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 29))")
                 .bind(next.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
+            if changed_availability {
+                availability::retain_observation(&mut tx, &next.binding, next.cursor, next.availability.as_ref()).await?;
+            }
         }
         tx.commit().await.map_err(|_| ())
     }

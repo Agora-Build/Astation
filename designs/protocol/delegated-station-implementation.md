@@ -195,6 +195,12 @@ Both the live signer and the recovery review check the owner. Never-bound lists
 retain the existing root-owner and account-availability checks. Binding changes
 can take effect at the same feed cursor.
 The checkpoint's polling interval sets no ownership freshness guarantee.
+Before signing a release, the built-in Station checks how far every reporting
+credential has read for this issuer, Portal and Station. The signing replica
+must catch up to that cursor. An observed account disable or incomplete baseline
+requires a strictly later, complete account view before release. Station retains
+these cursor bounds when a credential is retired. Recovery checks the same
+bounds when reviewing a proposed release.
 Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
 comparison remain required. No provider, signing, publication or reopening is

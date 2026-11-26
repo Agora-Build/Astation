@@ -709,6 +709,27 @@ mod tests {
                 let before = replica.load(&rotated).await.unwrap();
                 replica.commit(&before, &before.apply_checkpoint(source, now).unwrap()).await.unwrap();
             }
+            if version == 6 {
+                let mut rotated = runtime.binding.clone();
+                rotated.report_client_id = "s-11234567890123456789012345".into();
+                let before = replica.load(&rotated).await.unwrap();
+                let cut = current.cursor + 1;
+                update["cursor"] = json!(cut);
+                update["checkpoint"]["accounts"]["disabled"] = json!([OWNER]);
+                let source = PortalCheckpoint::parse(&serde_json::to_vec(&update).unwrap(), &rotated).unwrap();
+                let disabled = before.apply_checkpoint(source, now).unwrap();
+                replica.commit(&before, &disabled).await.unwrap();
+                replica.deny(&rotated).await.unwrap();
+                assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+                assert_eq!(feed(&runtime, &genesis).await, held);
+                let before = replica.load(&runtime.binding).await.unwrap();
+                let change = |id, kind| json!({"id":id,"kind":kind,"account":OWNER,
+                    "integrationId":null,"state":null,"reason":"agora_build"});
+                let page = json!({"changes":[change(cut, "account_disabled"),change(cut+1, "account_enabled")],
+                    "cursor":cut+1});
+                let enabled = before.apply(before.cursor, serde_json::from_value(page).unwrap(), now).unwrap();
+                replica.commit(&before, &enabled).await.unwrap();
+            }
             let result = runtime.reconcile_delegated_service(ID).await;
             if version < 6 {
                 assert!(result.is_err());
