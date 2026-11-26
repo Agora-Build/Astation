@@ -531,7 +531,7 @@ mod tests {
         let held = feed(&runtime, &genesis).await;
         let other = "ab00000000000000000000000001";
         for (version, state, owner) in [
-            (1, "unbound", OWNER), (2, "released", OWNER), (3, "bound", other), (4, "bound", OWNER),
+            (1, "unbound", OWNER), (2, "released", OWNER), (3, "bound", other), (4, "bound", OWNER), (6, "bound", OWNER),
         ] {
             let mut update = value.clone();
             update["cursor"] = json!(current.cursor);
@@ -542,8 +542,17 @@ mod tests {
             let next = current.apply_checkpoint(exact, chrono::Utc::now().timestamp()).unwrap();
             replica.commit(&current, &next).await.unwrap();
             current = next;
+            if version == 4 {
+                let mut rotated = runtime.binding.clone();
+                rotated.report_client_id = "s-11234567890123456789012345".into();
+                update["checkpoint"]["bindings"][0]["version"] = json!(5);
+                update["checkpoint"]["bindings"][0]["bindingState"] = json!("released");
+                let source = PortalCheckpoint::parse(&serde_json::to_vec(&update).unwrap(), &rotated).unwrap();
+                let before = replica.load(&rotated).await.unwrap();
+                replica.commit(&before, &before.apply_checkpoint(source, now).unwrap()).await.unwrap();
+            }
             let result = runtime.reconcile_delegated_service(ID).await;
-            if version < 4 {
+            if version < 6 {
                 assert!(result.is_err());
                 assert_eq!(feed(&runtime, &genesis).await, held);
             } else {

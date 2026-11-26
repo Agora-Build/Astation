@@ -370,23 +370,42 @@ impl PolicyCheckpoint {
             || (!self.denied && self.availability.as_ref().is_some_and(|s| s.enabled_at(self.cursor, owner)))
     }
 
-    /// A known release or transfer remains a veto across ordinary feed polls.
-    /// The caller separately verifies the durable root owner for never-bound lists.
-    pub(crate) fn allows_list_release(&self, owner: &str, account_id: &str, genesis: &str) -> bool {
+    /// Call inside the signing or recovery transaction. Report credentials rotate
+    /// independently of the ownership version for a Station and device list.
+    pub(crate) async fn allows_list_release_in(
+        &self, tx: &mut sqlx::PgConnection, owner: &str, account_id: &str, genesis: &str,
+    ) -> Result<bool, ()> {
         if !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
-            return true;
+            return Ok(true);
         }
         if !self.allows_delegated_release(owner) {
-            return false;
+            return Ok(false);
         }
-        let Some(source) = &self.portal_snapshot else { return false };
-        if source.validate_for(&self.binding).is_err() {
-            return false;
+        let source = self.portal_snapshot.as_ref().ok_or(())?;
+        source.validate_for(&self.binding)?;
+        let current = source.bindings.as_ref().ok_or(())?.iter()
+            .find(|row| row.account_id == account_id && row.genesis_hash == genesis);
+        if current.is_some_and(|row| row.account != owner || row.binding_state != "bound") {
+            return Ok(false);
         }
-        let Some(bindings) = &source.bindings else { return false };
-        bindings.iter()
-            .find(|row| row.account_id == account_id && row.genesis_hash == genesis)
-            .is_none_or(|row| row.account == owner && row.binding_state == "bound")
+        // Keep new observations ordered with the actual release through commit.
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 29))")
+            .bind(self.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
+        let veto: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM station_integration_policy p
+               CROSS JOIN LATERAL jsonb_array_elements(
+                 p.checkpoint::jsonb->'portal_snapshot'->'bindings') AS observation(value)
+               WHERE p.binding <> $1
+                 AND p.binding::jsonb - 'report_client_id' = $1::text::jsonb - 'report_client_id'
+                 AND value->>'accountId'=$2 AND value->>'genesisHash'=$3
+                 AND ($4::jsonb IS NULL OR (value->>'version')::bigint > $5
+                      OR ((value->>'version')::bigint = $5 AND value <> $4::jsonb)))",
+        )
+        .bind(self.binding.storage_key()?).bind(account_id).bind(genesis)
+        .bind(current.map(sqlx::types::Json)).bind(current.map(|row| row.version as i64))
+        .fetch_one(tx).await.map_err(|_| ())?;
+        Ok(!veto)
     }
 
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
@@ -555,6 +574,12 @@ impl PolicyStore {
             .bind(new).bind(key).bind(old).bind(recovery.map(|f| f.generation)).execute(&mut *tx).await.map_err(|_| ())?;
         if result.rows_affected() != 1 {
             return Err(());
+        }
+        if next.portal_snapshot_revision == Some(next.revision)
+            && crate::integration_checkpoint::PortalCheckpoint::built_in(&next.binding)
+        {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 29))")
+                .bind(next.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
         }
         tx.commit().await.map_err(|_| ())
     }

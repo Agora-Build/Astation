@@ -64,7 +64,8 @@ pub(super) async fn observe(
         .accounts
         .as_ref()
         .is_none_or(|accounts| accounts.enabled(owner))
-        && policy.allows_list_release(owner, log.account_id(), &genesis);
+        && policy.allows_list_release_in(connection, owner, log.account_id(), &genesis)
+            .await.map_err(|_| invalid())?;
     let policy = |id: &str, key: &str| {
         id.strip_prefix("svc-")
             .and_then(|id| snapshot.integrations.get(id))

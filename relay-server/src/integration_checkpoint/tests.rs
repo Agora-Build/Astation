@@ -450,3 +450,110 @@ fn built_in_account_changes_follow_the_checkpoint_across_pages_restart_and_reset
     let baseline = apply(&malformed, vec![change(524, "accounts_baseline", Value::Null)], 108);
     assert!(!baseline.allows_delegated_release(OWNER));
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_rotated_report_client_cannot_release_from_an_older_binding() {
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let writer = PolicyStore(db.pool.clone());
+    let replica = db.reconnect(2).await;
+    let first = binding(true);
+    let mut rotated = first.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let genesis = "b".repeat(64);
+    let cut = |prior: &PolicyCheckpoint, rows: Value| {
+        let mut source = source(true);
+        source["cursor"] = json!(0);
+        source["checkpoint"]["bindings"] = rows;
+        prior
+            .apply_checkpoint(parse(&source, &prior.binding).unwrap(), 101)
+            .unwrap()
+    };
+    let bootstrap = |config: &FeedBinding| {
+        PolicyCheckpoint::empty(config.clone())
+            .unwrap()
+            .apply(
+                0,
+                serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[]})).unwrap(),
+                100,
+            )
+            .unwrap()
+    };
+    let rows = source(true)["checkpoint"]["bindings"].clone();
+    let initial = bootstrap(&first);
+    let new_client = bootstrap(&rotated);
+    writer
+        .commit(&writer.load(&first).await.unwrap(), &initial)
+        .await
+        .unwrap();
+    writer
+        .commit(&writer.load(&rotated).await.unwrap(), &new_client)
+        .await
+        .unwrap();
+    let bound = cut(&initial, rows.clone());
+    let missing = cut(&new_client, json!([]));
+    writer.commit(&initial, &bound).await.unwrap();
+    writer.commit(&new_client, &missing).await.unwrap();
+
+    async fn allowed(pool: &sqlx::PgPool, policy: &PolicyCheckpoint, genesis: &str) -> bool {
+        let mut tx = pool.begin().await.unwrap();
+        policy
+            .allows_list_release_in(&mut tx, OWNER, "acct-1", genesis)
+            .await
+            .unwrap()
+    }
+    assert!(!allowed(&replica, &missing, &genesis).await);
+    let same = cut(&missing, rows.clone());
+    writer.commit(&missing, &same).await.unwrap();
+    assert!(allowed(&replica, &same, &genesis).await);
+    let mut tx = replica.begin().await.unwrap();
+    assert!(same
+        .allows_list_release_in(&mut tx, OWNER, "acct-1", &genesis)
+        .await
+        .unwrap());
+    let mut changed = rows.clone();
+    changed[0]["bindingState"] = json!("released");
+    changed[0]["version"] = json!(4);
+    let released = cut(&bound, changed);
+    let commit = writer.commit(&bound, &released);
+    tokio::pin!(commit);
+    // A commit under the first credential must wait for a signature under the second.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut commit)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    commit.await.unwrap();
+    let rotated_reader = PolicyStore(replica.clone());
+    let saved = rotated_reader.load(&rotated).await.unwrap();
+    assert!(!allowed(&replica, &saved, &genesis).await);
+    assert!(allowed(&replica, &saved, &"c".repeat(64)).await);
+
+    let mut separate = rotated.clone();
+    separate.portal_origin = "https://other-portal.example".into();
+    let separate_initial = bootstrap(&separate);
+    writer
+        .commit(&writer.load(&separate).await.unwrap(), &separate_initial)
+        .await
+        .unwrap();
+    let independent = cut(&separate_initial, json!([]));
+    writer
+        .commit(&separate_initial, &independent)
+        .await
+        .unwrap();
+    assert!(allowed(&replica, &independent, &genesis).await);
+
+    let mut conflict = rows.clone();
+    conflict[0]["version"] = json!(4);
+    let competing = cut(&saved, conflict.clone());
+    writer.commit(&saved, &competing).await.unwrap();
+    assert!(!allowed(&replica, &competing, &genesis).await);
+    conflict[0]["version"] = json!(5);
+    let later = cut(&competing, conflict);
+    writer.commit(&competing, &later).await.unwrap();
+    assert!(allowed(&replica, &later, &genesis).await);
+    drop(rotated_reader);
+    replica.close().await;
+    db.cleanup().await;
+}
