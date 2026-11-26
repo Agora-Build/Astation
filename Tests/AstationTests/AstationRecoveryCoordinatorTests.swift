@@ -1912,7 +1912,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     func testServiceApprovalChecksProtectedKeyAndBothReplicaProcessesThroughSigning() async throws {
-        enum Scenario: CaseIterable { case healthy, missingKey, missingExistingService, replacedReplica, expiredAtKey }
+        enum Scenario: CaseIterable { case healthy, missingKey, missingExistingService, replacedReplica, expiredAtKey, renewedPastReview }
         for scenario in Scenario.allCases {
             let h = RecoveryCoordinatorHarness(), portalServer = ServiceApprovalPortal()
             var extraTime: UInt64 = 0
@@ -1951,7 +1951,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     if scenario != .missingExistingService { existing["auth_key"] = existingAuth }
                     let rows = serverReview.candidate.replicas.map { id -> [String: Any] in
                         let replaced = scenario == .replacedReplica && call == 2 && id == serverReview.candidate.replicas.last
-                        return ["id": id, "connection_generation": replaced ? 2 : 1, "authorization_ms_left": 30_000,
+                        let shortLease = scenario == .renewedPastReview && call == 1 && id == serverReview.candidate.replicas.last
+                        return ["id": id, "connection_generation": replaced ? 2 : 1, "authorization_ms_left": shortLease ? 2_000 : 30_000,
                                 "verifier": ["version": inventory.version, "actions": inventory.actions]]
                     }
                     return try JSONSerialization.data(withJSONObject: ["origin": approval.stationOrigin, "account_id": log.accountId(),
@@ -1969,6 +1970,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 _ = try await coordinator.approveService(approval, portal: portal(portalServer), authorizeNewOperations: { _ in
                     checks += 1
                     if scenario == .expiredAtKey && checks == 3 { extraTime = 30_000 }
+                    if scenario == .renewedPastReview && checks == 3 { extraTime = 2_000 }
                 }, refreshServiceReports: reports, current: { true })
                 XCTAssertEqual(scenario, .healthy)
             } catch {
@@ -1976,7 +1978,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 case .healthy: XCTFail("healthy Station reports refused: \(error)")
                 case .missingKey, .missingExistingService: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
                 case .replacedReplica: XCTAssertEqual(error as? RemoteVerifierGateError, .staleConnection)
-                case .expiredAtKey: XCTAssertTrue(error is AtemError)
+                case .expiredAtKey, .renewedPastReview: XCTAssertTrue(error is AtemError)
                 }
             }
             let missing = scenario == .missingKey || scenario == .missingExistingService
@@ -2007,7 +2009,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let approval = try await service(coordinator, operations: ["launch", "view"])
             try await coordinator.prepareService(approval)
             await portalServer.setScopes(["agent.launch", "agent.view"])
-            let reports = coordinator.serviceNativeVerifier(for: approval, current: { true }, transport: { _ in mailbox }, waitForReport: {})
+            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _ in mailbox }, waitForReport: {})
             let signs = h.identityCryptography.signingCalls
             var checks = 0
             do {
@@ -2029,6 +2031,65 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             XCTAssertEqual(reads.count, scenario == .missingMember ? 0 : 2)
             XCTAssertEqual(Set(reads).count, scenario == .missingMember ? 0 : 1)
             XCTAssertEqual(h.identityCryptography.signingCalls, signs + (scenario == .healthy ? 1 : 0))
+        }
+    }
+
+    func testServiceApprovalRequiresEveryReviewedServiceProcess() async throws {
+        enum Scenario: CaseIterable { case healthy, offline, staleReview }
+        for scenario in Scenario.allCases {
+            let h = RecoveryCoordinatorHarness(), mailbox = ApprovalReportMailbox(), server = ServiceApprovalPortal()
+            let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in }, confirmVerifierRoster: { _ in true },
+                confirmProcessRoster: { true })
+            _ = try await coordinator.setup()
+            let key = Curve25519.Signing.PrivateKey(), id = "existing-service"
+            try await append(["action": "add", "member": ["device_id": id, "kind": "service", "roles": ["service"],
+                "auth_key": ["alg": "ed25519", "pub": recoveryTestBase64(key.publicKey.rawRepresentation)],
+                "scope": ["hosts": ["host-a"], "ops": ["view"]], "expires_at": AstationRecoveryCoordinator.clock().wallMs + 600_000]], harness: h)
+            let roster = try await coordinator.prepareStationVerifierRoster(current: { true })
+            try await coordinator.acceptStationVerifierRoster(roster, current: { true })
+            for (member, slots) in [(id, ["observer", "worker"]), (coordinator.managerID, ["truck"])] {
+                if scenario == .staleReview && member == coordinator.managerID {
+                    let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1, hostID: "host-b")
+                    let draft = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+                    _ = try await coordinator.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+                }
+                let review = try await coordinator.prepareProcessReview(member: member, current: { true })
+                try await coordinator.acceptProcessReview(review, lines: slots.map { $0 + " " + verifierReportProcess() }, current: { true })
+            }
+            let approval = try await service(coordinator, operations: ["launch", "view"])
+            let log = try await coordinator.serviceMembership()
+            try await coordinator.prepareService(approval)
+            await server.setScopes(["agent.launch", "agent.view"])
+            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _ in mailbox }) {
+                for slot in scenario == .offline ? ["worker"] : ["observer", "worker"] {
+                    let requests = try await mailbox.verifierChallenges(genesisHash: log.genesisHash(), signer: "service:" + id,
+                        slot: slot, expected: log.head())
+                    let challenge = try XCTUnwrap(requests.first)
+                    let request = try VerifierReportRequest(log: log, challengeJson: challenge, signer: "service:" + id,
+                        slot: slot, origin: approval.stationOrigin, keyId: id, nowMs: AstationRecoveryCoordinator.clock().wallMs)
+                    let report = try request.finish(signature: key.signature(for: request.signRequest().input))
+                    _ = try await mailbox.publishVerifierReport(genesisHash: log.genesisHash(), challengeJSON: challenge,
+                        expected: log.head(), reportJSON: report)
+                }
+            }
+            let before = h.identityCryptography.signingCalls, confirmations = h.ownerRequests.count
+            do {
+                _ = try await coordinator.approveService(approval, portal: portal(server), authorizeNewOperations: { _ in },
+                    refreshServiceReports: reports, current: { true })
+                XCTAssertEqual(scenario, .healthy)
+            } catch {
+                switch scenario {
+                case .healthy: XCTFail("Every reviewed process answered: \(error)")
+                case .offline: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
+                case .staleReview: XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview)
+                }
+            }
+            let healthy = scenario == .healthy
+            XCTAssertEqual(h.identityCryptography.signingCalls - before, healthy ? 1 : 0)
+            XCTAssertEqual(h.ownerRequests.count - confirmations, healthy ? 1 : 0)
+            let reads = await mailbox.reads
+            XCTAssertEqual(Set(reads).count, scenario == .staleReview ? 0 : 3)
+            XCTAssertEqual(reads.count, healthy ? 6 : Set(reads).count)
         }
     }
 

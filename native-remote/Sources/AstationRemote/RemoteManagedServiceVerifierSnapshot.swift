@@ -65,6 +65,7 @@ public final class RemoteManagedServiceVerifierEvidence {
     private var connections: [RemoteVerifierSigningGate.Connection] = []
     private var retired = false
     private var reviewedGenerations: [UInt64]?
+    private var enrollmentDeadline: UInt64?
 
     public init(gate: RemoteVerifierSigningGate, roster: RemoteStationVerifierRoster, log: MembershipLog, memberIDs: [String],
                 prospectiveRequest: SignRequest? = nil) throws {
@@ -156,9 +157,19 @@ public final class RemoteManagedServiceVerifierEvidence {
             let replicas = snapshot.station.replicas
             guard replicas.allSatisfy({ $0.inventory != nil && $0.authorizationMilliseconds != nil }),
                   let first = replicas.first?.actions, let version = replicas.compactMap(\.version).min(),
-                  let lifetime = replicas.compactMap(\.authorizationMilliseconds).min() else { return }
+                  var lifetime = replicas.compactMap(\.authorizationMilliseconds).min() else { return }
             let actions = replicas.dropFirst().reduce(Set(first)) { $0.intersection($1.actions ?? []) }.sorted()
             guard !actions.isEmpty else { return }
+            if prospective != nil {
+                // A later poll can shorten the lease reviewed for this unsigned request.
+                let start = snapshot.station.requestStartedAt
+                let end = start.addingReportingOverflow(lifetime)
+                guard !end.overflow else { throw RemoteVerifierGateError.staleConnection }
+                let deadline = min(enrollmentDeadline ?? end.partialValue, end.partialValue)
+                guard start < deadline else { throw RemoteVerifierGateError.staleConnection }
+                enrollmentDeadline = deadline
+                lifetime = deadline - start
+            }
             for id in members {
                 guard let key = snapshot.services[id], keys[id] == key else { continue }
                 let connection = try gate.connect(.member(id)); connections.append(connection)

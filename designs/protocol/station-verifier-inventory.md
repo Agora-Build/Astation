@@ -442,7 +442,10 @@ deadline still applies at signing. An external service whose key the Station
 cannot attest keeps enrollment pending until its independent carrier is available.
 
 The Mac also obtains a signed challenge response from every protected process
-slot of every active native member. An unreviewed native member stops the
+slot of every active native member. If a manager has reviewed SDK processes
+for an active service, each of those processes must also answer, even when
+the Station has confirmed the service key. A review from an earlier device-list
+revision requires a new review. An unreviewed native member stops the
 approval before the owner prompt. The approving Mac can answer for its own
 reviewed local process with its existing key. After confirmation it rereads
 each original nonce, then checks the durable conflict history, membership,
