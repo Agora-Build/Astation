@@ -2016,7 +2016,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let approval = try await service(coordinator, operations: ["launch", "view"])
             try await coordinator.prepareService(approval)
             await portalServer.setScopes(["agent.launch", "agent.view"])
-            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _ in mailbox }, waitForReport: {})
+            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _, _ in mailbox }, waitForReport: {})
             let signs = h.identityCryptography.signingCalls
             var checks = 0
             do {
@@ -2067,7 +2067,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let log = try await coordinator.serviceMembership()
             try await coordinator.prepareService(approval)
             await server.setScopes(["agent.launch", "agent.view"])
-            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _ in mailbox }) {
+            let reports = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { _, _ in mailbox }) {
                 for slot in scenario == .offline ? ["worker"] : ["observer", "worker"] {
                     let requests = try await mailbox.verifierChallenges(genesisHash: log.genesisHash(), signer: "service:" + id,
                         slot: slot, expected: log.head())
@@ -2097,6 +2097,60 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let reads = await mailbox.reads
             XCTAssertEqual(Set(reads).count, scenario == .staleReview ? 0 : 3)
             XCTAssertEqual(reads.count, healthy ? 6 : Set(reads).count)
+        }
+    }
+
+    func testApprovalRequiresSignedProcessReportsAtEachReviewedStation() async throws {
+        let previousOrigin = "https://second.example"
+        for loseReply in [true, false] {
+            let h = RecoveryCoordinatorHarness(), previous = RecoveryMemoryRelay(stationOrigin: previousOrigin)
+            let initial = try h.coordinator()
+            _ = try await initial.setup()
+            await previous.replaceLog(try await initial.serviceMembership())
+            let previousMailbox = ApprovalReportMailbox(), selectedMailbox = ApprovalReportMailbox()
+            var confirmations = 0
+            h.serviceOwnerConfirmation = { _, _ in
+                confirmations += 1
+                if loseReply { await previousMailbox.discardReports() }
+                return true
+            }
+            for (origin, relay) in [(previousOrigin, previous), (initial.relayURL, h.relay)] {
+                let manager = try h.coordinator(relayURL: origin, transport: relay,
+                    confirmVerifierRoster: { _ in true }, confirmProcessRoster: { true })
+                let servers = try await manager.prepareStationVerifierRoster(current: { true })
+                try await manager.acceptStationVerifierRoster(servers, current: { true })
+                let review = try await manager.prepareProcessReview(member: manager.managerID, current: { true })
+                try await manager.acceptProcessReview(review, lines: ["desktop " + verifierReportProcess()], current: { true })
+            }
+            let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in })
+            let approval = try await service(coordinator, operations: ["launch", "view"])
+            try await coordinator.prepareService(approval)
+            let server = ServiceApprovalPortal()
+            await server.setScopes(["agent.launch", "agent.view"])
+            let verify = coordinator.serviceMemberProcessVerifier(for: approval, current: { true }, transport: { origin, active in
+                XCTAssertTrue(active())
+                if origin == previousOrigin { return previousMailbox }
+                XCTAssertEqual(origin, approval.stationOrigin)
+                return selectedMailbox
+            }, waitForReport: {})
+            let before = h.identityCryptography.signingCalls
+            do {
+                _ = try await coordinator.approveService(approval, portal: portal(server), authorizeNewOperations: { _ in },
+                    refreshServiceReports: verify, current: { true })
+                XCTAssertFalse(loseReply)
+            } catch {
+                XCTAssertTrue(loseReply)
+                XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse)
+            }
+            XCTAssertEqual(confirmations, 1)
+            XCTAssertEqual(h.identityCryptography.signingCalls, before + (loseReply ? 0 : 1))
+            let selectedReads = await selectedMailbox.reads, previousReads = await previousMailbox.reads
+            for (origin, nonces) in [(approval.stationOrigin, selectedReads), (previousOrigin, previousReads)] {
+                XCTAssertEqual(nonces.count, 2)
+                XCTAssertEqual(Set(nonces).count, 1)
+                XCTAssertEqual(try parseVerifierReportChallenge(challengeJson: XCTUnwrap(nonces.first)).origin, origin)
+            }
+            XCTAssertNotEqual(selectedReads.first, previousReads.first)
         }
     }
 

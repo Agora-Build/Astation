@@ -83,7 +83,7 @@ final class AstationRecoveryCoordinator {
     private let confirmProcessRoster: (() async -> Bool)?
     private let verifierHistory: @MainActor (MembershipLog, String, Bool) throws -> RemoteMemberVerifierJournal
     private var processReview: ProcessReview?
-    private var deliveredVerifierChallenges = Set<String>()
+    private var deliveredVerifierChallenges: [String: Set<String>] = [:]
     private var verifierReportGeneration = UUID()
     private let verifierTime: () -> UInt64
     /// The caller authenticates this account's Station roster and scopes each transport's token
@@ -1363,7 +1363,7 @@ final class AstationRecoveryCoordinator {
 }
 
 extension AstationRecoveryCoordinator {
-    private struct AcceptedVerifierRoster: Codable {
+    private struct AcceptedVerifierRoster: Codable, Equatable {
         let genesis: String
         let roster: RemoteStationVerifierRoster
     }
@@ -1419,9 +1419,10 @@ extension AstationRecoveryCoordinator {
         }.sorted { $0.review.member < $1.review.member }
     }
 
-    func reviewedProcessSlots(member: String, log: MembershipLog) throws -> [RemoteMemberVerifierSlot] {
-        guard !uncertain, let roster = saved.processRosters?[relayURL]?[member], roster.member == member,
-              roster.origin == relayURL, log.accountId() == accountID, log.frozen() == nil,
+    func reviewedProcessSlots(member: String, log: MembershipLog, stationOrigin: String? = nil) throws -> [RemoteMemberVerifierSlot] {
+        let origin = stationOrigin ?? relayURL
+        guard !uncertain, let roster = saved.processRosters?[origin]?[member], roster.member == member,
+              roster.origin == origin, log.accountId() == accountID, log.frozen() == nil,
               roster.genesis == log.genesisHash(), roster.sequence == log.head().seq, roster.headHash == log.head().hash,
               log.head() == membershipLog?.head(), let target = log.member(deviceId: member), target.status == .active,
               target.kind == "native" || (target.kind == "service" && (target.expiresAt ?? 0) > now().wallMs)
@@ -1613,10 +1614,7 @@ extension AstationRecoveryCoordinator {
             }
             try requireDurableRecoveryCheckpoint()
             var result: [String: RemoteStationVerifierRoster] = [:]
-            let processOrigins = (saved.processRosters ?? [:]).compactMap { origin, reviews in
-                reviews.values.contains(where: { $0.genesis == approval.genesisHash }) ? origin : nil
-            }
-            let origins = retainedControlOrigins(log).union(processOrigins)
+            let origins = retainedControlOrigins(log).union(reviewedProcessOrigins(genesis: approval.genesisHash))
                 .union(try controlStationTransports(log).keys).subtracting([relayURL])
             for origin in origins {
                 guard let entry = saved.verifierRosters?[origin], entry.genesis == approval.genesisHash,
@@ -1652,23 +1650,31 @@ extension AstationRecoveryCoordinator {
         }
     }
 
+    private func reviewedProcessOrigins(genesis: String) -> Set<String> {
+        Set((saved.processRosters ?? [:]).compactMap { origin, reviews in
+            reviews.values.contains(where: { $0.genesis == genesis }) ? origin : nil
+        })
+    }
+
     func serviceMemberProcessVerifier(for approval: RemoteServiceApproval,
         current: @escaping @MainActor @Sendable () -> Bool,
-        transport: @escaping (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport,
+        transport: @escaping (String, @escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport,
         waitForReport: @escaping () async throws -> Void = { try await Task.sleep(for: .seconds(5)) }
     ) -> (MembershipLog) async throws -> ((MembershipLog) throws -> Void) {
         let generation = verifierReportGeneration
-        var owner: (poller: RemoteMemberVerifierPoller, evidence: RemoteMemberVerifierEvidence, slots: [RemoteMemberVerifierSlot])?
+        let rosters = saved.verifierRosters
+        var retired = false
+        var sources: [(origin: String, poller: RemoteMemberVerifierPoller, evidence: RemoteMemberVerifierEvidence,
+                       slots: [RemoteMemberVerifierSlot])] = []
         return { log in
             let head = log.head()
-            guard let roster = try self.acceptedStationVerifierRoster(),
-                  let requirement = try membershipRequiredVersion(bodyJson: approval.bodyJSON) else {
+            guard let requirement = try membershipRequiredVersion(bodyJson: approval.bodyJSON) else {
                 throw RemoteVerifierGateError.invalidRoster
             }
             let active: @MainActor @Sendable () -> Bool = {
-                current() && !Task.isCancelled && !self.uncertain && self.verifierReportGeneration == generation &&
+                current() && !Task.isCancelled && !retired && !self.uncertain && self.verifierReportGeneration == generation &&
                     self.membershipLog?.head() == head && self.membershipLog?.frozen() == nil &&
-                    self.saved.verifierRosters?[self.relayURL]?.roster == roster
+                    self.saved.verifierRosters == rosters
             }
             @MainActor func membership() throws -> MembershipLog {
                 guard active(), self.relayURL == approval.stationOrigin, let latest = self.membershipLog,
@@ -1678,42 +1684,53 @@ extension AstationRecoveryCoordinator {
                 return latest
             }
             _ = try membership()
-            let first = owner == nil
-            if first {
-                // A managed service key can also have independently reviewed SDK processes.
-                // Keep their slots required across membership revisions until reviewed again.
-                let rosters = self.saved.processRosters?[self.relayURL] ?? [:]
-                let participants = log.members().filter { member in
-                    member.status == .active && (member.kind == "native" || rosters[member.deviceId] != nil)
-                }
-                let slots = try participants.flatMap { try self.reviewedProcessSlots(member: $0.deviceId, log: log) }
-                guard !slots.isEmpty, self.saved.verifierHistoryRoots?[self.relayURL] == approval.genesisHash else {
-                    throw RemoteVerifierGateError.invalidRoster
-                }
-                let gate = try RemoteVerifierSigningGate(log: log, station: roster, now: self.verifierTime)
-                let journal = try self.verifierHistory(log, self.relayURL, false)
-                let evidence = try RemoteMemberVerifierEvidence(gate: gate, log: log, origin: self.relayURL,
-                    slots: slots, journal: journal, current: active, now: self.verifierTime)
-                let poller = RemoteMemberVerifierPoller(evidence: evidence, transport: try transport(active),
-                    membership: membership, wall: { self.now().wallMs }, now: self.verifierTime)
-                owner = (poller, evidence, slots)
-            }
-            guard let owner else { throw RemoteVerifierGateError.invalidRoster }
+            let first = sources.isEmpty
             do {
                 if first {
-                    try await owner.poller.pollSlots(owner.slots, issue: true)
-                    try await self.answerLocalVerifierChallenges(current: active, transport: transport)
+                    let reviews = self.saved.processRosters ?? [:]
+                    let origins = self.reviewedProcessOrigins(genesis: approval.genesisHash).union([self.relayURL])
+                    let members = log.members().filter { $0.status == .active }
+                    for origin in origins.sorted() {
+                        let required = members.filter { member in
+                            (origin == self.relayURL && member.kind == "native") ||
+                                reviews[origin]?[member.deviceId] != nil
+                        }
+                        if required.isEmpty && origin != self.relayURL { continue }
+                        let slots = try required.flatMap { try self.reviewedProcessSlots(member: $0.deviceId, log: log, stationOrigin: origin) }
+                        guard !slots.isEmpty, let accepted = self.saved.verifierRosters?[origin],
+                              accepted.genesis == approval.genesisHash, accepted.roster.origin == origin,
+                              self.saved.verifierHistoryRoots?[origin] == approval.genesisHash else {
+                            throw RemoteVerifierGateError.invalidRoster
+                        }
+                        let gate = try RemoteVerifierSigningGate(log: log, station: accepted.roster, now: self.verifierTime)
+                        let journal = try self.verifierHistory(log, origin, false)
+                        let evidence = try RemoteMemberVerifierEvidence(gate: gate, log: log, origin: origin,
+                            slots: slots, journal: journal, current: active, now: self.verifierTime)
+                        let poller = RemoteMemberVerifierPoller(evidence: evidence, transport: try transport(origin, active),
+                            membership: membership, wall: { self.now().wallMs }, now: self.verifierTime)
+                        sources.append((origin, poller, evidence, slots))
+                    }
+                    for source in sources {
+                        try await source.poller.pollSlots(source.slots, issue: true)
+                        try await self.answerLocalVerifierChallenges(at: source.origin, current: active) { try transport(source.origin, $0) }
+                    }
                     try await waitForReport()
                 }
-                try await owner.poller.pollSlots(owner.slots, issue: false)
+                for source in sources { try await source.poller.pollSlots(source.slots, issue: false) }
                 let check: (MembershipLog) throws -> Void = { latest in
                     let currentLog = try membership()
-                    guard latest.head() == currentLog.head() else { throw RemoteVerifierGateError.staleMembership }
-                    try owner.evidence.requireSupport(requirement, log: latest, wallMs: self.now().wallMs)
+                    guard !sources.isEmpty, latest.head() == currentLog.head() else { throw RemoteVerifierGateError.staleMembership }
+                    for source in sources {
+                        try source.evidence.requireSupport(requirement, log: latest, wallMs: self.now().wallMs)
+                    }
                 }
                 try check(log)
                 return check
-            } catch { owner.poller.retire(); throw error }
+            } catch {
+                retired = true
+                for source in sources { source.poller.retire() }
+                throw error
+            }
         }
     }
 
@@ -1788,15 +1805,16 @@ extension AstationRecoveryCoordinator {
 
     func answerVerifierChallenges(current: @escaping @MainActor @Sendable () -> Bool,
         transport: (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport) async throws {
-        try await answerLocalVerifierChallenges(current: { [weak self] in self?.busy == false && current() }, transport: transport)
+        try await answerLocalVerifierChallenges(at: relayURL, current: { [weak self] in self?.busy == false && current() }, transport: transport)
     }
 
-    private func answerLocalVerifierChallenges(current: @escaping @MainActor @Sendable () -> Bool,
+    private func answerLocalVerifierChallenges(at origin: String, current: @escaping @MainActor @Sendable () -> Bool,
         transport: (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport) async throws {
-        guard current(), !Task.isCancelled, hasLocalVerifierSlot,
-              let roster = saved.processRosters?[relayURL]?[managerID], let slot = roster.localReporterSlot,
-              let log = membershipLog?.snapshot(),
-              try reviewedProcessSlots(member: managerID, log: log).contains(where: { $0.slot == slot })
+        guard current(), !Task.isCancelled, !uncertain,
+              let roster = saved.processRosters?[origin]?[managerID], let slot = roster.localReporterSlot,
+              let log = membershipLog?.snapshot(), log.frozen() == nil,
+              roster.genesis == log.genesisHash(), roster.sequence == log.head().seq, roster.headHash == log.head().hash,
+              try reviewedProcessSlots(member: managerID, log: log, stationOrigin: origin).contains(where: { $0.slot == slot })
         else { return }
         let anchor = try RemoteVerifierReportAnchor(log: log)
         let head = log.head(), generation = verifierReportGeneration
@@ -1810,8 +1828,8 @@ extension AstationRecoveryCoordinator {
         let challenges = try await station.verifierChallenges(genesisHash: anchor.genesisHash,
             signer: "member:" + managerID, slot: slot, expected: head)
         guard active(), challenges.count <= 16 else { throw RemoteChannelError.staleLink }
-        deliveredVerifierChallenges.formIntersection(challenges)
-        for challenge in challenges where !deliveredVerifierChallenges.contains(challenge) {
+        deliveredVerifierChallenges[origin, default: []].formIntersection(challenges)
+        for challenge in challenges where deliveredVerifierChallenges[origin]?.contains(challenge) != true {
             guard active() else { throw RemoteChannelError.staleLink }
             try requireDurableRecoveryCheckpoint()
             // An inbox entry can expire while an earlier entry is being answered.
@@ -1819,7 +1837,7 @@ extension AstationRecoveryCoordinator {
             let parsed = try parseVerifierReportChallenge(challengeJson: challenge)
             guard wall < parsed.expiresAt else { continue }
             let report = try identity.verifierReport(log: log, anchor: anchor, memberID: managerID,
-                challengeJSON: challenge, slot: slot, origin: relayURL, wallMs: wall, current: active)
+                challengeJSON: challenge, slot: slot, origin: origin, wallMs: wall, current: active)
             let receipt = try await station.publishVerifierReport(genesisHash: anchor.genesisHash,
                 challengeJSON: challenge, expected: head, reportJSON: report)
             guard active() else { throw RemoteChannelError.staleLink }
@@ -1832,7 +1850,7 @@ extension AstationRecoveryCoordinator {
                 return (try? signedObjectInfo(json: returned).bodyJcs) == body
             })
             else { throw RemoteRecoveryTransportError.invalidResponse }
-            deliveredVerifierChallenges.insert(challenge)
+            deliveredVerifierChallenges[origin, default: []].insert(challenge)
         }
     }
 

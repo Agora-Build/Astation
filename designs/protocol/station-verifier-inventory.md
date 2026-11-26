@@ -454,7 +454,13 @@ discovery, separate from the protected list of participants.
 The Mac also obtains a signed challenge response from every protected process
 slot of every active native member. If a manager has reviewed SDK processes
 for an active service, each of those processes must also answer, even when
-the Station has confirmed the service key. A review from an earlier device-list
+the Station has confirmed the service key. This includes process slots reviewed
+at a previously selected Station for the same device list. During approval the Mac
+uses each Station's own bearer, challenge mailbox and protected conflict journal.
+It issues the challenges at all reviewed origins before waiting for responses.
+After confirmation it reads the original nonce at each origin. A response at
+one Station cannot satisfy the review at another, even for the same member and
+slot. A review from an earlier device-list
 revision requires a new review. An unreviewed native member stops the
 approval before the owner prompt. The approving Mac can answer for its own
 reviewed local process with its existing key. After confirmation it rereads
