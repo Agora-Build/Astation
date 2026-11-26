@@ -8,6 +8,35 @@ import Vision
 import XCTest
 @testable import Menubar
 
+private actor ApprovalReportMailbox: RemoteVerifierReportTransport {
+    private var reports: [String: [String]] = [:]
+    private(set) var reads: [String] = []
+    var discardOnRead = false
+    func discardReports() { discardOnRead = true }
+
+    func submitVerifierChallenge(genesisHash: String, challengeJSON: String, expected: LogHead) throws -> RemoteVerifierReportMailbox {
+        XCTAssertNil(reports[challengeJSON], "Approval must not reissue a nonce after confirmation")
+        reports[challengeJSON] = []
+        return RemoteVerifierReportMailbox(challengeJSON: challengeJSON, reports: [])
+    }
+    func verifierReports(genesisHash: String, challengeJSON: String, expected: LogHead) throws -> RemoteVerifierReportMailbox {
+        reads.append(challengeJSON)
+        return RemoteVerifierReportMailbox(challengeJSON: challengeJSON,
+            reports: discardOnRead ? [] : try XCTUnwrap(reports[challengeJSON]))
+    }
+    func verifierChallenges(genesisHash: String, signer: String, slot: String, expected: LogHead) throws -> [String] {
+        try reports.keys.filter {
+            let challenge = try parseVerifierReportChallenge(challengeJson: $0)
+            return challenge.signer == signer && challenge.slot == slot
+        }
+    }
+    func publishVerifierReport(genesisHash: String, challengeJSON: String, expected: LogHead, reportJSON: String) throws -> RemoteVerifierReportMailbox {
+        XCTAssertNotNil(reports[challengeJSON])
+        reports[challengeJSON] = [reportJSON]
+        return RemoteVerifierReportMailbox(challengeJSON: challengeJSON, reports: [reportJSON])
+    }
+}
+
 private final class RecoveryReportHTTPStub: URLProtocol {
     static let lock = NSLock()
     static var response: ((URLRequest, Data) throws -> Data)?
@@ -1883,7 +1912,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     func testServiceApprovalChecksProtectedKeyAndBothReplicaProcessesThroughSigning() async throws {
-        enum Scenario: CaseIterable { case healthy, missingKey, replacedReplica, expiredAtKey }
+        enum Scenario: CaseIterable { case healthy, missingKey, missingExistingService, replacedReplica, expiredAtKey }
         for scenario in Scenario.allCases {
             let h = RecoveryCoordinatorHarness(), portalServer = ServiceApprovalPortal()
             var extraTime: UInt64 = 0
@@ -1891,6 +1920,12 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 confirmVerifierRoster: { _ in true },
                 verifierTime: { RemoteVerifierSigningGate.evidenceTimeMilliseconds() + extraTime })
             _ = try await coordinator.setup()
+            let existingKey = P256.Signing.PrivateKey().publicKey.x963Representation
+            let existingID = "existing-service"
+            let existingAuth = ["alg": "p256", "pub": recoveryTestBase64(existingKey)]
+            try await append(["action": "add", "member": ["device_id": existingID, "kind": "service", "roles": ["service"],
+                "auth_key": existingAuth, "scope": ["hosts": ["host-a"], "ops": ["view"]],
+                "expires_at": AstationRecoveryCoordinator.clock().wallMs + 600_000]], harness: h)
             let serverReview = try await coordinator.prepareStationVerifierRoster(current: { true })
             try await coordinator.acceptStationVerifierRoster(serverReview, current: { true })
             let key = P256.Signing.PrivateKey().publicKey
@@ -1907,11 +1942,13 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 RecoveryReportHTTPStub.response = { request, bytes in
                     XCTAssertEqual(request.url?.path, "/agora-build/v1/logs/" + log.genesisHash() + "/verifiers/services")
                     let body = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-                    XCTAssertEqual(body["member_ids"] as? [String], ["service-test"])
+                    XCTAssertEqual(body["member_ids"] as? [String], [existingID, "service-test"])
                     XCTAssertEqual(body["expected"] as? NSDictionary, head as NSDictionary)
                     let call = reads.withLock { $0 += 1; return $0 }
                     var member: [String: Any] = ["id": "service-test"]
                     if scenario != .missingKey { member["auth_key"] = ["alg": "p256", "pub": recoveryTestBase64(key.x963Representation)] }
+                    var existing: [String: Any] = ["id": existingID]
+                    if scenario != .missingExistingService { existing["auth_key"] = existingAuth }
                     let rows = serverReview.candidate.replicas.map { id -> [String: Any] in
                         let replaced = scenario == .replacedReplica && call == 2 && id == serverReview.candidate.replicas.last
                         return ["id": id, "connection_generation": replaced ? 2 : 1, "authorization_ms_left": 30_000,
@@ -1919,7 +1956,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     }
                     return try JSONSerialization.data(withJSONObject: ["origin": approval.stationOrigin, "account_id": log.accountId(),
                         "genesis_hash": log.genesisHash(), "roster_generation": serverReview.candidate.generation,
-                        "head": head, "replicas": rows, "services": [member]])
+                        "head": head, "replicas": rows, "services": [existing, member]])
                 }
             }
             defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
@@ -1937,14 +1974,61 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             } catch {
                 switch scenario {
                 case .healthy: XCTFail("healthy Station reports refused: \(error)")
-                case .missingKey: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
+                case .missingKey, .missingExistingService: XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers)
                 case .replacedReplica: XCTAssertEqual(error as? RemoteVerifierGateError, .staleConnection)
                 case .expiredAtKey: XCTAssertTrue(error is AtemError)
                 }
             }
-            XCTAssertEqual(reads.withLock { $0 }, scenario == .missingKey ? 1 : 2)
-            XCTAssertEqual(h.ownerRequests.count, prompts + (scenario == .missingKey ? 0 : 1))
+            let missing = scenario == .missingKey || scenario == .missingExistingService
+            XCTAssertEqual(reads.withLock { $0 }, missing ? 1 : 2)
+            XCTAssertEqual(h.ownerRequests.count, prompts + (missing ? 0 : 1))
             XCTAssertEqual(h.identityCryptography.signingCalls, before + (scenario == .healthy ? 1 : 0))
+        }
+    }
+
+    func testServiceApprovalReadsEveryNativeSlotAndRechecksOriginalNonceAfterConfirmation() async throws {
+        enum Scenario: CaseIterable { case healthy, missingMember, missingReply, expiredAtKey }
+        for scenario in Scenario.allCases {
+            let h = RecoveryCoordinatorHarness(), mailbox = ApprovalReportMailbox(), portalServer = ServiceApprovalPortal()
+            var prompts = 0, extraTime: UInt64 = 0
+            h.serviceOwnerConfirmation = { _, _ in
+                prompts += 1
+                if scenario == .missingReply { await mailbox.discardReports() }
+                return true
+            }
+            let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in }, confirmVerifierRoster: { _ in true },
+                confirmProcessRoster: { true }, verifierTime: { RemoteVerifierSigningGate.evidenceTimeMilliseconds() + extraTime })
+            _ = try await coordinator.setup()
+            if scenario == .missingMember { _ = try await addSecondManager(harness: h) }
+            let serverReview = try await coordinator.prepareStationVerifierRoster(current: { true })
+            try await coordinator.acceptStationVerifierRoster(serverReview, current: { true })
+            let review = try await coordinator.prepareProcessReview(member: coordinator.managerID, current: { true })
+            try await coordinator.acceptProcessReview(review, lines: ["truck " + verifierReportProcess()], current: { true })
+            let approval = try await service(coordinator, operations: ["launch", "view"])
+            try await coordinator.prepareService(approval)
+            await portalServer.setScopes(["agent.launch", "agent.view"])
+            let reports = coordinator.serviceNativeVerifier(for: approval, current: { true }, transport: { _ in mailbox }, waitForReport: {})
+            let signs = h.identityCryptography.signingCalls
+            var checks = 0
+            do {
+                _ = try await coordinator.approveService(approval, portal: portal(portalServer), authorizeNewOperations: { _ in
+                    checks += 1
+                    if scenario == .expiredAtKey && checks == 3 { extraTime = 30_000 }
+                }, refreshServiceReports: reports, current: { true })
+                XCTAssertEqual(scenario, .healthy)
+            } catch {
+                switch scenario {
+                case .healthy: XCTFail("A current signed manager report should pass: \(error)")
+                case .missingMember: XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview)
+                case .missingReply: XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse)
+                case .expiredAtKey: XCTAssertTrue(error is AtemError)
+                }
+            }
+            let reads = await mailbox.reads
+            XCTAssertEqual(prompts, scenario == .missingMember ? 0 : 1)
+            XCTAssertEqual(reads.count, scenario == .missingMember ? 0 : 2)
+            XCTAssertEqual(Set(reads).count, scenario == .missingMember ? 0 : 1)
+            XCTAssertEqual(h.identityCryptography.signingCalls, signs + (scenario == .healthy ? 1 : 0))
         }
     }
 

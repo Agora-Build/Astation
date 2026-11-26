@@ -435,6 +435,20 @@ expired lease requires a fresh attempt. Network time after owner confirmation
 counts toward its 30-second window. A retry of a saved signature skips both
 polls.
 
+The approval requests evidence for all active service members in the signed
+list. Each page includes the proposed key and at most 63 existing service IDs.
+All pages must agree on the replica processes, and every page's original
+deadline still applies at signing. An external service whose key the Station
+cannot attest keeps enrollment pending until its independent carrier is available.
+
+The Mac also obtains a signed challenge response from every protected process
+slot of every active native member. An unreviewed native member stops the
+approval before the owner prompt. The approving Mac can answer for its own
+reviewed local process with its existing key. After confirmation it rereads
+each original nonce, then checks the durable conflict history, membership,
+reported action and evidence lifetime again at signing. A missing reply or
+an expired check requires a fresh approval attempt.
+
 The Mac issues up to eight challenges at a time and reads each original nonce
 after allowing the responders five seconds to answer. The result counts reports
 verified during the inspection. Different batches can finish at different
