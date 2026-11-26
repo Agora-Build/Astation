@@ -649,8 +649,7 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(source["provisioned_without_membership"], json!([]));
     assert_eq!(&source["portal_keys_without_attribution"], unattributed);
     let prior = source["prior_signing_registrations"].as_array().unwrap();
-    let stopped = prior.iter().find(|row| row["service_id"] == id).unwrap();
-    assert_eq!(stopped["key_fingerprint"], fingerprint);
+    let stopped = prior.iter().find(|row| row["service_id"] == id && row["key_fingerprint"] == fingerprint).unwrap();
     assert_eq!(stopped["highest_observed_ms"], ceiling);
     assert_eq!(stopped["portal_observation"]["state"], "revoked");
     assert_eq!(stopped["portal_observation"]["interrupt_running"], true);
@@ -662,6 +661,14 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(&evidence["portal_keys_without_attribution"], unattributed);
     assert!(evidence["prior_signing_registrations"].as_array().unwrap().contains(stopped));
     assert_eq!(disconnected["recovery_ready"], false);
+    store.register_new_key(account, &genesis, &id, fingerprint).await.unwrap();
+    let lower = review().await.unwrap();
+    let evidence = &lower["portal_service_evidence"];
+    let live = evidence["registrations_without_membership"].as_array().unwrap().iter()
+        .find(|row| row["service_id"] == id && row["key_fingerprint"] == fingerprint).unwrap();
+    assert_eq!(live["highest_reserved_ms"], 0);
+    assert!(evidence["prior_signing_registrations"].as_array().unwrap().contains(stopped));
+    assert_eq!(&evidence["portal_keys_without_attribution"], unattributed);
     assert_ne!(saved["portal_service_evidence_hash"], unassigned["portal_service_evidence_hash"]);
     assert_eq!(unassigned["recovery_ready"], false);
     drop(runtime);
