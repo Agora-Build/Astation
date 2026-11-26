@@ -1614,7 +1614,7 @@ extension AstationRecoveryCoordinator {
             }
             try requireDurableRecoveryCheckpoint()
             var result: [String: RemoteStationVerifierRoster] = [:]
-            let origins = retainedControlOrigins(log).union(reviewedProcessOrigins(genesis: approval.genesisHash))
+            let origins = try retainedControlOrigins(log).union(reviewedProcessOrigins(genesis: approval.genesisHash))
                 .union(try controlStationTransports(log).keys).subtracting([relayURL])
             for origin in origins {
                 guard let entry = saved.verifierRosters?[origin], entry.genesis == approval.genesisHash,
@@ -2752,7 +2752,7 @@ extension AstationRecoveryCoordinator {
         let value: RemoteControlStationTransport
         if let supplied = try controlStationTransports(log)[origin] { value = supplied }
         else {
-            guard let retainedControlTransport, retainedControlOrigins(log).contains(origin) else {
+            guard let retainedControlTransport, try retainedControlOrigins(log).contains(origin) else {
                 throw RemoteChannelError.staleLink
             }
             value = try retainedControlTransport(origin)
@@ -2763,16 +2763,23 @@ extension AstationRecoveryCoordinator {
         return value
     }
 
-    private func retainedControlOrigins(_ log: MembershipLog) -> Set<String> {
-        Set((saved.controlPublications ?? [:]).keys).union((saved.verifierRosters ?? [:]).compactMap {
+    private func retainedControlOrigins(_ log: MembershipLog) throws -> Set<String> {
+        let journals = (saved.controlPublications ?? [:]).keys
+        var origins = Set(journals).union((saved.verifierRosters ?? [:]).compactMap {
             $0.value.genesis == log.genesisHash() ? $0.key : nil
         })
+        // A signed host interrupt can name a Station that has no journal of its own.
+        for origin in journals {
+            origins.formUnion(try controls(stationOrigin: origin).previouslyReviewedStations())
+        }
+        guard origins.union([relayURL]).count <= 64 else { throw RemoteRecoveryError.requiresReview }
+        return origins
     }
 
     private func controlActivityOrigins(_ log: MembershipLog) throws -> [String] {
         var origins = Set(try controlStationTransports(log).keys)
         origins.insert(relayURL)
-        if retainedControlTransport != nil { origins.formUnion(retainedControlOrigins(log)) }
+        if retainedControlTransport != nil { origins.formUnion(try retainedControlOrigins(log)) }
         guard origins.count <= 64, origins.allSatisfy(PortalIntegrationRecord.validOrigin) else {
             throw RemoteRecoveryError.requiresReview
         }

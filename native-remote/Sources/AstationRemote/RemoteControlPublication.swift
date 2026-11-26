@@ -143,12 +143,11 @@ public final class RemoteControlPublication {
         return [saved.stationOrigin] + (saved.operations[try index(recordID)].additionalStations ?? [:]).keys.sorted()
     }
 
-    public func previouslyReviewedStations(hostID: String) throws -> Set<String> {
+    public func previouslyReviewedStations(hostID: String? = nil) throws -> Set<String> {
         try available()
         var origins = Set<String>()
         for operation in saved.operations where operation.recordJSON != nil && operation.observed != true {
-            let body = try Self.body(operation.bodyJSON)
-            guard body.principal == "host:" + hostID else { continue }
+            if let hostID, try Self.body(operation.bodyJSON).principal != "host:" + hostID { continue }
             origins.insert(saved.stationOrigin)
             if let additional = operation.additionalStations { origins.formUnion(additional.keys) }
         }

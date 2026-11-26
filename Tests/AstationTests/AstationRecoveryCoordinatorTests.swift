@@ -5804,12 +5804,43 @@ extension AstationRecoveryCoordinatorTests {
             }, current: { true })
         XCTAssertTrue(requests.isEmpty, "discovery and draft preparation must never contact the listed Stations")
         XCTAssertEqual(review.additionalStationOrigins, [origin])
+        do {
+            _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true })
+            XCTFail("an unsigned draft enrolled a Station in background monitoring")
+        } catch RemoteChannelError.staleLink {}
+        XCTAssertTrue(requests.isEmpty)
         await second.dropControlReply()
         let first = try await coordinator.commitHostInterrupt(review, current: { true })
         XCTAssertEqual(first.additionalStations, [origin: false])
         let confirmations = h.ownerRequests.count
         coordinator = try restart()
         let pending = try XCTUnwrap(coordinator.pendingHostInterrupts().first)
+        let approval = try await service(coordinator, operations: ["launch", "view"])
+        let check = coordinator.serviceAdditionalStationVerifier(for: approval, current: { true }) { _, _ in
+            XCTFail("queried a Station before its replica roster was reviewed")
+            return second
+        }
+        do {
+            _ = try await check(try await coordinator.serviceMembership())
+            XCTFail("service enrollment omitted the signed destination")
+        } catch RemoteVerifierGateError.invalidRoster {}
+        do {
+            _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: other, current: { true })
+            XCTFail("a directory-only Station was contacted")
+        } catch RemoteChannelError.staleLink {}
+        let primaryScan = expectation(description: "selected Station checked first")
+        let peerScan = expectation(description: "signed destination checked on its own turn")
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { source, _, _ in
+            switch source {
+            case coordinator.relayURL: primaryScan.fulfill()
+            case origin: peerScan.fulfill()
+            default: XCTFail("unexpected monitoring origin")
+            }
+        }
+        await fulfillment(of: [primaryScan], timeout: 5)
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [peerScan], timeout: 5)
+        coordinator.stopControlActivity()
         let retry = try await coordinator.commitHostInterrupt(pending, current: { true })
         XCTAssertEqual(retry.recordJSON, first.recordJSON)
         XCTAssertEqual(retry.additionalStations, [origin: true])
