@@ -89,6 +89,33 @@ fn custom_checkpoints_cannot_carry_builtin_account_or_binding_data() {
     assert!(parse(&value, &binding(false)).is_err());
 }
 
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_migration_retains_account_floors_from_rotated_credentials() {
+    let db = crate::test_database::TestDatabase::new("RECOVERY_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../migrations/0012_station_integration_policy.sql"))
+        .execute(&db.pool).await.unwrap();
+    let first = binding(true);
+    let mut second = first.clone();
+    second.report_client_id = "s-11234567890123456789012345".into();
+    for (binding, policy) in [
+        (first, json!({"cursor":1,"portal_snapshot":{"cursor":20,
+            "accounts":{"complete":true,"disabled":[OTHER]}}})),
+        (second, json!({"cursor":8,"availability":{"cursor":8,"complete":false,"disabled":[OWNER]}})),
+        (binding(false), json!({"cursor":99})),
+    ] {
+        sqlx::query("INSERT INTO station_integration_policy(binding,checkpoint) VALUES ($1,$2)")
+            .bind(binding.storage_key().unwrap()).bind(policy.to_string()).execute(&db.pool).await.unwrap();
+    }
+    sqlx::raw_sql(include_str!("../../migrations/0030_delegated_availability_fences.sql"))
+        .execute(&db.pool).await.unwrap();
+    let floors: Vec<(String,i64)> = sqlx::query_as(
+        "SELECT account,minimum_cursor FROM station_delegated_availability_fences ORDER BY account",
+    ).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(floors, vec![("".into(),20), (OWNER.into(),9), (OTHER.into(),21)]);
+    db.cleanup().await;
+}
+
 #[test]
 fn legacy_partial_ambiguous_and_duplicate_snapshots_are_refused() {
     let mut variants = vec![json!({"changes":[],"cursor":0,"integrations":[]})];

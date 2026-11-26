@@ -23,7 +23,8 @@ WITH saved AS (
     SELECT scope, cut+1 AS floor, account FROM sources
     CROSS JOIN LATERAL jsonb_array_elements_text(accounts->'disabled') AS d(account)
     UNION ALL
-    SELECT scope, cut+1, '' FROM sources WHERE accounts->>'complete'='false'
+    SELECT scope, cut + CASE WHEN accounts->>'complete'='false' THEN 1 ELSE 0 END, ''
+    FROM sources WHERE jsonb_typeof(accounts)='object'
     UNION ALL
     SELECT scope, (policy->>'cursor')::bigint, '' FROM saved
     WHERE scope->>'station_origin' IN ('https://station.agora.build', 'https://station-dev.agora.build')
