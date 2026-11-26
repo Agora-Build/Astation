@@ -542,6 +542,11 @@ delivery update only for their own integration and Station origin.
 Background monitoring also rotates through the authenticated additional Station
 roster and origins already retained in the account's protected control journals
 or accepted server-list reviews. Only reviews for the current genesis count.
+This includes the destinations in a locally signed host interruption, even
+after a restart if the delivery receipt is missing and the destination has
+no local journal yet. An unsigned choice in the interrupt picker adds no
+monitor. Before signing a new service enrollment with launch, message or
+notify, the Mac also requires a reviewed replica roster for each such Station.
 This discovers no new URL from presence, a notification, or a server's claim.
 The union is bounded to 64 origins; exhausting the bound requires review and
 never silently discards a retained destination. The interrupt picker uses the Portal directory for new
