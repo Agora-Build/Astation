@@ -692,7 +692,23 @@ impl super::RecoveryStore {
         }
         let covered = covered_hosts(&log, &bodies[0].principal);
         let store = self.signing_ceilings.get().ok_or(())?;
-        for record in signer.sign_control_batch(store, &bodies, previously_signed).await? {
+        // A recovery review may have observed a reservation that never reached
+        // the feed. Require the signing store to cover it before reserving more.
+        let fingerprint = principal_key_of(&key).map_err(|_| ())?.to_hex();
+        let (floor, conflicting_key): (i64, bool) = sqlx::query_as(
+            "SELECT COALESCE(MAX(highest_ms) FILTER (WHERE key_hash=$5),0),
+                    COALESCE(BOOL_OR(key_hash<>$5 AND highest_ms>0),false)
+             FROM station_delegated_observed_reservations
+             WHERE origin=$1 AND account_id=$2 AND genesis_hash=$3 AND service_id=$4",
+        )
+        .bind(origin).bind(log.account_id()).bind(&context.genesis)
+        .bind(&context.service_id).bind(fingerprint)
+        .fetch_one(&mut *tx).await.map_err(|_| ())?;
+        if conflicting_key {
+            return Err(());
+        }
+        let required_floor = previously_signed.max(u64::try_from(floor).map_err(|_| ())?);
+        for record in signer.sign_control_batch(store, &bodies, required_floor).await? {
             feed.publish(
                 origin,
                 &log,

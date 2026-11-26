@@ -821,6 +821,19 @@ A missing historical registration appears even when its signatures were never
 published. A missing checkpoint is reported as pending.
 Publication must recheck current authority.
 
+During `prepare`, the primary recovery database retains the highest reservation
+it has seen for each Station, account, genesis, service and key. This includes
+ranges burned by a failed publication and registrations still at zero. A later
+review lists any missing or lower signing-store row in
+`service_clock_evidence.reservation_shortfalls` with its previously observed
+value. Changing plans or replicas preserves these observations. If the signing
+store is unconfigured, the review lists the retained observations separately.
+Before signing any new service control records, Station requires the independent
+database to cover the observed floor for that key. A positive observation for
+another key of the same service also blocks signing. Only the independent
+signing database can reserve timestamps. If both databases
+lose a reservation, this comparison cannot recover it.
+
 For each service, `snapshot_review` lists the fresh lifecycle actions required
 by the observed checkpoint. Station matches the signed active member and key
 to the stored provisioning context for this issuer, Station, owner, and genesis.

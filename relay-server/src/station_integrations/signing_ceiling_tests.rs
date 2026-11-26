@@ -13,6 +13,57 @@ use crate::{
 
 #[tokio::test]
 #[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_signing_checks_recovery_observations_before_reserving() {
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql")).execute(&external.pool).await.unwrap();
+    let (primary, runtime, fixture) =
+        fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let account = fixture.log.account_id();
+    let origin = &runtime.binding.station_origin;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    let key = draft["fingerprint"].as_str().unwrap();
+    let service = format!("svc-{ID}");
+    append_body(&runtime, &fixture, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    policy(&runtime, "paused", key, None).await;
+    assert_eq!(
+        recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0,
+        StatusCode::OK
+    );
+    let store = recovery.signing_ceilings.get().unwrap();
+    store.reserve(account, &genesis, &service, key, 0, 1..=2).await.unwrap();
+
+    let fence = Binding::new(origin, 1).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+    plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(store), None, None).await.unwrap();
+    // Exercise the normal signer with a reopened test fence and an older or
+    // replaced independent cluster. There is no production reopen operation yet.
+    sqlx::query("UPDATE station_delegated_recovery SET ready=true WHERE origin=$1")
+        .bind(origin).execute(&primary.pool).await.unwrap();
+    sqlx::query("TRUNCATE station_service_signing_ceilings").execute(&external.pool).await.unwrap();
+    store.register_new_key(account, &genesis, &service, key).await.unwrap();
+    assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+    assert_eq!(store.reservations(account, &genesis).await.unwrap()[0].highest_ms, 0);
+    assert!(feed(&runtime, &genesis).await.is_empty());
+    store.reserve(account, &genesis, &service, key, 0, 1..=2).await.unwrap();
+    sqlx::query("UPDATE station_delegated_observed_reservations SET key_hash=$1 WHERE genesis_hash=$2")
+        .bind("f".repeat(64)).bind(&genesis).execute(&primary.pool).await.unwrap();
+    assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+    assert_eq!(store.reservations(account, &genesis).await.unwrap()[0].highest_ms, 2);
+    assert!(feed(&runtime, &genesis).await.is_empty());
+    sqlx::query("UPDATE station_delegated_observed_reservations SET key_hash=$1 WHERE genesis_hash=$2")
+        .bind(key).bind(&genesis).execute(&primary.pool).await.unwrap();
+    runtime.reconcile_delegated_service(ID).await.unwrap();
+    assert_eq!(feed(&runtime, &genesis).await.len(), 2);
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
 async fn postgres_delegated_external_reservation_survives_failed_commit_and_primary_restore() {
     let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 4).await;
     sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
@@ -180,6 +231,26 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         missing["service_clock_evidence"]["unregistered_membership_keys"],
         json!([[service, key]])
     );
+    let observed_floor = json!({"service_id":service,"key_hash":key,"highest_ms":future});
+    assert_eq!(
+        missing["service_clock_evidence"]["reservation_shortfalls"],
+        json!([observed_floor])
+    );
+    // Simulate restoring the signing database to its original registration.
+    // The observed reservation never appeared in the restored feed.
+    replica.register_new_key(account, &genesis, service, key).await.unwrap();
+    let next = Binding::new(origin, 3).unwrap();
+    next.initialize(&primary.pool, true).await.unwrap();
+    let restarted = primary.reconnect(2).await;
+    let lower = plan::prepare_with_sources(&restarted, &next, &genesis, Some(&replica), None, None)
+        .await.unwrap();
+    assert_eq!(lower["service_clock_evidence"]["reservation_shortfalls"], json!([observed_floor]));
+    let offline = plan::prepare_with_sources(&restarted, &next, &genesis, None, None, None)
+        .await.unwrap();
+    assert_eq!(offline["service_clock_evidence"]["status"], "signing_store_unconfigured");
+    assert!(offline["service_clock_evidence"]["observed_reservations"].as_array().unwrap().contains(&observed_floor));
+    assert_eq!(offline["recovery_ready"], false);
+    restarted.close().await;
     assert_ne!(
         missing["service_clock_evidence_hash"],
         review["service_clock_evidence_hash"]
@@ -211,7 +282,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .await
         .is_err());
     assert!(
-        plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None, None)
+        plan::prepare_with_sources(&primary.pool, &next, &genesis, Some(&replica), None, None)
             .await
             .is_err()
     );
