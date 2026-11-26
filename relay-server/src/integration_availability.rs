@@ -77,3 +77,31 @@ impl Availability {
         Ok(())
     }
 }
+
+/// Keep a credential-independent lower bound on the Portal cut used to release
+/// work. A complete view can catch up to a peer's feed cursor. A known disable
+/// or incomplete baseline requires a strictly later view.
+pub(super) async fn retain_observation(
+    tx: &mut sqlx::PgConnection,
+    binding: &FeedBinding,
+    feed_cursor: u64,
+    view: Option<&Availability>,
+) -> Result<(), ()> {
+    let mut accounts: Vec<&str> = vec![""];
+    let mut floors = vec![feed_cursor as i64];
+    if let Some(view) = view {
+        floors[0] = floors[0].max(view.cursor as i64 + i64::from(!view.complete));
+        accounts.extend(view.disabled.iter().map(String::as_str));
+        floors.resize(accounts.len(), view.cursor as i64 + 1);
+    }
+    sqlx::query(
+        "INSERT INTO station_delegated_availability_fences AS f
+         (issuer, portal_origin, station_origin, account, minimum_cursor)
+         SELECT $1,$2,$3,account,floor FROM unnest($4::text[], $5::bigint[]) AS d(account,floor)
+         ON CONFLICT (issuer,portal_origin,station_origin,account) DO UPDATE
+         SET minimum_cursor=EXCLUDED.minimum_cursor WHERE f.minimum_cursor < EXCLUDED.minimum_cursor",
+    )
+    .bind(&binding.issuer).bind(&binding.portal_origin).bind(&binding.station_origin)
+    .bind(accounts).bind(floors).execute(tx).await.map_err(|_| ())?;
+    Ok(())
+}
