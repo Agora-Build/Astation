@@ -48,8 +48,8 @@ commit. A file import, another origin or an unknown outcome keeps the hold.
 
 Recovery Copies can request a Station challenge and submit a signed report
 when the delegated signing gate permits it. A retry can deliver a previously
-exposed signature. The Mac can check for an authenticated abandonment receipt. Publication receipts,
-complete historical author coverage and joint verification remain open.
+exposed signature. The Mac checks the authenticated terminal receipt for abandonment or publication.
+Station still needs atomic publication, complete historical author coverage and joint verification.
 
 Recovery Copies can review this Mac's retained evidence offline. The coordinator
 holds the account checkpoint and the member key's journal lock while reading
@@ -225,13 +225,14 @@ external generation. The deployment fence stays closed.
 
 **Check Signing Hold** in Recovery Copies reads
 `GET /api/remote/v1/logs/{genesis}/control/recovery/{plan}/outcome` from the
-selected Station with the native owner's bearer. Only an `abandoned` receipt
+selected Station with the native owner's bearer. An `abandoned` or `published` receipt
 matching the account, genesis, origin, generation, plan, candidate and source
 can end this hold. Missing, pending and unrecognized outcomes keep it held.
 The Mac retains the frozen signatures and end marker in one protected write.
 A late challenge cannot reinstall that plan. Holds at other origins still apply.
-Publication requires the future atomic reconstruction path before Station can
-issue a published outcome.
+Station may issue `published` only after it atomically commits the recovered
+feed, generation and plan outcome. The current server returns `pending` or
+`abandoned` while that publication path is under development.
 
 ## Implemented fence and operator commands
 

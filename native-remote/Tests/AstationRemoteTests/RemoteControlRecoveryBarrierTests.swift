@@ -212,6 +212,14 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
     }
 
     func testOnlyExactAbandonmentReleasesTheHoldAndPreventsItsReinstallation() async throws {
+        try await checkTerminalReceipt(.abandoned)
+    }
+
+    func testOnlyExactPublicationReleasesTheHoldAndPreventsItsReinstallation() async throws {
+        try await checkTerminalReceipt(.published)
+    }
+
+    private func checkTerminalReceipt(_ outcome: RemoteStationPlanEnd.Outcome) async throws {
         let f = try ControlPublicationFixture(), c = try context(f), other = try context(f, origin: "https://another.example")
         let host = try XCTUnwrap(URL(string: c.stationOrigin)?.host)
         let config = URLSessionConfiguration.ephemeral
@@ -226,7 +234,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let current = try f.readAuthorJournal("manager")
         let payload: [String: String] = ["account_id": c.accountID, "genesis_hash": c.genesisHash, "origin": c.stationOrigin,
             "generation": String(c.generation), "plan_id": c.planID, "candidate_feed_id": c.candidateFeedID,
-            "source_hash": c.sourceHash, "outcome": "abandoned"]
+            "source_hash": c.sourceHash, "outcome": outcome.rawValue]
         for field in payload.keys.sorted() + ["extra", "pending", "valid"] {
             var body = payload
             if field == "pending" { body["outcome"] = "pending" }
@@ -238,18 +246,19 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
                 return (200, data)
             }
             if field == "valid" {
-                let end = try await station.abandonment(of: c)
+                let end = try await station.planEnd(for: c)
                 let proof = try XCTUnwrap(end)
+                XCTAssertEqual(proof.outcome, outcome)
                 let fail = try RemoteControlSigningJournal(log: f.log, memberID: "manager",
                     read: { f.authorBytes["manager"] }, persist: { _ in throw RemoteControlPublicationError.storageUncertain })
-                XCTAssertThrowsError(try fail.reconcileAbandonment(proof))
+                XCTAssertThrowsError(try fail.reconcilePlanEnd(proof))
                 XCTAssertThrowsError(try current.requireStopChange(origin: c.stationOrigin))
-                try current.reconcileAbandonment(proof)
+                try current.reconcilePlanEnd(proof)
             } else if field == "pending" {
-                let end = try await station.abandonment(of: c)
+                let end = try await station.planEnd(for: c)
                 XCTAssertNil(end)
             } else {
-                do { _ = try await station.abandonment(of: c); XCTFail(field) }
+                do { _ = try await station.planEnd(for: c); XCTFail(field) }
                 catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse, field) }
             }
         }

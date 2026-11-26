@@ -2223,15 +2223,15 @@ extension AstationRecoveryCoordinator {
         return result
     }
 
-    func checkSigningHold(_ context: RemoteControlRecoveryContext, current: () -> Bool) async throws -> Bool {
+    func checkSigningHold(_ context: RemoteControlRecoveryContext, current: () -> Bool) async throws -> RemoteStationPlanEnd.Outcome? {
         try begin(); defer { busy = false }
         guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
               try currentKit()?.genesisHash == context.genesisHash,
               let station = http as? RemoteRecoveryHTTP else { throw RemoteRecoveryError.requiresReview }
-        guard let end = try await station.abandonment(of: context) else { return false }
+        guard let end = try await station.planEnd(for: context) else { return nil }
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-        try readControlJournal(member: managerID).reconcileAbandonment(end)
-        return true
+        try readControlJournal(member: managerID).reconcilePlanEnd(end)
+        return end.outcome
     }
 
     /// A transport retry sends the existing signed evidence without a second owner prompt.
