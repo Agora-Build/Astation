@@ -2,6 +2,7 @@ import AppKit
 import AtemClient
 @testable import AstationRemote
 import CryptoKit
+import os
 import Security
 import Vision
 import XCTest
@@ -1876,6 +1877,27 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
         XCTAssertEqual(checks, 3)
         XCTAssertEqual(h.identityCryptography.signingCalls, before)
+        XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
+    }
+
+    func testServiceConfirmationExpiresWhileRecheckingParticipants() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in })
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, operations: ["launch", "view"])
+        try await coordinator.prepareService(approval)
+        let initialSigns = h.identityCryptography.signingCalls
+        let tick = OSAllocatedUnfairLock(initialState: UInt64(10))
+        var checks = 0
+        do {
+            _ = try await coordinator.approveService(approval, portal: portal(transport), authorizeNewOperations: { _ in
+                checks += 1
+                if checks == 2 { tick.withLock { $0 += 30_000 } }
+            }, confirmationClock: { tick.withLock { $0 } }, current: { true })
+            XCTFail("The post-confirmation checks consumed the approval window")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        XCTAssertEqual(checks, 2)
+        XCTAssertEqual(h.identityCryptography.signingCalls, initialSigns)
         XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
     }
 

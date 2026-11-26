@@ -788,6 +788,7 @@ final class AstationRecoveryCoordinator {
     @discardableResult
     func approveService(_ approval: RemoteServiceApproval, portal: PortalIntegrationHTTP,
         authorizeNewOperations: ((MembershipLog) throws -> Void)? = nil,
+        confirmationClock: @escaping @Sendable () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         current: @escaping () -> Bool) async throws -> (record: PortalIntegrationRecord, membership: MembershipLog) {
         try begin(); defer { busy = false }
         guard current(), try pendingServiceApproval() == approval, let checkpoint = saved.publication else {
@@ -820,6 +821,7 @@ final class AstationRecoveryCoordinator {
                     }
                 } else { authorizeInventory = nil }
                 guard await confirmServiceOwner(approval, request), current() else { throw RemoteRecoveryError.confirmationRequired }
+                let stamp = confirmationClock()
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
@@ -830,9 +832,8 @@ final class AstationRecoveryCoordinator {
                     authorizeNewMembership: authorizeInventory.map { authorize in
                         { request in try authorize(request, snapshot) }
                     })
-                let stamp = now().monoMs
                 append = try approval.sign(publication: publication, provider: signer, managerID: managerID,
-                    validationClock: now(), confirmedAt: stamp, now: { Self.clock().monoMs }, current: current)
+                    validationClock: now(), confirmedAt: stamp, now: confirmationClock, current: current)
             }
             guard current() else { throw RemoteChannelError.staleLink }
             switch try await http.append(genesisHash: approval.genesisHash, request: append) {
