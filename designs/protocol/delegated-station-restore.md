@@ -307,7 +307,10 @@ With built-in Station reporting configured, the same transaction includes
 and native proxy proof against the stored list head and trust generation.
 The result identifies the carrier and host, whether the registered room owner
 matches the root's issuer-scoped identity, and the ownership source from the
-last observed Portal binding. An unbound or released list has no bound owner.
+last observed Portal binding. If another credential for the same Station has a
+newer binding, or disagrees at the same version, room ownership stays unresolved
+until the selected credential has a consistent checkpoint. An unbound or
+released list has no bound owner.
 For a never-bound list, a missing root identity or conflicting or unresolvable
 registration requires review. For a Station-issued session room, inspection
 also resolves its seven-day binding to a registered Astation under the same

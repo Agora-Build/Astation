@@ -160,7 +160,10 @@ pub(super) async fn inspect(
             rows.iter()
                 .find(|r| r.account_id == root.account && r.genesis_hash == genesis)
         });
+    let competing = policy.has_competing_binding(connection, &root.account, &genesis, binding)
+        .await.map_err(|_| invalid_root())?;
     let binding_state = match binding {
+        _ if competing => "superseded_or_conflicting",
         Some(row) => row.binding_state.as_str(),
         None if policy.portal_snapshot.is_some() => "no_binding_in_checkpoint",
         None => "unobserved",
@@ -283,7 +286,7 @@ pub(super) async fn inspect(
     }
     Ok(
         json!({"root_owner_mapped":owner.is_some(),"last_observed_binding":binding_state,
-        "binding_matches_root_owner":binding.and_then(|b|owner.map(|o|o == b.account)),
+        "binding_matches_root_owner":binding.filter(|_| !competing).and_then(|b|owner.map(|o|o == b.account)),
         "binding_version":binding.map(|row|row.version),"retained_routes":hosts}),
     )
 }

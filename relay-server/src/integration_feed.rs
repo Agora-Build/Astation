@@ -400,7 +400,15 @@ impl PolicyCheckpoint {
         if observed_denial {
             return Ok(false);
         }
-        let veto: bool = sqlx::query_scalar(
+        Ok(!self.has_competing_binding(tx, account_id, genesis, current).await?)
+    }
+
+    /// Binding versions are shared by every report credential for this Station.
+    pub(crate) async fn has_competing_binding(
+        &self, tx: &mut sqlx::PgConnection, account_id: &str, genesis: &str,
+        current: Option<&crate::integration_checkpoint::Binding>,
+    ) -> Result<bool, ()> {
+        sqlx::query_scalar(
             "SELECT EXISTS (
                SELECT 1 FROM station_integration_policy p
                CROSS JOIN LATERAL jsonb_array_elements(
@@ -413,8 +421,7 @@ impl PolicyCheckpoint {
         )
         .bind(self.binding.storage_key()?).bind(account_id).bind(genesis)
         .bind(current.map(sqlx::types::Json)).bind(current.map(|row| row.version as i64))
-        .fetch_one(tx).await.map_err(|_| ())?;
-        Ok(!veto)
+        .fetch_one(tx).await.map_err(|_| ())
     }
 
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
