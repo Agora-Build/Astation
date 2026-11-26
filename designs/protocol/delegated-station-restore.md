@@ -800,6 +800,14 @@ observations, and whether any ended with a stopped client or outstanding deliver
 A missing live journal has a null current hash. Earlier observations remain
 available to reconcile before reopening. Preparation sends no report or resume.
 
+At reporter startup, Station checks that the live event sequence extends every
+archived sequence for the same issuer, Portal and Station. It restores consumed
+resume IDs in the journal transaction before considering the configured resume.
+A missing stop or a conflicting prefix keeps the reporter closed. An archived
+delivery claim that disappeared requires a fresh explicit resume unless the
+live journal already records a subsequent resume. These checks apply before
+the worker can send its first report.
+
 A Station in recovery review mode fetches the existing authenticated Portal checkpoint
 after observing its configured closed generation. At commit it takes a shared lock
 on the same fence and compares the policy revision. A late response from a previous

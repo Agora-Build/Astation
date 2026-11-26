@@ -1,7 +1,58 @@
 use super::{invalid, source_hash, Binding, MAX_STATE};
 use crate::integration_feed::FeedBinding;
+use crate::remote_api::recovery::delegated::ReportControlEvent;
+use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use sqlx::PgConnection;
+
+/// Validate event history and restore consumed resume IDs under the journal
+/// and deployment locks. A lost delivery claim requires a fresh explicit resume.
+pub(crate) async fn reconcile_report_restart(
+    connection: &mut PgConnection,
+    portal: &FeedBinding,
+    events: &[ReportControlEvent],
+    in_flight: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let key = portal.report_control_binding();
+    let mut rows = sqlx::query_as::<_, (String, Option<Value>)>(
+        "SELECT h.evidence_hash, CASE WHEN octet_length(h.journal::text) <= $3 THEN h.journal END
+         FROM station_delegated_reporting_history h WHERE h.origin=$1 AND h.binding=$2",
+    )
+    .bind(&portal.station_origin)
+    .bind(&key)
+    .bind(MAX_STATE as i64)
+    .fetch(&mut *connection);
+    let mut needs_resume = false;
+    let mut has_history = false;
+    while let Some((hash, journal)) = rows.try_next().await? {
+        let journal = journal.ok_or_else(invalid)?;
+        if source_hash(&journal)? != hash || !journal["resume_ids"].is_array() {
+            return Err(invalid());
+        }
+        let prior: Vec<ReportControlEvent> =
+            serde_json::from_value(journal["events"].clone()).map_err(|_| invalid())?;
+        let later = events.strip_prefix(prior.as_slice()).ok_or_else(invalid)?;
+        if !journal["in_flight"].is_null() {
+            let claim = journal["in_flight"].as_str().ok_or_else(invalid)?;
+            needs_resume |= in_flight != Some(claim)
+                && !later.iter().any(|event| matches!(event, ReportControlEvent::Resume(_)));
+        }
+        has_history = true;
+    }
+    drop(rows);
+    if has_history {
+        // Consumption is permanent. Rebuild missing IDs before considering an
+        // operator's request, in the same transaction as any resulting resume.
+        sqlx::query(
+            "INSERT INTO station_delegated_report_resumptions(binding,resume_id)
+             SELECT DISTINCT h.binding, prior.id::uuid FROM station_delegated_reporting_history h
+             CROSS JOIN LATERAL jsonb_array_elements_text(h.journal->'resume_ids') AS prior(id)
+             WHERE h.origin=$1 AND h.binding=$2 ON CONFLICT DO NOTHING",
+        )
+        .bind(&portal.station_origin).bind(&key).execute(connection).await?;
+    }
+    Ok(needs_resume)
+}
 
 /// Preparation holds the deployment fence through commit. The live reporter
 /// takes the same fence before changing either the journal or consumed resume IDs.

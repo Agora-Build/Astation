@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 #[path = "delegated_portal_services.rs"]
 mod portal_services;
 #[path = "delegated_reporting_history.rs"]
-mod reporting_history;
+pub(crate) mod reporting_history;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
