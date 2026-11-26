@@ -137,6 +137,9 @@ public final class RemoteStationVerifierEvidence {
     private var poll: Poll?
     private var connections: [String: RemoteVerifierSigningGate.Connection] = [:]
     private var generations: [String: UInt64] = [:]
+    private var approvalGenerations: [UInt64]?
+    private var approvalDeadline: UInt64?
+    private var approvalCurrent = false
 
     public init(gate: RemoteVerifierSigningGate, roster: RemoteStationVerifierRoster, log: MembershipLog) throws {
         try gate.requireMembership(log)
@@ -149,6 +152,7 @@ public final class RemoteStationVerifierEvidence {
     deinit { for connection in connections.values { gate.disconnect(connection) } }
 
     public func begin() -> Poll {
+        approvalCurrent = false
         let next = Poll(id: UUID()); poll = next
         return next
     }
@@ -157,6 +161,13 @@ public final class RemoteStationVerifierEvidence {
     /// The returned IDs are reviewed replicas that supplied no live inventory in this snapshot.
     public func inspect(using transport: any RemoteStationVerifierTransport,
                         current: @MainActor () throws -> Void) async throws -> [String] {
+        try await fetch(using: transport, current: current) { snapshot in
+            snapshot.replicas.filter { $0.inventory == nil }.map(\.id)
+        }
+    }
+
+    private func fetch<T>(using transport: any RemoteStationVerifierTransport, current: @MainActor () throws -> Void,
+                          inspect: (RemoteStationVerifierSnapshot) throws -> T) async throws -> T {
         let expected = begin()
         do {
             try Task.checkCancellation()
@@ -165,11 +176,38 @@ public final class RemoteStationVerifierEvidence {
             try Task.checkCancellation()
             try current()
             try receive(snapshot, for: expected)
-            return snapshot.replicas.filter { $0.inventory == nil }.map(\.id)
+            return try inspect(snapshot)
         } catch {
             failed(expected)
             throw error
         }
+    }
+
+    /// One approval checks the same replica processes before and after consent.
+    public func refreshApproval(using transport: any RemoteStationVerifierTransport, requirement: VerifierRequirement,
+                                current: @MainActor () throws -> Void) async throws {
+        try await fetch(using: transport, current: current) { snapshot in
+            let processes = snapshot.replicas.compactMap(\.connectionGeneration)
+            guard processes.count == roster.replicas.count, approvalGenerations == nil || approvalGenerations == processes,
+                  snapshot.replicas.allSatisfy({ replica in
+                      guard let inventory = replica.inventory else { return false }
+                      return inventory.version >= requirement.minimumVersion && inventory.actions.contains(requirement.action)
+                  }), let lease = snapshot.replicas.compactMap(\.authorizationMilliseconds).min()
+            else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+            let deadline = snapshot.requestStartedAt.addingReportingOverflow(lease)
+            guard !deadline.overflow else { throw RemoteVerifierGateError.staleConnection }
+            let bound = min(approvalDeadline ?? deadline.partialValue, deadline.partialValue)
+            try gate.requireLiveDeadline(bound)
+            approvalGenerations = processes
+            approvalDeadline = bound
+            approvalCurrent = true
+        }
+    }
+
+    public func requireApproval(log: MembershipLog) throws {
+        try gate.requireMembership(log)
+        guard approvalCurrent, let approvalDeadline else { throw RemoteVerifierGateError.staleConnection }
+        try gate.requireLiveDeadline(approvalDeadline)
     }
 
     public func receive(_ snapshot: RemoteStationVerifierSnapshot, for expected: Poll) throws {
@@ -205,6 +243,7 @@ public final class RemoteStationVerifierEvidence {
     public func disconnect() { poll = nil; disconnectEvidence() }
 
     private func disconnectEvidence() {
+        approvalCurrent = false
         for connection in connections.values { gate.disconnect(connection) }
         connections.removeAll()
     }

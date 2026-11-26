@@ -151,6 +151,10 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         states[connection.verifier]?.prospectiveRequest = nil
     }
 
+    func requireLiveDeadline(_ deadline: UInt64) throws {
+        guard now() < deadline else { throw RemoteVerifierGateError.staleConnection }
+    }
+
     /// Only call after authenticating this consumer and its connection. A host's report must
     /// instead come from its encrypted, shared-core-verified welcome via observeHostWelcome.
     public func observeConsumer(_ inventory: VerifierInventory?, on connection: Connection) throws {
