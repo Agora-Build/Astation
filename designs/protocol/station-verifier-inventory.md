@@ -396,8 +396,9 @@ running SDK's process ID assigns that slot to this Mac. The Mac stores the
 assignment in its protected checkpoint. An older review needs a fresh
 confirmation to assign a slot. Removing the local row stops reporting.
 
-The signed-in Mac checks that slot's inbox on the selected Station every four
-seconds. It checks the protected roster and device-list head before signing,
+Every four seconds the signed-in Mac checks each Station where the manager
+assigned it a slot at the current device-list head. Each origin uses its own
+bearer and has at most one background poll in flight. It checks the protected roster and device-list head before signing,
 uses its existing key without an owner prompt, and verifies the signed body
 returned by Station before marking the challenge answered. A lost or invalid
 receipt is retried while the challenge is open. Switching accounts or Stations,
@@ -405,12 +406,14 @@ sleeping, or changing membership invalidates the in-flight work. After a process
 restart the Mac reports its new SDK process ID under the saved slot, allowing a
 consumer to detect the conflict and require a new review.
 
-**Check Live Processes** in the Mac's Host Sending Access window first fetches
-the selected Station's live server reports. It checks the account, signed
-device-list head and protected server roster before issuing any member
-challenge. A changed roster requires a new server review. A reviewed server
-without a live inventory is listed by name. The server check also works when
-no member process has been reviewed. Members without an eligible review stay visible.
+**Check Live Processes** in the Mac's Host Sending Access window inspects the
+same Station origins used by capability-sensitive enrollment. For each origin
+it checks the account, signed device-list head and protected server roster
+before issuing member challenges there. A Station without a reviewed server
+list is named and skipped. A changed list requires a new review. Each report
+and missing slot is attributed to its Station, even if two Stations use the
+same replica or slot names. The server check also works before the first
+member process review. Members without an eligible review stay visible.
 The same check lists hosts from the signed device list, including offline
 hosts. For each host the Mac checks its current encrypted channels for a
 verified welcome at the reviewed membership head and trust generation.

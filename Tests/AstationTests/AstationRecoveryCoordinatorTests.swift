@@ -782,6 +782,15 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let review = try await coordinator.prepareProcessReview(member: coordinator.managerID, current: { true })
         try await coordinator.acceptProcessReview(review, lines: ["offline AQEBAQEBAQEBAQEBAQEBAQ",
             "truck " + verifierReportProcess()], current: { true })
+        let peerOrigin = "https://second.example"
+        let peer = RecoveryMemoryRelay(stationOrigin: peerOrigin)
+        await peer.replaceLog(try await coordinator.hostSenderMembership())
+        let peerManager = try h.coordinator(relayURL: peerOrigin, transport: peer,
+            confirmVerifierRoster: { _ in true }, confirmProcessRoster: { true })
+        let peerServers = try await peerManager.prepareStationVerifierRoster(current: { true })
+        try await peerManager.acceptStationVerifierRoster(peerServers, current: { true })
+        let peerReview = try await peerManager.prepareProcessReview(member: coordinator.managerID, current: { true })
+        try await peerManager.acceptProcessReview(peerReview, lines: ["truck " + verifierReportProcess()], current: { true })
         let restarted = try h.coordinator()
         let log = try await restarted.hostSenderMembership()
         let origin = restarted.relayURL, member = restarted.managerID, identity = h.identity
@@ -795,13 +804,16 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let inventory = verifierInventory()
         RecoveryReportHTTPStub.lock.withLock {
             RecoveryReportHTTPStub.response = { request, data in
+                let requestOrigin = "https://" + (try XCTUnwrap(request.url?.host))
+                XCTAssertTrue([origin, peerOrigin].contains(requestOrigin))
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer " + (requestOrigin == origin ? "selected-token" : "peer-token"))
                 if request.url?.lastPathComponent == "verifiers" {
                     XCTAssertEqual(request.httpMethod, "GET")
                     let rows: [[String: Any]] = [
                         ["id": "a", "connection_generation": 2, "authorization_ms_left": 30_000,
                          "verifier": ["version": inventory.version, "actions": inventory.actions]],
                         ["id": "b", "connection_generation": 1]]
-                    return try JSONSerialization.data(withJSONObject: ["origin": origin, "account_id": log.accountId(),
+                    return try JSONSerialization.data(withJSONObject: ["origin": requestOrigin, "account_id": log.accountId(),
                         "genesis_hash": log.genesisHash(), "roster_generation": rosterGeneration, "head": head, "replicas": rows])
                 }
                 let nonce: String
@@ -820,7 +832,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 let json = try XCTUnwrap(issued[nonce])
                 let challenge = try parseVerifierReportChallenge(challengeJson: json)
                 var reports: [Any] = []
-                if request.httpMethod == "GET", challenge.slot == "truck" {
+                XCTAssertEqual(challenge.origin, requestOrigin)
+                if request.httpMethod == "GET", challenge.slot == "truck", requestOrigin == origin {
                     let report = try identity.verifierReport(log: log, anchor: anchor, memberID: member,
                         challengeJSON: json, slot: challenge.slot, origin: origin,
                         wallMs: AstationRecoveryCoordinator.clock().wallMs, current: { true })
@@ -833,32 +846,40 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
         var activeAccount = true
         func check(wait: @escaping @Sendable () async throws -> Void = {}) async throws -> AstationRecoveryCoordinator.ProcessCheck {
-            try await restarted.checkMemberProcesses(current: { activeAccount }, transport: { active in
-                try RemoteRecoveryHTTP(relayURL: origin, configuration: config) {
+            try await restarted.checkMemberProcesses(current: { activeAccount }, transport: { target, active in
+                try RemoteRecoveryHTTP(relayURL: target, configuration: config) {
                     guard await active() else { throw AccountLoginError.changed }
-                    return "test-token"
+                    return target == origin ? "selected-token" : "peer-token"
                 }
-            }, waitForReport: wait, progress: { _, _ in })
+            }, waitForReport: wait, progress: { _, _, _ in })
         }
         let result = try await check()
-        XCTAssertEqual(issued.count, 2)
-        XCTAssertEqual(reads, 2)
-        XCTAssertEqual(result.answered, 1)
-        XCTAssertEqual(result.unanswered.map(\.slot), ["offline"])
-        XCTAssertEqual(result.pendingMembers, ["manager-b"])
-        XCTAssertEqual(result.serverCount, 2)
-        XCTAssertEqual(result.unconfirmedServers, ["b"])
+        XCTAssertEqual(issued.count, 3)
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(result.stations.map(\.origin), [origin, peerOrigin])
+        let first = try XCTUnwrap(result.stations.first { $0.origin == origin })
+        let second = try XCTUnwrap(result.stations.first { $0.origin == peerOrigin })
+        XCTAssertEqual(first.slots, 2)
+        XCTAssertEqual(first.unanswered.map(\.slot), ["offline"])
+        XCTAssertEqual(first.pendingMembers, ["manager-b"])
+        XCTAssertEqual(first.serverCount, 2)
+        XCTAssertEqual(first.unconfirmedServers, ["b"])
+        XCTAssertEqual(second.slots, 1)
+        XCTAssertEqual(second.unanswered.map(\.slot), ["truck"])
+        XCTAssertEqual(second.pendingMembers, [])
+        XCTAssertEqual(second.serverCount, 2)
+        XCTAssertEqual(second.unconfirmedServers, ["b"])
         XCTAssertFalse(restarted.hostSenderControlsAvailable)
         rosterGeneration = 2
         do { _ = try await check(); XCTFail("unreviewed server roster accepted") }
         catch RemoteVerifierGateError.staleMembership {}
-        XCTAssertEqual(issued.count, 2, "validate the reviewed server list before creating challenges")
+        XCTAssertEqual(issued.count, 3, "validate the reviewed server list before creating challenges")
         rosterGeneration = 1
         do {
             _ = try await check { await MainActor.run { activeAccount = false } }
             XCTFail("signed-out check returned a result")
         } catch {}
-        XCTAssertEqual(reads, 2, "a retired inspection cannot read the mailbox")
+        XCTAssertEqual(reads, 3, "a retired inspection cannot read the mailbox")
         activeAccount = true
         let requestsBeforeStorageLoss = issued.count
         h.verifierHistoryBytes.removeValue(forKey: origin)
@@ -894,19 +915,20 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
         var selected = true
         func check(switchAccount: Bool) async throws -> AstationRecoveryCoordinator.ProcessCheck {
-            try await coordinator.checkMemberProcesses(current: { selected }, transport: { _ in
-                try RemoteRecoveryHTTP(relayURL: origin, configuration: config) {
+            try await coordinator.checkMemberProcesses(current: { selected }, transport: { target, _ in
+                try RemoteRecoveryHTTP(relayURL: target, configuration: config) {
                     if switchAccount { await MainActor.run { selected = false } }
                     return "test-token"
                 }
-            }, progress: { _, _ in })
+            }, progress: { _, _, _ in })
         }
         let result = try await check(switchAccount: false)
-        XCTAssertEqual(result.unconfirmedServers, ["a", "b"])
+        let station = try XCTUnwrap(result.stations.first)
+        XCTAssertEqual(station.unconfirmedServers, ["a", "b"])
         XCTAssertEqual(result.hostCount, 1)
         XCTAssertEqual(result.unconfirmedHosts, ["host-a"])
-        XCTAssertEqual(result.pendingMembers, [coordinator.managerID])
-        XCTAssertEqual(result.total, 0)
+        XCTAssertEqual(station.pendingMembers, [coordinator.managerID])
+        XCTAssertEqual(station.slots, 0)
         XCTAssertTrue(h.verifierHistoryBytes.isEmpty)
         do { _ = try await check(switchAccount: true); XCTFail("accepted a response for the previous account") }
         catch RemoteVerifierGateError.staleConnection {}
@@ -928,8 +950,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         rosters[origin]?[member]?["lines"] = ["truck AQEBAQEBAQEBAQEBAQEBAQ"]
         checkpoint["processRosters"] = rosters
         h.store.bytes = try PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)
-        let restarted = try h.coordinator()
-        XCTAssertTrue(restarted.hasLocalVerifierSlot)
+        let restarted = try h.coordinator(relayURL: "https://elsewhere.example")
+        XCTAssertEqual(restarted.localVerifierOrigins, [origin])
         XCTAssertFalse(restarted.delegatedControlsAvailable)
 
         let wall = AstationRecoveryCoordinator.clock().wallMs
@@ -966,7 +988,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [RecoveryReportHTTPStub.self]
         func poll() async throws {
-            try await restarted.answerVerifierChallenges(current: { true }) { active in
+            try await restarted.answerVerifierChallenges(at: origin, current: { true }) { active in
                 try RemoteRecoveryHTTP(relayURL: origin, configuration: config, accessToken: {
                     guard await active() else { throw AccountLoginError.changed }
                     return "verifier-test"
@@ -983,8 +1005,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.identityCryptography.noninteractiveSigningCalls, 2)
         _ = try await addSecondManager(harness: h)
         _ = try await restarted.hostSenderMembership()
-        XCTAssertFalse(restarted.hasLocalVerifierSlot)
-        try await restarted.answerVerifierChallenges(current: { true }) { _ in
+        XCTAssertTrue(restarted.localVerifierOrigins.isEmpty)
+        try await restarted.answerVerifierChallenges(at: origin, current: { true }) { _ in
             XCTFail("stale roster started a request"); throw AccountLoginError.changed
         }
     }
@@ -993,8 +1015,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let h = RecoveryCoordinatorHarness()
         let coordinator = try h.coordinator(confirmProcessRoster: { true })
         _ = try await coordinator.setup()
-        XCTAssertFalse(coordinator.hasLocalVerifierSlot)
-        try await coordinator.answerVerifierChallenges(current: { true }) { _ in
+        XCTAssertTrue(coordinator.localVerifierOrigins.isEmpty)
+        try await coordinator.answerVerifierChallenges(at: coordinator.relayURL, current: { true }) { _ in
             XCTFail("unreviewed Mac requested a token"); throw AccountLoginError.changed
         }
         let review = try await coordinator.prepareProcessReview(member: coordinator.managerID, current: { true })
@@ -1007,7 +1029,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
         do {
-            try await coordinator.answerVerifierChallenges(current: { signedIn }) { active in
+            try await coordinator.answerVerifierChallenges(at: coordinator.relayURL, current: { signedIn }) { active in
                 try RemoteRecoveryHTTP(relayURL: coordinator.relayURL, configuration: config, accessToken: {
                     await MainActor.run { signedIn = false }
                     guard await active() else { throw AccountLoginError.changed }
@@ -5802,6 +5824,17 @@ extension AstationRecoveryCoordinatorTests {
                 XCTAssertEqual(choice.unavailable, ["https://removed.example"])
                 return [origin]
             }, current: { true })
+        func uncheckedOrigins(_ manager: AstationRecoveryCoordinator) async throws -> [String] {
+            let result = try await manager.checkMemberProcesses(current: { true }, transport: { _, _ in
+                XCTFail("requested a bearer before server review")
+                throw AccountLoginError.changed
+            }, progress: { _, _, _ in })
+            XCTAssertTrue(result.stations.allSatisfy { $0.serverCount == nil })
+            XCTAssertNil(result.hostCount)
+            return result.stations.map(\.origin)
+        }
+        let draftOrigins = try await uncheckedOrigins(coordinator)
+        XCTAssertEqual(draftOrigins, [coordinator.relayURL])
         XCTAssertTrue(requests.isEmpty, "discovery and draft preparation must never contact the listed Stations")
         XCTAssertEqual(review.additionalStationOrigins, [origin])
         do {
@@ -5815,6 +5848,8 @@ extension AstationRecoveryCoordinatorTests {
         let confirmations = h.ownerRequests.count
         coordinator = try restart()
         let pending = try XCTUnwrap(coordinator.pendingHostInterrupts().first)
+        let signedOrigins = try await uncheckedOrigins(coordinator)
+        XCTAssertEqual(signedOrigins, [coordinator.relayURL, origin].sorted())
         let approval = try await service(coordinator, operations: ["launch", "view"])
         let check = coordinator.serviceAdditionalStationVerifier(for: approval, current: { true }) { _, _ in
             XCTFail("queried a Station before its replica roster was reviewed")

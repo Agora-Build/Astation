@@ -195,33 +195,47 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         task = Task { [weak self] in
             guard let self else { return }
             defer { task = nil; render() }
+            var checkingStation: String?
             do {
-                guard try coordinator.acceptedStationVerifierRoster() != nil else {
-                    status.stringValue = "Review Station Servers before checking live processes."
-                    return
-                }
                 let context = try hub.verifierContext(for: coordinator)
                 let result = try await coordinator.checkMemberProcesses(current: { current() && context() },
-                    transport: hub.verifierTransport(current:), reportingHosts: hub.hostsWithLiveVerifierReports(in:)) { checked, total in
-                    self.status.stringValue = "Checking Station servers and processes (\(checked)/\(total) slots)..."
+                    transport: hub.verifierTransport(for:current:), reportingHosts: hub.hostsWithLiveVerifierReports(in:)) { origin, checked, total in
+                    checkingStation = origin
+                    self.status.stringValue = "Checking \(origin) (\(checked)/\(total) process slots)..."
                 }
                 guard current(), context(), !Task.isCancelled else { throw AccountLoginError.changed }
-                let servers = result.serverCount - result.unconfirmedServers.count
-                let hosts = result.hostCount - result.unconfirmedHosts.count
-                let summary = "Reports received from \(servers)/\(result.serverCount) Station servers, \(hosts)/\(result.hostCount) hosts and \(result.answered)/\(result.total) reviewed process slots."
+                let missingRosters = result.stations.filter { $0.serverCount == nil }.count
+                let servers = result.stations.compactMap(\.serverCount).reduce(0, +)
+                let missingServers = result.stations.reduce(0) { $0 + $1.unconfirmedServers.count }
+                let slots = result.stations.reduce(0) { $0 + $1.slots }
+                let missingSlots = result.stations.reduce(0) { $0 + $1.unanswered.count }
+                let hosts = result.hostCount.map { "\($0 - result.unconfirmedHosts.count)/\($0) hosts" } ?? "hosts unchecked"
+                var summary = "Reports received from \(servers - missingServers)/\(servers) reviewed servers and \(slots - missingSlots)/\(slots) reviewed process slots. \(hosts)."
+                if missingRosters > 0 { summary += " Stations needing server review: \(missingRosters)." }
                 status.stringValue = summary
-                guard !result.unconfirmedServers.isEmpty || !result.unconfirmedHosts.isEmpty || !result.unanswered.isEmpty || !result.pendingMembers.isEmpty else { return }
+                var details = result.unconfirmedHosts.map { $0 + " - no host report" }
+                for station in result.stations {
+                    var lines = station.pendingMembers.map { $0 + " - no current eligible process review" }
+                    if station.serverCount == nil {
+                        lines.insert("Select this Station and review its servers to check its processes.", at: 0)
+                    } else {
+                        lines += station.unconfirmedServers.map { $0 + " - no server report" }
+                        lines += station.unanswered.map { $0.memberID + " / " + $0.slot + " - no process report" }.sorted()
+                    }
+                    if !lines.isEmpty { details.append(([station.origin] + lines).joined(separator: "\n")) }
+                }
+                guard !details.isEmpty else { return }
                 let alert = NSAlert()
                 alert.messageText = "Process check"
                 alert.informativeText = summary
-                let missing = result.unanswered.map { $0.memberID + " / " + $0.slot + " - no report" }.sorted()
-                let pending = result.pendingMembers.map { $0 + " - no current eligible review" }
-                let unavailable = result.unconfirmedServers.map { $0 + " - no live Station server report" }
-                let missingHosts = result.unconfirmedHosts.map { $0 + " - no live host report" }
-                alert.accessoryView = processEditor((unavailable + missingHosts + pending + missing).joined(separator: "\n"), editable: false).0
+                alert.accessoryView = processEditor(details.joined(separator: "\n\n"), editable: false).0
                 alert.addButton(withTitle: "Done")
                 alert.runModal()
-            } catch { if generation == epoch { status.stringValue = error.localizedDescription } }
+            } catch {
+                if generation == epoch {
+                    status.stringValue = (checkingStation.map { $0 + "\n" } ?? "") + error.localizedDescription
+                }
+            }
         }
         render()
     }
