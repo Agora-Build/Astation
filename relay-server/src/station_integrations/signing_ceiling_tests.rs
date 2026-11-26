@@ -519,9 +519,13 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
         .register_new_key(account, &genesis, &format!("svc-{other}"), fingerprint)
         .await
         .unwrap();
+    let unrelated = "i-88888888888888888888888888";
     let source = json!({"changes":[],"cursor":prev.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
         "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":fingerprint,
         "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    },{
+        "id":unrelated,"ownerAccount":OWNER,"state":"ready","scopes":["agent.view"],
+        "r9Svc":fingerprint,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
     },{
         "id":other,"ownerAccount":"ab00000000000000000000000001","state":"ready","scopes":["agent.view"],
         "r9Svc":fingerprint,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
@@ -550,7 +554,9 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(provisioned.len(), 1);
     assert_eq!(provisioned[0]["key_fingerprint"], fingerprint);
     assert_eq!(provisioned[0]["portal_observation"]["interrupt_running"], true);
-    assert_eq!(portal["portal_keys_without_attribution"], json!([]));
+    let unattributed = &portal["portal_keys_without_attribution"];
+    assert_eq!(unattributed.as_array().unwrap().len(), 1);
+    assert_eq!(unattributed[0]["service_id"], format!("svc-{unrelated}"));
     assert_eq!(portal["services"], json!([]));
     assert_eq!(portal["protected_service_keys"][0]["signing_reservation"],
         json!({"highest_reserved_ms":ceiling}));
@@ -615,7 +621,7 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(row["key_fingerprint"], fingerprint);
     assert_eq!(row["signing_reservation"], json!({"status":"missing"}));
     assert_eq!(row["portal_observation"]["state"], "revoked");
-    assert_eq!(evidence["portal_keys_without_attribution"], json!([]));
+    assert_eq!(&evidence["portal_keys_without_attribution"], unattributed);
     assert_eq!(evidence["provisioned_without_membership"], json!([]));
     assert_eq!(evidence["provisioning_without_fingerprint"], json!([]));
     assert_eq!(restored["recovery_ready"], false);
@@ -627,7 +633,7 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     let metadata = &without_key["portal_service_evidence"];
     assert_eq!(metadata["envelopes_without_provisioning"], json!([id]));
     assert!(metadata.get("protected_service_keys").is_none());
-    assert_eq!(metadata["portal_keys_without_attribution"][0]["service_id"], id);
+    assert_eq!(&metadata["portal_keys_without_attribution"], unattributed);
     let wrapping = crate::service_keys::ServiceKeyVault::new(&[83; 32], "other-operator").unwrap();
     let unreadable = plan::prepare_with_sources(&replica, &fence, &genesis, Some(store),
         Some(&runtime.binding), Some(&wrapping)).await.unwrap();
@@ -641,12 +647,21 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     let source = &unassigned["portal_service_evidence"];
     assert_eq!(source["services"], json!([]));
     assert_eq!(source["provisioned_without_membership"], json!([]));
-    let keys = source["portal_keys_without_attribution"].as_array().unwrap();
-    assert_eq!(keys.len(), 1, "the other Agora.Build owner's row stays private");
-    assert_eq!(keys[0]["service_id"], id);
-    assert_eq!(keys[0]["portal_observation"]["state"], "revoked");
-    assert_eq!(keys[0]["portal_observation"]["interrupt_running"], true);
-    assert!(keys[0].get("snapshot_review").is_none());
+    assert_eq!(&source["portal_keys_without_attribution"], unattributed);
+    let prior = source["prior_signing_registrations"].as_array().unwrap();
+    let stopped = prior.iter().find(|row| row["service_id"] == id).unwrap();
+    assert_eq!(stopped["key_fingerprint"], fingerprint);
+    assert_eq!(stopped["highest_observed_ms"], ceiling);
+    assert_eq!(stopped["portal_observation"]["state"], "revoked");
+    assert_eq!(stopped["portal_observation"]["interrupt_running"], true);
+    assert!(stopped.get("snapshot_review").is_none());
+    let disconnected = plan::prepare_with_sources(&replica, &fence, &genesis, None,
+        Some(&runtime.binding), None).await.unwrap();
+    let evidence = &disconnected["portal_service_evidence"];
+    assert!(evidence["registrations_without_membership"].is_null());
+    assert_eq!(&evidence["portal_keys_without_attribution"], unattributed);
+    assert!(evidence["prior_signing_registrations"].as_array().unwrap().contains(stopped));
+    assert_eq!(disconnected["recovery_ready"], false);
     assert_ne!(saved["portal_service_evidence_hash"], unassigned["portal_service_evidence_hash"]);
     assert_eq!(unassigned["recovery_ready"], false);
     drop(runtime);

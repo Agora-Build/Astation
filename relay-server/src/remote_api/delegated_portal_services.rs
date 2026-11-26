@@ -20,6 +20,7 @@ pub(super) async fn observe(
     subject: &str,
     log: &Membership,
     registrations: Option<&[Reservation]>,
+    observed_registrations: &[Reservation],
     review: &Value,
 ) -> Result<Value, sqlx::Error> {
     if portal.station_origin != fence.origin {
@@ -224,11 +225,17 @@ pub(super) async fn observe(
 
     // A registration may outlive an enrollment or its failed provisioning transaction.
     // Keep such keys outside signed membership, including unused registrations.
-    if let Some(rows) = registrations {
-        attributed_keys.extend(
-            rows.iter()
-                .map(|r| (r.service_id.clone(), r.key_hash.clone())),
-        );
+    // An independent registration observed for this exact list still identifies
+    // the service after a restore. Only the live store can confirm its ceiling.
+    let mut prior_registrations = Vec::new();
+    for row in observed_registrations {
+        attributed_keys.insert((row.service_id.clone(), row.key_hash.clone()));
+        let key = (row.service_id.as_str(), row.key_hash.as_str());
+        let current = ceilings.as_ref().and_then(|rows| rows.get(&key));
+        if current.is_none_or(|highest| *highest < row.highest_ms) {
+            prior_registrations.push(json!({"service_id":row.service_id,"key_fingerprint":row.key_hash,
+                "highest_observed_ms":row.highest_ms,"portal_observation":observation(&row.service_id, &row.key_hash)}));
+        }
     }
     let unmatched = registrations.map(|rows| rows.iter().filter(|row|
         !services.contains_key(&(row.service_id.clone(), row.key_hash.clone())))
@@ -276,6 +283,9 @@ pub(super) async fn observe(
         "portal_keys_without_attribution":unattributed,"services":rows});
     if vault.is_some() {
         evidence["protected_service_keys"] = json!(protected);
+    }
+    if !prior_registrations.is_empty() {
+        evidence["prior_signing_registrations"] = json!(prior_registrations);
     }
     if !missing_provisioning.is_empty() {
         evidence["envelopes_without_provisioning"] = json!(missing_provisioning);
