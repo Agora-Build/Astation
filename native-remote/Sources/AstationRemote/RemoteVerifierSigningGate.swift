@@ -235,11 +235,13 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         return deadline.partialValue
     }
 
-    func hasHostReport(_ welcome: WelcomeInfo, id: String, receivedAt: UInt64) -> Bool {
+    func hasHostReport(_ welcome: WelcomeInfo, id: String, receivedAt: UInt64, requirement: VerifierRequirement?) -> Bool {
         let current = now()
         guard let deadline = hostDeadline(welcome, id: id, receivedAt: receivedAt, current: current),
-              current < deadline, let inventory = welcome.verifier else { return false }
-        return (try? Self.validateInventory(inventory)) != nil
+              current < deadline, let inventory = welcome.verifier,
+              (try? Self.validateInventory(inventory)) != nil else { return false }
+        guard let requirement else { return true }
+        return inventory.version >= requirement.minimumVersion && inventory.actions.contains(requirement.action)
     }
 
     private func observe(_ inventory: VerifierInventory?, on connection: Connection,

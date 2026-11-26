@@ -814,14 +814,15 @@ final class AstationRecoveryCoordinator {
                     try authorizeNewOperations(committed)
                     guard let authorizeNewMembership else { throw RemoteVerifierGateError.unconfirmedVerifiers }
                     try authorizeNewMembership(request, committed)
-                    authorizeInventory = authorizeNewMembership
+                    authorizeInventory = { request, log in
+                        try authorizeNewOperations(log)
+                        try authorizeNewMembership(request, log)
+                    }
                 } else { authorizeInventory = nil }
                 guard await confirmServiceOwner(approval, request), current() else { throw RemoteRecoveryError.confirmationRequired }
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
-                // A disconnect or host replacement during owner authentication cancels unsigned consent.
-                if !review.requiredHostFeatures.isEmpty { try authorizeNewOperations?(latest) }
                 try authorizeInventory?(request, latest)
                 let snapshot = latest.snapshot()
                 let signer = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
@@ -1512,6 +1513,33 @@ extension AstationRecoveryCoordinator {
         let unconfirmedHosts: [String]
         var answered = 0
         var unanswered: [RemoteMemberVerifierSlot] = []
+    }
+
+    /// One unsigned approval owns these channel generations until its key is used.
+    /// An exact retry of a previously signed append never invokes this check.
+    func serviceHostVerifier(for approval: RemoteServiceApproval, current: @escaping () -> Bool,
+        channels: @escaping (RemoteVerifierSigningGate, VerifierRequirement) -> [String: Set<UUID>]
+    ) throws -> (MembershipLog) throws -> Void {
+        let requirement = try membershipRequiredVersion(bodyJson: approval.bodyJSON)
+        var checked: (roster: RemoteStationVerifierRoster, gate: RemoteVerifierSigningGate, links: [String: Set<UUID>])?
+        return { [weak self] log in
+            guard let requirement else { return }
+            guard let self, current(), !Task.isCancelled, !self.uncertain,
+                  log.accountId() == self.accountID, log.genesisHash() == approval.genesisHash,
+                  log.head() == self.membershipLog?.head(), self.membershipLog?.frozen() == nil
+            else { throw RemoteVerifierGateError.staleMembership }
+            try self.requireDurableRecoveryCheckpoint()
+            guard let roster = try self.acceptedStationVerifierRoster() else { throw RemoteVerifierGateError.invalidRoster }
+            if let checked, roster != checked.roster { throw RemoteVerifierGateError.staleMembership }
+            let gate = try checked?.gate ?? RemoteVerifierSigningGate(log: log, station: roster, now: self.verifierTime)
+            try gate.requireMembership(log)
+            let live = channels(gate, requirement)
+            guard gate.enrolledHostIDs.allSatisfy({ live[$0]?.isEmpty == false }) else {
+                throw RemoteVerifierGateError.unconfirmedVerifiers
+            }
+            if let checked, checked.links != live { throw RemoteVerifierGateError.staleConnection }
+            checked = (roster, gate, live)
+        }
     }
 
     func checkMemberProcesses(current: @escaping @MainActor @Sendable () -> Bool,

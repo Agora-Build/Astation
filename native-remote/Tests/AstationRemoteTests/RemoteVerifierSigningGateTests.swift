@@ -316,6 +316,26 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
     }
 
     @MainActor
+    func testEncryptedHostReportMustSupportExactServiceOperationRequirement() async throws {
+        let f = try VerifierFixture()
+        let requirement = VerifierRequirement(action: "add", minimumVersion: 1)
+        var tick: UInt64 = 100
+        let (gate, _) = try f.confirmedGate(now: { tick })
+        for (inventory, supports) in [(VerifierInventory(version: 1, actions: ["add"]), true),
+                                      (VerifierInventory(version: 2, actions: ["set_roles"]), false)] {
+            let link = VerifierChannelHarness(gate: gate, welcome: f.welcome(inventory: inventory), now: { tick })
+            tick = 100
+            try await link.welcome()
+            XCTAssertTrue(link.channel.hasLiveVerifierReport(hostID: "host", in: gate))
+            XCTAssertEqual(link.channel.hasLiveVerifierReport(hostID: "host", in: gate, requirement: requirement), supports)
+            XCTAssertFalse(link.channel.hasLiveVerifierReport(hostID: "host", in: gate,
+                requirement: VerifierRequirement(action: "add", minimumVersion: 3)))
+            tick = 1_100
+            XCTAssertFalse(link.channel.hasLiveVerifierReport(hostID: "host", in: gate, requirement: requirement))
+        }
+    }
+
+    @MainActor
     func testInspectingAnExistingChannelUsesItsOriginalWelcomeAndCannotAuthorizeSigning() async throws {
         let f = try VerifierFixture()
         var tick: UInt64 = 100

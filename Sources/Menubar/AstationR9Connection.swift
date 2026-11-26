@@ -107,9 +107,9 @@ final class AstationR9Connection {
         router.receive(bytes, generation: generation)
     }
 
-    func hasLiveVerifierReport(in gate: RemoteVerifierSigningGate) -> Bool {
+    func hasLiveVerifierReport(in gate: RemoteVerifierSigningGate, requirement: VerifierRequirement?) -> Bool {
         guard isCurrent, let membershipLog, (try? gate.requireMembership(membershipLog)) != nil else { return false }
-        return channel?.hasLiveVerifierReport(hostID: context.device, in: gate) == true
+        return channel?.hasLiveVerifierReport(hostID: context.device, in: gate, requirement: requirement) == true
     }
 
     func send(_ message: AstationMessage) -> Bool {

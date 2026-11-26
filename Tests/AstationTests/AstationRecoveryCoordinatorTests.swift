@@ -1499,7 +1499,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
-    private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64) async throws
+    private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64, hostID: String = "host-a") async throws
         -> (RemotePairingCommit, RemotePairingReveal, AtemVerifyKeys) {
         let keys = try await coordinator.pairingKeys(nonce: Data(repeating: 8, count: 32))
         let reveal = try RemotePairingReveal(originalJSON: JSONSerialization.data(withJSONObject: [
@@ -1510,7 +1510,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 "host_channel_pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation),
                 "nonce": Data(repeating: 9, count: 32).base64EncodedString()
             ]]))
-        let commit = try RemotePairingCommit(context: RemotePairingContext(accountID: "account-a", hostID: "host-a", linkGeneration: UUID()),
+        let commit = try RemotePairingCommit(context: RemotePairingContext(accountID: "account-a", hostID: hostID, linkGeneration: UUID()),
             hostTrustGeneration: generation, commitment: reveal.commitment())
         return (commit, reveal, keys)
     }
@@ -1835,6 +1835,48 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testServiceApprovalRequiresOutOfScopeHostAndRejectsReplacedChannelAtKey() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in }, confirmVerifierRoster: { _ in true })
+        _ = try await coordinator.setup()
+        for id in ["host-a", "host-b"] {
+            let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1, hostID: id)
+            let draft = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+            _ = try await coordinator.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        }
+        let roster = try await coordinator.prepareStationVerifierRoster(current: { true })
+        try await coordinator.acceptStationVerifierRoster(roster, current: { true })
+        let approval = try await service(coordinator, operations: ["launch", "view"])
+        try await coordinator.prepareService(approval)
+        let portal = try portal(ServiceApprovalPortal())
+        let original = UUID(), other = UUID()
+        let before = h.identityCryptography.signingCalls
+        let confirmations = h.ownerRequests.count
+        let incomplete = try coordinator.serviceHostVerifier(for: approval, current: { true }) { gate, required in
+            XCTAssertEqual(gate.enrolledHostIDs, ["host-a", "host-b"])
+            XCTAssertEqual(required.action, "add")
+            return ["host-a": [original]]
+        }
+        do {
+            _ = try await coordinator.approveService(approval, portal: portal, authorizeNewOperations: incomplete, current: { true })
+            XCTFail("An offline host outside this service's scope still verifies the account list")
+        } catch { XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers) }
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        var checks = 0
+        let replaced = try coordinator.serviceHostVerifier(for: approval, current: { true }) { _, _ in
+            checks += 1
+            return ["host-a": [original], "host-b": [checks < 3 ? other : UUID()]]
+        }
+        do {
+            _ = try await coordinator.approveService(approval, portal: portal, authorizeNewOperations: replaced, current: { true })
+            XCTFail("Replacement at the private key must cancel this signature")
+        } catch { XCTAssertTrue(error is AtemError, "UniFFI wraps the refusal at the key provider") }
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        XCTAssertEqual(checks, 3)
+        XCTAssertEqual(h.identityCryptography.signingCalls, before)
+        XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
     }
 
     func testNewServiceOperationsRecheckInventoryAfterConfirmationAndAtTheKeyBoundary() async throws {
