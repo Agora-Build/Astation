@@ -55,6 +55,10 @@ impl FeedBinding {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| ())
     }
+
+    pub(crate) fn report_control_binding(&self) -> String {
+        serde_json::json!([self.issuer, self.portal_origin, self.station_origin]).to_string()
+    }
 }
 
 pub(crate) fn client_id(value: &str, prefix: &str) -> bool {

@@ -786,6 +786,15 @@ This component does not publish a replacement snapshot or reopen recovery.
 
 ### Portal service observations during recovery
 
+With report-client configuration, `prepare` archives the Station-wide reporting
+journal under its issuer, Portal and Station origins. It saves the ordered
+events, outstanding delivery claim and consumed resume IDs together while the
+recovery fence is locked. Accounts and replicas share one copy of each distinct
+observation. The operator sees the current evidence hash, the number of retained
+observations, and whether any ended with a stopped client or outstanding delivery.
+A missing live journal has a null current hash. Earlier observations remain
+available to reconcile before reopening. Preparation sends no report or resume.
+
 A Station in recovery review mode fetches the existing authenticated Portal checkpoint
 after observing its configured closed generation. At commit it takes a shared lock
 on the same fence and compares the policy revision. A late response from a previous
