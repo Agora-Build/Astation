@@ -428,6 +428,17 @@ mod tests {
         assert_eq!(separate["reporting_history"]["distinct_journals"], 0);
         assert!(separate["reporting_history"]["current_evidence_hash"].is_null());
 
+        sqlx::query("UPDATE station_delegated_reporting SET in_flight=NULL WHERE binding=$1")
+            .bind(&key).execute(&db.pool).await.unwrap();
+        let restored = crate::remote_api::recovery::delegated_recovery::plan::reporting_history::restore_stop(
+            &replica, &fence, &runtime.binding, report["retained_stop_or_claim_hash"].as_str().unwrap(),
+        ).await.unwrap();
+        assert_eq!(restored["outstanding_delivery"], true);
+        assert_eq!(restored["stopped"], false);
+        let held: String = sqlx::query_scalar("SELECT in_flight FROM station_delegated_reporting WHERE binding=$1")
+            .bind(&key).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(held, claim);
+
         // A later restore can retain a stop instead of the outstanding delivery.
         let events = json!([ReportControlEvent::Stop(runtime.binding.report_client_id.clone())]);
         sqlx::query("UPDATE station_delegated_reporting SET events=$2,in_flight=NULL WHERE binding=$1")
@@ -448,6 +459,12 @@ mod tests {
         assert!(missing["reporting_history"]["current_evidence_hash"].is_null());
         assert_eq!(missing["reporting_history"]["distinct_journals"], 2);
         assert_eq!(missing["recovery_ready"], false);
+        assert!(missing["reporting_history"]["retained_stop_or_claim_hash"].is_string());
+        // Neither archive contains the other's event prefix.
+        let candidate = missing["reporting_history"]["retained_stop_or_claim_hash"].as_str().unwrap();
+        assert!(crate::remote_api::recovery::delegated_recovery::plan::reporting_history::restore_stop(
+            &replica, &next, &runtime.binding, candidate,
+        ).await.is_err());
         drop((runtime, replica));
         db.cleanup().await;
     }
@@ -504,6 +521,70 @@ mod tests {
         assert_eq!(sqlx::query_scalar::<_,Value>("SELECT events FROM station_delegated_reporting WHERE binding=$1")
             .bind(&key).fetch_one(&db.pool).await.unwrap(), events);
         drop(runtime);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_restore_report_stop_is_scoped_atomic_and_idempotent() {
+        use crate::remote_api::recovery::delegated_recovery::{plan::{prepare_with_sources, reporting_history::restore_stop}, Binding};
+        let origin = "https://station-dev.agora.build";
+        let (db, runtime, _) = super::super::tests::fixture_at_station("https://auth.example", None, origin).await;
+        runtime.app.recovery.configure_delegated(origin, 1).await.unwrap();
+        let genesis = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        let portal = &runtime.binding;
+        let key = portal.report_control_binding();
+        let resume = uuid::Uuid::new_v4().to_string();
+        runtime.initialize_report_control(Some(&resume)).await.unwrap();
+        let fence = Binding::new(origin, 2).unwrap();
+        fence.initialize(&db.pool, true).await.unwrap();
+        let running = prepare_with_sources(&db.pool, &fence, &genesis, None, Some(portal), None).await.unwrap();
+        let hash = running["reporting_history"]["current_evidence_hash"].as_str().unwrap();
+        assert!(restore_stop(&db.pool, &fence, portal, hash).await.is_err());
+
+        let stopped = json!([ReportControlEvent::Stop(portal.report_client_id.clone())]);
+        let events: Value = sqlx::query_scalar("UPDATE station_delegated_reporting SET events=events || $2
+            WHERE binding=$1 RETURNING events").bind(&key).bind(stopped).fetch_one(&db.pool).await.unwrap();
+        let archive = prepare_with_sources(&db.pool, &fence, &genesis, None, Some(portal), None).await.unwrap();
+        let hash = archive["reporting_history"]["current_evidence_hash"].as_str().unwrap();
+        assert_eq!(archive["reporting_history"]["retained_stop_or_claim_hash"], hash);
+        let mut wrong_portal = portal.clone();
+        wrong_portal.portal_origin = "https://another-portal.example".into();
+        assert!(restore_stop(&db.pool, &fence, &wrong_portal, hash).await.is_err());
+
+        sqlx::query("DELETE FROM station_delegated_report_resumptions WHERE binding=$1")
+            .bind(&key).execute(&db.pool).await.unwrap();
+        sqlx::query("DELETE FROM station_delegated_reporting WHERE binding=$1")
+            .bind(&key).execute(&db.pool).await.unwrap();
+        sqlx::raw_sql("CREATE FUNCTION reject_restored_stop() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'injected commit failure'; END; $$;
+            CREATE CONSTRAINT TRIGGER reject_restored_stop AFTER INSERT ON station_delegated_reporting
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_restored_stop()")
+            .execute(&db.pool).await.unwrap();
+        assert!(restore_stop(&db.pool, &fence, portal, hash).await.is_err());
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM station_delegated_reporting WHERE binding=$1)")
+            .bind(&key).fetch_one(&db.pool).await.unwrap();
+        assert!(!exists);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_delegated_report_resumptions WHERE binding=$1")
+            .bind(&key).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER reject_restored_stop ON station_delegated_reporting")
+            .execute(&db.pool).await.unwrap();
+        let replica = db.reconnect(2).await;
+        let (one, two) = tokio::join!(restore_stop(&db.pool, &fence, portal, hash),
+            restore_stop(&replica, &fence, portal, hash));
+        let receipt = one.unwrap();
+        assert_eq!(two.unwrap(), receipt);
+        assert_eq!(receipt["stopped"], true);
+        assert_eq!(receipt["recovery_ready"], false);
+        let restored: Value = sqlx::query_scalar("SELECT events FROM station_delegated_reporting WHERE binding=$1")
+            .bind(&key).fetch_one(&replica).await.unwrap();
+        assert_eq!(restored, events);
+        let ids: Vec<String> = sqlx::query_scalar("SELECT resume_id::text FROM station_delegated_report_resumptions WHERE binding=$1")
+            .bind(&key).fetch_all(&replica).await.unwrap();
+        assert_eq!(ids, vec![resume]);
+        assert!(restore_stop(&replica, &Binding::new(origin, 1).unwrap(), portal, hash).await.is_err());
+        drop((runtime, replica));
         db.cleanup().await;
     }
 

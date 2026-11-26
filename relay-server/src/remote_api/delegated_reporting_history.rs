@@ -5,6 +5,61 @@ use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 
+/// Restore an operator-selected stopped or outstanding journal while all
+/// reporters are fenced. An enabled observation cannot authorize a resume.
+pub(crate) async fn restore_stop(
+    pool: &sqlx::PgPool,
+    fence: &Binding,
+    portal: &FeedBinding,
+    expected: &str,
+) -> Result<Value, sqlx::Error> {
+    if portal.station_origin != fence.origin || !super::super::canonical_genesis(expected) {
+        return Err(invalid());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout='5s'").execute(&mut *tx).await?;
+    fence.lock_mode(&mut tx, false).await?;
+    let key = portal.report_control_binding();
+    let archive: Option<Value> = sqlx::query_scalar(
+        "SELECT CASE WHEN octet_length(journal::text) <= $4 THEN journal END
+         FROM station_delegated_reporting_history WHERE origin=$1 AND binding=$2 AND evidence_hash=$3
+         AND first_generation <= $5",
+    )
+    .bind(&fence.origin).bind(&key).bind(expected).bind(MAX_STATE as i64).bind(fence.generation)
+    .fetch_one(&mut *tx).await?;
+    let archive = archive.ok_or_else(invalid)?;
+    if source_hash(&archive)? != expected {
+        return Err(invalid());
+    }
+    let proposed: Vec<ReportControlEvent> =
+        serde_json::from_value(archive["events"].clone()).map_err(|_| invalid())?;
+    let claim: Option<String> = serde_json::from_value(archive["in_flight"].clone()).map_err(|_| invalid())?;
+    let stopped = matches!(proposed.last(), Some(ReportControlEvent::Stop(_)));
+    if proposed.is_empty() || (!stopped && claim.is_none()) {
+        return Err(invalid());
+    }
+
+    sqlx::query("INSERT INTO station_delegated_reporting(binding,events,in_flight)
+                 VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+        .bind(&key).bind(&archive["events"]).bind(&claim).execute(&mut *tx).await?;
+    let (live, pending): (Value, Option<String>) = sqlx::query_as(
+        "SELECT events,in_flight FROM station_delegated_reporting WHERE binding=$1 FOR UPDATE",
+    ).bind(&key).fetch_one(&mut *tx).await?;
+    let live: Vec<ReportControlEvent> = serde_json::from_value(live).map_err(|_| invalid())?;
+    if !proposed.starts_with(&live) || pending.is_some() && pending != claim
+        || reconcile_report_restart(&mut tx, portal, &proposed, claim.as_deref()).await? {
+        return Err(invalid());
+    }
+    if live != proposed || pending != claim {
+        sqlx::query("UPDATE station_delegated_reporting SET events=$2,in_flight=$3 WHERE binding=$1")
+            .bind(&key).bind(&archive["events"]).bind(&claim).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(json!({"generation":fence.generation.to_string(),"source_evidence_hash":expected,
+        "retained_events":proposed.len(),"stopped":stopped,"outstanding_delivery":claim.is_some(),
+        "recovery_ready":false}))
+}
+
 /// Validate event history and restore consumed resume IDs under the journal
 /// and deployment locks. A lost delivery claim requires a fresh explicit resume.
 pub(crate) async fn reconcile_report_restart(
@@ -120,8 +175,14 @@ pub(super) async fn retain(
     )
     .bind(&fence.origin)
     .bind(&binding)
-    .fetch_one(connection)
+    .fetch_one(&mut *connection)
     .await?;
+    let candidate: Option<String> = sqlx::query_scalar(
+        "SELECT evidence_hash FROM station_delegated_reporting_history WHERE origin=$1 AND binding=$2
+         AND ((journal->'events'->-1) ? 'Stop' OR journal->'in_flight' <> 'null'::jsonb)
+         ORDER BY jsonb_array_length(journal->'events') DESC, first_generation DESC, evidence_hash LIMIT 1",
+    ).bind(&fence.origin).bind(&binding).fetch_optional(connection).await?;
     Ok(json!({"current_evidence_hash":current, "distinct_journals":observations.0,
+        "retained_stop_or_claim_hash":candidate,
         "observed_stopped_client":observations.1, "observed_uncertain_delivery":observations.2}))
 }

@@ -808,6 +808,18 @@ delivery claim that disappeared requires a fresh explicit resume unless the
 live journal already records a subsequent resume. These checks apply before
 the worker can send its first report.
 
+If the restored journal lost a stop or an outstanding delivery, run
+`station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>`
+with the same Portal reporting configuration, while the recovery generation is
+closed. The preparation report includes `reporting_history.retained_stop_or_claim_hash`
+when an archived observation ended with either condition. An earlier preparation's
+saved hash can also identify the source. Station verifies the selected archive
+against the live row and all other observations. Incompatible histories require
+reconciliation. On success it restores the exact stopped event sequence or
+outstanding claim and the consumed resume IDs in one transaction. Repeating the
+command returns the same receipt. The reporting worker stays held until its
+normal explicit resume, and the deployment recovery fence stays closed.
+
 A Station in recovery review mode fetches the existing authenticated Portal checkpoint
 after observing its configured closed generation. At commit it takes a shared lock
 on the same fence and compares the policy revision. A late response from a previous
