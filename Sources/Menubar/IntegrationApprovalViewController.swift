@@ -402,7 +402,7 @@ final class IntegrationApprovalViewController: NSViewController {
                 let verifyAdditionalStations = coordinator.serviceAdditionalStationVerifier(for: approval,
                     current: { context?() == true }, transport: hub.verifierTransport(for:current:))
                 let verifyMembers = coordinator.serviceMemberProcessVerifier(for: approval,
-                    current: { context?() == true }, transport: hub.verifierTransport(current:))
+                    current: { context?() == true }, transport: hub.verifierTransport(for:current:))
                 let result = try await coordinator.approveService(approval, portal: portal,
                     authorizeNewOperations: { [hub] log in
                         try hub.validateServiceHosts(review, log: log)
