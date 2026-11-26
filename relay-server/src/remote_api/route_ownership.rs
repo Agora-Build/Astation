@@ -1,4 +1,5 @@
 //! Ownership evidence for proved routes on the built-in Station.
+use super::super::HostBinding;
 use super::{invalid_root, Membership, Root};
 use crate::auth::session_id_for_room;
 use crate::identity_store::BINDING_TTL_SECS;
@@ -15,20 +16,24 @@ pub(in crate::remote_api::recovery) async fn observe(
     origin: &str,
     issuer: &str,
     genesis: &str,
-    room: &str,
+    rooms: &[&str],
 ) -> Result<(), sqlx::Error> {
+    if rooms.is_empty() {
+        return Ok(());
+    }
+    let sessions: Vec<_> = rooms.iter().map(|room| session_id_for_room(room)).collect();
     sqlx::query(
         "INSERT INTO station_proved_room_owners AS retained
            (station_origin,issuer,genesis_hash,room,account_subject,conflicted)
-         SELECT $1,$2,$3,$4,i.subject,
+         SELECT $1,$2,$3,r.room,i.subject,
                 direct.astation_id IS NOT NULL AND direct.agora_user <> a.agora_user
-         FROM astation_accounts a
+         FROM unnest($4::text[], $5::text[]) AS r(room, session)
+         LEFT JOIN session_bindings s ON s.session_id=r.session
+           AND s.last_used_at > floor(extract(epoch FROM statement_timestamp()))::bigint - $6
+         JOIN astation_accounts a ON a.astation_id=CASE WHEN r.session IS NULL THEN r.room ELSE s.astation_id END
          JOIN account_identities i ON i.principal=a.agora_user AND i.issuer=$2
-         LEFT JOIN astation_accounts direct ON direct.astation_id=$4
-         WHERE a.astation_id = CASE WHEN $5::text IS NULL THEN $4 ELSE (
-             SELECT s.astation_id FROM session_bindings s WHERE s.session_id=$5
-             AND s.last_used_at > floor(extract(epoch FROM statement_timestamp()))::bigint - $6
-         ) END AND i.subject ~ '^ab[0-9A-HJKMNP-TV-Z]{26}$'
+         LEFT JOIN astation_accounts direct ON direct.astation_id=r.room
+         WHERE i.subject ~ '^ab[0-9A-HJKMNP-TV-Z]{26}$'
          ON CONFLICT (station_origin,issuer,genesis_hash,room)
          DO UPDATE SET conflicted=TRUE WHERE NOT retained.conflicted AND
              (retained.account_subject <> EXCLUDED.account_subject OR EXCLUDED.conflicted)",
@@ -36,12 +41,96 @@ pub(in crate::remote_api::recovery) async fn observe(
     .bind(origin)
     .bind(issuer)
     .bind(genesis)
-    .bind(room)
-    .bind(session_id_for_room(room))
+    .bind(rooms)
+    .bind(sessions)
     .bind(BINDING_TTL_SECS)
     .execute(connection)
     .await?;
     Ok(())
+}
+
+fn routes<'a>(
+    root: &'a Root,
+    log: &'a Membership,
+) -> impl Iterator<Item = (&'static str, &'a String, &'a HostBinding, bool)> + 'a {
+    [("relay", &root.routes), ("proxy", &root.proxies)]
+        .into_iter()
+        .flat_map(move |(carrier, routes)| {
+            routes.iter().map(move |(host, route)| {
+                let proved = log.frozen().is_none()
+                    && route.host == *host
+                    && route.proxy.is_some() == (carrier == "proxy")
+                    && log
+                        .host(host)
+                        .is_some_and(|h| h.host_trust_gen == route.host_trust_gen)
+                    && route.valid(log);
+                (carrier, host, route, proved)
+            })
+        })
+}
+
+pub(crate) async fn migrate(
+    pool: &sqlx::PgPool,
+    origin: &str,
+    issuer: &str,
+    genesis: &str,
+) -> Result<Value, sqlx::Error> {
+    use crate::remote_api::recovery::{now, MAX_STATE};
+    if !super::canonical_genesis(genesis)
+        || !crate::account_identity::built_in_station(origin)
+        || !crate::account_identity::station_origin(issuer)
+    {
+        return Err(invalid_root());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='5s'")
+        .execute(&mut *tx)
+        .await?;
+    let state: Option<Value> = sqlx::query_scalar(
+        "SELECT CASE WHEN octet_length(state::text) <= $2 THEN state END
+         FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE",
+    )
+    .bind(genesis)
+    .bind(MAX_STATE as i64)
+    .fetch_one(&mut *tx)
+    .await?;
+    let root: Root =
+        serde_json::from_value(state.ok_or_else(invalid_root)?).map_err(|_| invalid_root())?;
+    let hash = atem_client::Hash32::from_hex(genesis).map_err(|_| invalid_root())?;
+    let mut log = Membership::from_stored(&root.account, &hash, &root.membership)
+        .map_err(|_| invalid_root())?;
+    log.advance(&now());
+    let mut rooms = BTreeSet::new();
+    let mut stale_routes = 0;
+    for (_, _, route, proved) in routes(&root, &log) {
+        if proved {
+            rooms.insert(route.room.as_str());
+        } else {
+            stale_routes += 1;
+        }
+    }
+    let rooms: Vec<_> = rooms.into_iter().collect();
+    observe(&mut tx, origin, issuer, genesis, &rooms).await?;
+    let (known, disputed): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE NOT conflicted), count(*) FILTER (WHERE conflicted)
+         FROM station_proved_room_owners WHERE station_origin=$1 AND issuer=$2
+         AND genesis_hash=$3 AND room=ANY($4)",
+    )
+    .bind(origin)
+    .bind(issuer)
+    .bind(genesis)
+    .bind(&rooms)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(
+        json!({"proved_rooms":rooms.len(),"with_registration_evidence":known,
+        "disputed":disputed,"without_registration_evidence":rooms.len() as i64-known-disputed,
+        "stale_routes":stale_routes}),
+    )
 }
 
 pub(super) async fn inspect(
@@ -77,23 +166,11 @@ pub(super) async fn inspect(
         None => "unobserved",
     };
 
-    let mut rows = Vec::new();
-    let mut rooms = BTreeSet::new();
-    for (carrier, routes) in [("relay", &root.routes), ("proxy", &root.proxies)] {
-        for (host, route) in routes {
-            let proved = log.frozen().is_none()
-                && route.host == *host
-                && log
-                    .host(host)
-                    .is_some_and(|h| h.host_trust_gen == route.host_trust_gen)
-                && route.proxy.is_some() == (carrier == "proxy")
-                && route.valid(log);
-            if proved {
-                rooms.insert(route.room.as_str());
-            }
-            rows.push((carrier, host, route, proved));
-        }
-    }
+    let rows: Vec<_> = routes(root, log).collect();
+    let rooms: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|(_, _, route, proved)| proved.then_some(route.room.as_str()))
+        .collect();
 
     let session_ids: Vec<_> = rooms
         .iter()

@@ -9,6 +9,7 @@ use sqlx::{PgConnection, PgPool};
 
 #[path = "route_ownership.rs"]
 pub(super) mod route_ownership;
+pub(crate) use route_ownership::migrate as migrate_room_owners;
 
 #[path = "delegated_recovery_plan.rs"]
 pub(crate) mod plan;

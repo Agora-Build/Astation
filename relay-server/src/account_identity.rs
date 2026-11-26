@@ -249,6 +249,14 @@ pub(crate) fn built_in_station(origin: &str) -> bool {
     matches!(origin, BUILT_IN_STATION_ORIGIN | "https://station-dev.agora.build")
 }
 
+pub(crate) fn room_ownership_scope(
+    public_origin: Option<&str>, audience: Option<&str>, issuer: Option<&str>,
+) -> Option<(String, String)> {
+    let origin = configured_integration_origin(public_origin, audience?).ok()?;
+    let issuer = issuer.filter(|issuer| station_origin(issuer))?;
+    built_in_station(&origin).then(|| (origin, issuer.to_owned()))
+}
+
 pub(crate) fn configured_integration_origin(
     public_origin: Option<&str>,
     audience: &str,
