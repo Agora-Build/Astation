@@ -704,6 +704,32 @@ async fn postgres_delegated_inspection_resolves_proved_route_owners_across_repli
             assert!(!report.to_string().contains(private));
         }
     }
+    // A replacement report credential may already know a later binding at
+    // the same Portal cursor. The older credential cannot resolve a room.
+    let mut rotated = portal.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let mut prior = policies.load(&rotated).await.unwrap();
+    body["checkpoint"]["bindings"][0]["bindingState"] = json!("bound");
+    for version in [4, 5] {
+        body["checkpoint"]["bindings"][0]["version"] = json!(version);
+        let source = PortalCheckpoint::parse(&serde_json::to_vec(&body).unwrap(), &rotated).unwrap();
+        let next = prior.apply_checkpoint(source, 1).unwrap();
+        policies.commit(&prior, &next).await.unwrap();
+        prior = next;
+        let report = inspect().await.unwrap();
+        let ownership = &report["root"]["route_ownership"];
+        assert_eq!(ownership["last_observed_binding"], "superseded_or_conflicting");
+        assert!(ownership["binding_matches_root_owner"].is_null());
+        assert!(ownership["retained_routes"].as_array().unwrap().iter()
+            .all(|row| row["owner_source"] == "unresolved"));
+    }
+    policies.deny(&rotated).await.unwrap();
+    let report = inspect().await.unwrap();
+    assert_eq!(report["root"]["route_ownership"]["last_observed_binding"], "superseded_or_conflicting");
+    let caught_up = previous.apply_checkpoint(exact(&body), 1).unwrap();
+    policies.commit(&previous, &caught_up).await.unwrap();
+    let report = inspect().await.unwrap();
+    assert_eq!(report["root"]["route_ownership"]["retained_routes"][0]["owner_source"], "portal_binding");
     assert_eq!(saved(&database.pool, &genesis).await, snapshot);
     assert!(
         super::super::super::delegated_recovery::inspect(&replica, ORIGIN)
