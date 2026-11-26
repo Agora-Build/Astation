@@ -675,7 +675,7 @@ impl super::RecoveryStore {
             return Err(());
         }
         if desired == ServiceDesired::Active
-            && !checkpoint.allows_list_release(&context.owner, log.account_id(), &context.genesis)
+            && !checkpoint.allows_list_release_in(tx, &context.owner, log.account_id(), &context.genesis).await?
         {
             return Err(());
         }
