@@ -2,6 +2,7 @@
 //! command establishes missing later history or authorizes reopening a fence.
 use super::super::{Root, MAX_STATE};
 use super::{Binding, Status};
+use crate::service_signing_ceilings::Reservation;
 use atem_client::{canonical::jcs, membership::Membership, Hash32};
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
@@ -112,9 +113,20 @@ pub(crate) async fn prepare_with_sources(
         Some(store) => Some(store.reservations(log.account_id(), genesis).await.map_err(|_| invalid())?),
         None => None,
     };
-    if let Some(rows) = reservations.as_deref() {
-        let evidence = crate::service_signing_ceilings::SigningCeilings::recovery_evidence(rows, &report)
-            .map_err(|_| invalid())?;
+    let observed = observe_reservations(
+        &mut tx, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
+    ).await?;
+    let clock_evidence = match reservations.as_deref() {
+        Some(rows) => Some(crate::service_signing_ceilings::SigningCeilings::recovery_evidence(
+            rows, &observed, &report,
+        ).map_err(|_| invalid())?),
+        None if !observed.is_empty() => Some(json!({
+            "status":"signing_store_unconfigured","plan_id":prepared.plan_id,
+            "reconstruction_hash":report["reconstruction_hash"],"observed_reservations":observed
+        })),
+        None => None,
+    };
+    if let Some(evidence) = clock_evidence {
         report["service_clock_evidence_hash"] = source_hash(&evidence)?.into();
         report["service_clock_evidence"] = evidence;
     }
@@ -129,6 +141,37 @@ pub(crate) async fn prepare_with_sources(
     }
     tx.commit().await?;
     Ok(report)
+}
+
+async fn observe_reservations(
+    connection: &mut PgConnection,
+    origin: &str,
+    account: &str,
+    genesis: &str,
+    current: Option<&[Reservation]>,
+) -> Result<Vec<Reservation>, sqlx::Error> {
+    if let Some(rows) = current.filter(|rows| !rows.is_empty()) {
+        sqlx::query(
+            "INSERT INTO station_delegated_observed_reservations AS seen
+             (origin,account_id,genesis_hash,service_id,key_hash,highest_ms)
+             SELECT $1,$2,$3,service_id,key_hash,highest_ms FROM jsonb_to_recordset($4)
+                AS r(service_id text,key_hash text,highest_ms bigint)
+             ON CONFLICT (origin,account_id,genesis_hash,service_id,key_hash) DO UPDATE
+             SET highest_ms=EXCLUDED.highest_ms WHERE seen.highest_ms < EXCLUDED.highest_ms",
+        )
+        .bind(origin).bind(account).bind(genesis).bind(json!(rows))
+        .execute(&mut *connection).await?;
+    }
+    let observed: Vec<Reservation> = sqlx::query_as(
+        "SELECT service_id,key_hash,highest_ms FROM station_delegated_observed_reservations
+         WHERE origin=$1 AND account_id=$2 AND genesis_hash=$3 ORDER BY service_id,key_hash LIMIT 4097",
+    )
+    .bind(origin).bind(account).bind(genesis)
+    .fetch_all(&mut *connection).await?;
+    if observed.len() > 4096 {
+        return Err(invalid());
+    }
+    Ok(observed)
 }
 
 /// Account-private acquisition of an existing review. It never prepares a plan,

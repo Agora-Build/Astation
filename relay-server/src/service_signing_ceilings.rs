@@ -126,6 +126,7 @@ impl SigningCeilings {
 
     pub(crate) fn recovery_evidence(
         reservations: &[Reservation],
+        observed_reservations: &[Reservation],
         plan: &serde_json::Value,
     ) -> Result<serde_json::Value, ()> {
         use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +139,10 @@ impl SigningCeilings {
                 )
             })
             .collect();
+        let shortfalls: Vec<_> = observed_reservations.iter().filter(|row| {
+            ceilings.get(&(row.service_id.as_str(), row.key_hash.as_str()))
+                .is_none_or(|current| *current < row.highest_ms)
+        }).collect();
         let mut missing = BTreeSet::new();
         let mut uncovered = BTreeMap::<&str, u64>::new();
         for observed in plan["known_history"]["observed_service_keys"]
@@ -164,6 +169,7 @@ impl SigningCeilings {
         Ok(
             serde_json::json!({"plan_id": plan["plan_id"], "source_hash": plan["source_hash"],
             "reconstruction_hash": plan["reconstruction_hash"], "reservations": reservations,
+            "reservation_shortfalls": shortfalls,
             "unregistered_membership_keys": missing, "uncovered_service_signatures": uncovered}),
         )
     }
