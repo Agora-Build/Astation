@@ -520,8 +520,52 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(saved["portal_service_evidence"]["protected_service_keys"][0]["signing_reservation"],
         json!({"status":"missing"}), "the same service's other key cannot supply its reservation");
     assert_eq!(saved["portal_service_evidence"]["provisioned_without_membership"].as_array().unwrap(), provisioned);
+    let stored: String = sqlx::query_scalar("SELECT context FROM station_integration_provisioning WHERE integration_id=$1")
+        .bind(ID).fetch_one(&primary.pool).await.unwrap();
+    let context: crate::service_keys::ServiceKeyContext = serde_json::from_str(&stored).unwrap();
+    for foreign in [
+        crate::service_keys::ServiceKeyContext { owner: "ab00000000000000000000000001".into(), ..context.clone() },
+        crate::service_keys::ServiceKeyContext { genesis: "a".repeat(64), ..context.clone() },
+        crate::service_keys::ServiceKeyContext { issuer: "https://other-auth.example".into(), ..context.clone() },
+        crate::service_keys::ServiceKeyContext { station_origin: "https://other-station.example".into(), ..context.clone() },
+    ] {
+        crate::service_keys::load_or_create_pending(&primary.pool, &runtime.vault, &foreign, None).await.unwrap();
+    }
     sqlx::query("DELETE FROM station_integration_provisioning WHERE integration_id=$1")
         .bind(ID).execute(&primary.pool).await.unwrap();
+    // Even without a provisioning row, membership, or a matching external
+    // reservation, the surviving protected key still identifies this list.
+    let restored = review().await.unwrap();
+    let evidence = &restored["portal_service_evidence"];
+    assert_eq!(evidence["envelopes_without_provisioning"], json!([id]));
+    assert_eq!(evidence["protected_service_keys"].as_array().unwrap().len(), 1);
+    let row = &evidence["protected_service_keys"][0];
+    assert_eq!(row["status"], "missing_provisioning");
+    assert_eq!(row["key_fingerprint"], fingerprint);
+    assert_eq!(row["signing_reservation"], json!({"status":"missing"}));
+    assert_eq!(row["portal_observation"]["state"], "revoked");
+    assert_eq!(evidence["portal_keys_without_attribution"], json!([]));
+    assert_eq!(evidence["provisioned_without_membership"], json!([]));
+    assert_eq!(evidence["provisioning_without_fingerprint"], json!([]));
+    assert_eq!(restored["recovery_ready"], false);
+    assert_eq!(review().await.unwrap()["portal_service_evidence_hash"],
+        restored["portal_service_evidence_hash"]);
+
+    let without_key = plan::prepare_with_sources(&replica, &fence, &genesis, Some(store),
+        Some(&runtime.binding), None).await.unwrap();
+    let metadata = &without_key["portal_service_evidence"];
+    assert_eq!(metadata["envelopes_without_provisioning"], json!([id]));
+    assert!(metadata.get("protected_service_keys").is_none());
+    assert_eq!(metadata["portal_keys_without_attribution"][0]["service_id"], id);
+    let wrapping = crate::service_keys::ServiceKeyVault::new(&[83; 32], "other-operator").unwrap();
+    let unreadable = plan::prepare_with_sources(&replica, &fence, &genesis, Some(store),
+        Some(&runtime.binding), Some(&wrapping)).await.unwrap();
+    assert_eq!(unreadable["portal_service_evidence"]["protected_service_keys"],
+        json!([{"service_id":id,"provisioning_fingerprint":null,"status":"unreadable"}]));
+    assert_eq!(unreadable["portal_service_evidence"]["portal_keys_without_attribution"],
+        metadata["portal_keys_without_attribution"]);
+
+    crate::service_keys::forget(&primary.pool, &context).await.unwrap();
     let unassigned = review().await.unwrap();
     let source = &unassigned["portal_service_evidence"];
     assert_eq!(source["services"], json!([]));

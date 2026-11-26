@@ -852,7 +852,13 @@ cannot authenticate is `unreadable`. With the independent signing database confi
 each authenticated key carries its exact reservation or a missing-registration
 observation. A registered ceiling of zero records an unused key. Preparing a review leaves the provisioning
 record and enrollment as they were. The protected-key observation is omitted when
-the wrapping key is unconfigured. These entries require reconciliation before
+the wrapping key is unconfigured. If an envelope survives the loss of its
+provisioning row, `envelopes_without_provisioning` lists its service ID for
+the exact issuer, Station, owner and device list. With the wrapping key,
+Station authenticates the envelope in that context and reports its fingerprint,
+Portal observation and available signing reservation. An unreadable envelope
+remains unresolved. Only a matching provisioning row can designate a managed
+key for snapshot signing. These entries require reconciliation before
 publication. If the Portal alone identifies a
 key for this Agora.Build owner, `portal_keys_without_attribution` preserves its
 lifecycle observation. The owner can have several R9 lists, so this evidence
