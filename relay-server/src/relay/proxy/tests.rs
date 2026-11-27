@@ -36,7 +36,10 @@ impl Test {
     }
 
     async fn with_store(store: Arc<RecoveryStore>) -> Self {
-        let mut state = crate::tests::test_state();
+        Self::with_state(crate::tests::test_state(), store).await
+    }
+
+    async fn with_state(mut state: AppState, store: Arc<RecoveryStore>) -> Self {
         state.recovery = store;
         state.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
         let fixture = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
@@ -123,6 +126,93 @@ impl Test {
         send_json(&mut socket, host_route_message(&object)).await;
         socket
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and Redis"]
+async fn postgres_delegated_remote_broker_checks_the_proxy_on_its_own_replica() {
+    use crate::cluster::redis::{connect_cluster, test_support};
+    use crate::station_integrations::tests::attach_test_room_owner;
+    let _redis = test_support::REDIS_LOCK.lock().await;
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    attach_test_room_owner(&store, ORIGIN).await;
+    let mut host_state = crate::tests::test_state();
+    let cluster = connect_cluster(
+        &test_support::test_url(),
+        host_state.identity.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    host_state.relay = cluster.relay.clone();
+    let t = Test::with_state(host_state, store).await;
+    let mut broker_state = t.state.clone();
+    let broker = connect_cluster(
+        &test_support::test_url(),
+        broker_state.identity.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    broker_state.relay = broker.relay.clone();
+    broker_state.recovery = RecoveryStore::postgres(db.reconnect(5).await);
+    broker_state
+        .recovery
+        .configure_delegated(ORIGIN, 1)
+        .await
+        .unwrap();
+    attach_test_room_owner(&broker_state.recovery, ORIGIN).await;
+    let (base, server) = spawn_relay(broker_state.clone()).await;
+    let mut proxy = t.proxy(RouteKind::Proxy).await;
+    assert_eq!(next_client_json(&mut proxy).await["op"], "host_route_ok");
+    assert_eq!(next_client_json(&mut proxy).await["op"], "heads");
+    let url = base.replace(
+        "/ws",
+        &format!(
+            "/api/remote/v1/channels?genesis={}&host=host-a",
+            t.fixture.log.genesis_hash().to_hex()
+        ),
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer alice".parse().unwrap());
+    let mut client = tokio_tungstenite::connect_async(request).await.unwrap().0;
+    send_json(
+        &mut client,
+        json!({"type":"channel","event":"open","channel":"mobile","transport":"relay"}),
+    )
+    .await;
+    let open = next_client_json(&mut proxy).await;
+    let handle = open["channel"].as_str().unwrap();
+    let binding = broker.relay.channels().host_binding(handle).unwrap();
+    assert_ne!(binding.connection.replica, broker.relay.replica_id());
+    assert!(binding.proxy.is_some());
+    let reply =
+        json!({"type":"channel","event":"frame","channel":handle,"frame":{"verified":true}});
+    send_json(&mut proxy, reply.clone()).await;
+    assert_eq!(
+        next_client_json(&mut client).await,
+        json!({"type":"channel","event":"frame","channel":"mobile","frame":{"verified":true}})
+    );
+
+    t.state
+        .identity
+        .unbind("paired-session", "phone")
+        .await
+        .unwrap();
+    assert!(broker
+        .relay
+        .channels()
+        .reply(handle, &binding.connection, &reply.to_string()));
+    crate::relay::tests::assert_closed(&mut client).await;
+    drop((proxy, client, t));
+    server.abort();
+    broker.abort();
+    cluster.abort();
+    broker_state.recovery.pool().unwrap().close().await;
+    db.cleanup().await;
 }
 
 #[tokio::test]

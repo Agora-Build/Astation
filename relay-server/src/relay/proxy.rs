@@ -41,6 +41,24 @@ impl NativeAuthority {
 }
 
 impl RelayHub {
+    pub(crate) async fn channel_proxy_current(&self, binding: &HostBinding) -> bool {
+        let Some(proxy) = &binding.proxy else { return true; };
+        let target = &binding.connection;
+        if target.replica == self.replica_id() {
+            return self.host_binding(&target.conn).as_ref() == Some(binding)
+                && self.proxy_current(&target.conn).await;
+        }
+        let Some((delivery, rx)) = self.channels().delivery() else { return false; };
+        let message = InboxMessage::CheckChannelProxy {
+            connection_id: target.conn.clone(), generation: proxy.generation.clone(),
+            reply_to: self.replica_id().to_owned(), delivery: delivery.clone(),
+        };
+        let sent = self.inner.bus.send_inbox(&target.replica, message).await.is_ok();
+        let current = sent && matches!(tokio::time::timeout(Duration::from_secs(2), rx).await, Ok(Ok(true)));
+        self.channels().delivered(&delivery, false);
+        current
+    }
+
     /// A suspended, still-authenticated proxy keeps its generation for recovery.
     /// The writer rechecks both proofs before delivering the notice or a refusal.
     pub(super) async fn hold_suspended_proxy(&self, binding: &HostBinding, request: Option<&str>) -> bool {

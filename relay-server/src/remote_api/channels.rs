@@ -403,7 +403,10 @@ async fn serve(
                 // A peer may have disabled the account after queue admission.
                 // Hold the proved association through the bounded socket write.
                 let sent = if let Some(binding) = &binding {
-                    matches!(recovery.with_host_route(binding, write).await, Some(Ok(Ok(()))))
+                    // The credential stays with the proxy socket. Never wait
+                    // for the other replica while holding the recovery lock.
+                    hub.channel_proxy_current(binding).await &&
+                        matches!(recovery.with_host_route(binding, write).await, Some(Ok(Ok(()))))
                 } else if let Some(route) = &owner_route {
                     recovery.with_owner_route(route, None, || async {
                         hub.owner_route_current(route).await && matches!(write().await, Ok(Ok(())))
@@ -434,11 +437,13 @@ async fn serve(
         }
     }
     if let Some(binding) = binding.as_ref().filter(|_| recovery.delegated_enabled()) {
-        let suspended = recovery.with_host_suspension(binding, |_| async {
-            let close = json!({"type":"channel","event":"close","channel":open.channel,"reason":"service_suspended"});
-            let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Text(close.to_string()))).await;
-        }).await;
-        if suspended.is_some() { guard.notify_host = false; }
+        if hub.channel_proxy_current(binding).await {
+            let suspended = recovery.with_host_suspension(binding, |_| async {
+                let close = json!({"type":"channel","event":"close","channel":open.channel,"reason":"service_suspended"});
+                let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Text(close.to_string()))).await;
+            }).await;
+            if suspended.is_some() { guard.notify_host = false; }
+        }
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
 }

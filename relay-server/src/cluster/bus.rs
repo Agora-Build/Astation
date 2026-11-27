@@ -29,6 +29,8 @@ pub enum InboxMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_route: Option<crate::remote_api::recovery::OwnerRoute> },
     ChannelDelivered { delivery: String, accepted: bool },
+    /// Check a native proxy on the replica holding its socket and token.
+    CheckChannelProxy { connection_id: String, generation: String, reply_to: String, delivery: String },
     /// A host socket closed these exact channel handles while suspended.
     RetireChannels { source: super::ConnRef, handles: Vec<String> },
     ChannelReply { handle: String, source: super::ConnRef, frame: String, reply_to: String, delivery: String },
@@ -69,6 +71,7 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
     }
     let targets: Vec<String> = match message {
         InboxMessage::ChannelDeliver { connection_id, .. }
+        | InboxMessage::CheckChannelProxy { connection_id, .. }
         | InboxMessage::VerificationDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
         InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::RetireChannels { .. } => vec![],
         InboxMessage::Deliver { connection_ids, .. } => {
@@ -92,7 +95,7 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
-        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::RetireChannels { .. } | InboxMessage::CloseUnproved { .. }
+        InboxMessage::ChannelDeliver { .. } | InboxMessage::CheckChannelProxy { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::RetireChannels { .. } | InboxMessage::CloseUnproved { .. }
         | InboxMessage::VerificationDeliver { .. } => {
             // Requires the hub's r9 broker; dispatched before this legacy socket handler.
         }

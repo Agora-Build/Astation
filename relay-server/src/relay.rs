@@ -424,8 +424,13 @@ impl RelayHub {
             };
             store
                 .with_host_route(&binding, || async {
-                    (binding.proxy.is_none() || self.proxy_current(&source.conn).await)
-                        && self.channels().reply(handle, source, frame)
+                    let current = match &binding.proxy {
+                        None => true,
+                        Some(_) if source.replica == self.replica_id() => self.proxy_current(&source.conn).await,
+                        Some(proxy) => matches!(self.room(&binding.room).await, Ok(Some(room))
+                            if room.verified && room.owner.as_ref() == Some(&proxy.native)),
+                    };
+                    current && self.channels().reply(handle, source, frame)
                 })
                 .await
                 .unwrap_or(false)
@@ -897,6 +902,12 @@ impl RelayHub {
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
                     }
                     BusEvent::Inbox(InboxMessage::ChannelDelivered { delivery, accepted }) => hub.channels().delivered(&delivery, accepted),
+                    BusEvent::Inbox(InboxMessage::CheckChannelProxy { connection_id, generation, reply_to, delivery }) => {
+                        let same = hub.host_binding(&connection_id).and_then(|b| b.proxy)
+                            .is_some_and(|proxy| proxy.generation == generation);
+                        let accepted = same && hub.local().contains(&connection_id) && hub.proxy_current(&connection_id).await;
+                        let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
+                    }
                     BusEvent::Inbox(InboxMessage::RetireChannels { source, handles }) => hub.channels().retire_channels(&source, &handles),
                     BusEvent::Inbox(InboxMessage::ChannelReply { handle, source, frame, reply_to, delivery }) => {
                         let accepted = hub.channel_reply_checked(&handle, &source, &frame).await;
