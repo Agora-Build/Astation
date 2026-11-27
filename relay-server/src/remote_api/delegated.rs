@@ -684,9 +684,12 @@ impl super::RecoveryStore {
         if log.frozen().is_some() {
             return Err(());
         }
-        let binding_current = || desired != ServiceDesired::Active
-            || checkpoint.binding_feed_current(log.account_id(), &context.genesis, chrono::Utc::now().timestamp_millis());
-        if !binding_current() || (desired == ServiceDesired::Active
+        let release_current = || {
+            let now = chrono::Utc::now();
+            desired != ServiceDesired::Active || (checkpoint.policy_current(now.timestamp())
+                && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis()))
+        };
+        if !release_current() || (desired == ServiceDesired::Active
             && !checkpoint.allows_list_release_in(tx, &context.owner, log.account_id(), &context.genesis).await?)
         {
             return Err(());
@@ -737,7 +740,7 @@ impl super::RecoveryStore {
             .map_err(|_| ())?;
         // A signing reservation can wait on the independent store. Returning
         // an error rolls back this publication if the feed aged out meanwhile.
-        if !binding_current() {
+        if !release_current() {
             return Err(());
         }
         Ok(true)

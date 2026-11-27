@@ -210,8 +210,9 @@ pub(super) async fn observe(
         .cloned()
         .collect();
     let stops = ServiceStops::from_review(review)?;
-    let can_release = owner_allows_release
-        && policy.binding_feed_current(log.account_id(), &genesis, chrono::Utc::now().timestamp_millis());
+    let now = chrono::Utc::now();
+    let can_release = owner_allows_release && policy.policy_current(now.timestamp())
+        && policy.binding_feed_current(log.account_id(), &genesis, now.timestamp_millis());
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
         let known = stops.get(&(id.as_str(), key.as_str())).copied().unwrap_or_default();

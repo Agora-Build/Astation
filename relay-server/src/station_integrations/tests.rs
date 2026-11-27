@@ -675,6 +675,25 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
         assert_eq!(result["portal_service_evidence"]["services"][0]["snapshot_review"],expected);
         assert_eq!(result["recovery_ready"], false);
     }
+    // An authenticated snapshot alone cannot renew the ordinary policy lease.
+    let fresh = runtime.policies.load(&runtime.binding).await.unwrap();
+    let snapshot = fresh.portal_snapshot.clone().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for (received, release) in [(now - crate::integration_feed::MAX_POLICY_AGE_SECS, false),
+                                (now + 600, false), (now, true)] {
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let mut next = previous.apply_checkpoint(snapshot.clone(), now).unwrap();
+        next.received_at = received;
+        runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+        let prepared = review().await.unwrap();
+        let service = &prepared["portal_service_evidence"]["services"][0];
+        assert_eq!(service["observation"]["state"], "ready");
+        if release {
+            assert_eq!(service["snapshot_review"]["fresh_actions"][1]["action"], "release");
+        } else {
+            assert_eq!(service["snapshot_review"], json!({"status":"owner_availability_unresolved"}));
+        }
+    }
     sqlx::query("UPDATE station_integration_provisioning SET context=jsonb_set(context::jsonb,'{genesis}',to_jsonb(repeat('a',64)))::text")
         .execute(&db.pool).await.unwrap();
     assert_eq!(review().await.unwrap()["portal_service_evidence"]["services"][0]["snapshot_review"],
