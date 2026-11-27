@@ -109,7 +109,7 @@ final class RemoteControlPortalMirrorTests: XCTestCase {
 
     func testMirrorNeverSettlesTheWrongStationIntegrationRoleStateOrInterruptChoice() async throws {
         for fields: [String: Any] in [["stationOrigin": "https://other.example"], ["id": "i-11234567890123456789012345"],
-            ["role": "station_owner"], ["state": "ready"], ["interruptRunning": false], ["interruptRunning": NSNull()]] {
+            ["role": "station_owner"], ["state": "ready"], ["pendingHostRevocation": true], ["interruptRunning": false], ["interruptRunning": NSNull()]] {
             let http = ControlMirrorHTTP(), portal = try client(http)
             await http.reply(fields)
             do { _ = try await portal.mirrorRevoke(mirror(interrupt: true)); XCTFail("mismatched receipt accepted") }
