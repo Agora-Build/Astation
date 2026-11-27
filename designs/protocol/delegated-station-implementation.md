@@ -208,6 +208,13 @@ version on another reporting credential blocks application. One PostgreSQL
 transaction retains the release ID, advances the binding to `released`, and
 queues the exact `binding_changed` report. Replicas share that row across
 report credential rotation and restart. Delivery follows route closure.
+For a bound list, live service signing also requires a completed ordinary
+feed read that began less than 60 seconds ago. Station saves its start time
+with the applied feed page. A full page, cursor reset or denial removes that
+evidence. A failed HTTP request cannot extend it. The active built-in
+Station targets a read every 20 seconds and polls on a nudge. Slow signing
+or reporting runs in a separate worker. Route dispatch and closure must
+check their own evidence before the same bound can apply to live sockets.
 Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
 comparison remain required. No provider, signing, publication or reopening is
