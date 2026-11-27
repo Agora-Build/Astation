@@ -1137,7 +1137,7 @@ final class AstationRecoveryCoordinator {
     }
 
     func submitStationBinding(_ submission: StationBindingSubmission, session: AccountLoginSession,
-                              current: () -> Bool) async throws -> RemoteStationBindingReceipt {
+                              current: () -> Bool, awaitingConsent: () -> Void = {}) async throws -> RemoteStationBindingReceipt {
         try begin()
         defer { busy = false }
         try requireDurableRecoveryCheckpoint()
@@ -1165,7 +1165,7 @@ final class AstationRecoveryCoordinator {
         let result: RemoteStationBindingReceipt
         do {
             result = try await client.submit(proof: proof, session: session, accountID: accountID,
-                genesisHash: kit.genesisHash, retry: retry, now: { self.now().wallMs }, current: current)
+                genesisHash: kit.genesisHash, retry: retry, now: { self.now().wallMs }, current: current, awaitingConsent: awaitingConsent)
         } catch RemoteStationBindingError.expiredWithoutCommit {
             try requireDurableRecoveryCheckpoint()
             guard current(), saved.stationBindingProofs?[relayURL] == proof else { throw AccountLoginError.changed }

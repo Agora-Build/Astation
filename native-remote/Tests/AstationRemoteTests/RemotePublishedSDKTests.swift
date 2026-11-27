@@ -311,6 +311,93 @@ final class RemotePublishedSDKTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { $0.httpBody == Data(proof.utf8) && $0.value(forHTTPHeaderField: "Authorization") == "Bearer test-bearer" })
     }
 
+    @MainActor
+    func testIndependentOwnerReviewsTheExactChallengeBeforeSendingConsent() async throws {
+        let source = try fixture("r9-vectors-station-binding")
+        let vector = try XCTUnwrap(rows(source["valid"]).first { $0["label"] as? String == "transfer_p256" })
+        let body = try XCTUnwrap(vector["challenge"] as? [String: Any])
+        let challenge = try parseStationBindingChallenge(challengeJson: json(body))
+        guard case let .bound(_, _, owner) = challenge.expectedBinding else { return XCTFail("transfer owner") }
+        let config = try AccountOIDCConfiguration(issuer: challenge.issuer, clientID: "astation",
+            resource: challenge.origin, requiredScope: "astation.remote")
+        func login(_ subject: String) -> AccountLoginSession {
+            .init(configuration: config, subject: subject, accessToken: "owner-session", refreshToken: "",
+                expiresAt: Date(timeIntervalSince1970: Double(challenge.expiresAt) / 1000 + 60),
+                authenticatedAt: Int64(challenge.issuedAt / 1000))
+        }
+        let request = Data(try json(["request": body]).utf8)
+        let none = Data(#"{"request":null}"#.utf8)
+        let ok = Data(#"{"consented":true}"#.utf8)
+        let http = BindingReceiptHTTP([(none, 200), (request, 200), (request, 200), (request, 200),
+                                       (request, 200), (request, 200), (ok, 200)])
+        let client = try RemoteStationBindingApproval(origin: challenge.origin, http: http)
+        var time = challenge.issuedAt
+        var current = true
+        func review(_ subject: String, confirm: (StationBindingChallenge) -> Bool) async throws -> RemoteStationBindingApproval.ConsentOutcome {
+            try await client.reviewConsent(session: login(subject), now: { time }, current: { current }, confirm: confirm)
+        }
+        let empty = try await review(owner) { _ in XCTFail("empty request"); return true }
+        XCTAssertEqual(empty, .noRequest)
+        let cancelled = try await review(owner) { seen in XCTAssertEqual(seen, challenge); return false }
+        XCTAssertEqual(cancelled, .cancelled)
+        do { _ = try await review(challenge.subject) { _ in XCTFail("own transfer"); return true }; XCTFail("wrong owner") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        do { _ = try await review(owner) { _ in current = false; return true }; XCTFail("changed account") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        current = true
+        do { _ = try await review(owner) { _ in time = challenge.expiresAt; return true }; XCTFail("expired review") }
+        catch RemoteStationBindingError.consentExpired {}
+        time = challenge.issuedAt
+        let recorded = try await review(owner) { seen in XCTAssertEqual(seen, challenge); return true }
+        XCTAssertEqual(recorded, .recorded)
+        let calls = await http.requests
+        XCTAssertEqual(calls.dropLast().map { $0.httpMethod }, Array(repeating: "GET", count: 6))
+        XCTAssertTrue(calls.dropLast().allSatisfy { $0.url?.path == "/agora-build/v1/binding/consent-request" })
+        let posted = try XCTUnwrap(calls.last)
+        XCTAssertEqual(posted.httpMethod, "POST")
+        XCTAssertEqual(posted.url?.absoluteString, challenge.origin + "/agora-build/v1/logs/" + challenge.genesisHash + "/binding/transfer-consent")
+        XCTAssertEqual(posted.value(forHTTPHeaderField: "Authorization"), "Bearer owner-session")
+        XCTAssertEqual(try canonicalJson(json: String(decoding: XCTUnwrap(posted.httpBody), as: UTF8.self)),
+                       try canonicalJson(json: json(body)))
+    }
+
+    @MainActor
+    func testManagerWaitsForConsentAndRetriesTheOriginalProof() async throws {
+        let source = try fixture("r9-vectors-station-binding")
+        let vector = try XCTUnwrap(rows(source["valid"]).first { $0["label"] as? String == "transfer_p256" })
+        let proof = try XCTUnwrap(vector["proof"] as? String)
+        let challenge = try parseStationBindingChallenge(challengeJson: json(XCTUnwrap(vector["challenge"])))
+        guard case let .bound(id, version, _) = challenge.expectedBinding else { return XCTFail("transfer owner") }
+        let config = try AccountOIDCConfiguration(issuer: challenge.issuer, clientID: "astation",
+            resource: challenge.origin, requiredScope: "astation.remote")
+        let session = AccountLoginSession(configuration: config, subject: challenge.subject, accessToken: "manager-session",
+            refreshToken: "", expiresAt: Date(timeIntervalSince1970: Double(challenge.expiresAt) / 1000 + 60),
+            authenticatedAt: Int64(challenge.authTime))
+        let waiting = Data(#"{"awaiting_consent":true}"#.utf8)
+        let receipt = Data(try json(["account": challenge.subject, "accountId": challenge.accountId,
+            "genesisHash": challenge.genesisHash, "bindingId": id, "version": version + 1, "bindingState": "bound"]).utf8)
+        let http = BindingReceiptHTTP([(waiting, 202), (receipt, 200), (waiting, 202),
+            (Data(#"{"error":{"code":"binding_proof_expired"}}"#.utf8), 410)])
+        let client = try RemoteStationBindingApproval(origin: challenge.origin, http: http)
+        var time = challenge.issuedAt
+        var waits = 0
+        func submit(expire: Bool) async throws -> RemoteStationBindingReceipt {
+            try await client.submit(proof: proof, session: session, accountID: challenge.accountId,
+                genesisHash: challenge.genesisHash, retry: false, now: { time }, current: { true }, awaitingConsent: {
+                    waits += 1
+                    if expire { time = challenge.expiresAt }
+                })
+        }
+        let confirmed = try await submit(expire: false)
+        XCTAssertEqual(confirmed.version, version + 1)
+        do { _ = try await submit(expire: true); XCTFail("expired consent") }
+        catch RemoteStationBindingError.expiredWithoutCommit {}
+        XCTAssertEqual(waits, 2)
+        let calls = await http.requests
+        XCTAssertEqual(calls.map { $0.url?.lastPathComponent }, ["commit", "commit", "commit", "receipt"])
+        XCTAssertTrue(calls.allSatisfy { $0.httpBody == Data(proof.utf8) })
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {

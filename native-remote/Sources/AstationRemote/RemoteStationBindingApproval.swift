@@ -16,9 +16,13 @@ public struct RemoteStationBindingReceipt: Codable, Equatable, Sendable {
 }
 
 public enum RemoteStationBindingError: LocalizedError {
-    case expiredWithoutCommit
+    case expiredWithoutCommit, consentExpired, awaitingReceipt
     public var errorDescription: String? {
-        "The previous approval expired before Station applied it. Review the ownership change again."
+        switch self {
+        case .expiredWithoutCommit: return "The previous approval expired before Station applied it. Review the ownership change again."
+        case .consentExpired: return "This ownership request expired. Ask the manager to start a new request."
+        case .awaitingReceipt: return "Station has not confirmed the outcome. Check the previous request again."
+        }
     }
 }
 
@@ -65,7 +69,7 @@ public struct RemoteStationBindingApproval {
     private let origin: String
     private let http: AccountOIDCHTTP
 
-    public init(origin: String, http: AccountOIDCHTTP = AccountURLSessionHTTP(maximumResponseBytes: 4096)) throws {
+    public init(origin: String, http: AccountOIDCHTTP = AccountURLSessionHTTP(maximumResponseBytes: 8192)) throws {
         guard ["https://station-dev.agora.build", "https://station.agora.build"].contains(origin) else {
             throw AccountLoginError.configuration
         }
@@ -99,11 +103,7 @@ public struct RemoteStationBindingApproval {
             "account_id": anchor.accountID, "head": ["seq": head.seq, "hash": head.hash] as [String: Any],
             "signer": manager, "expected_binding": Self.wire(previous)])
         let (bytes, status) = try await http.send(call)
-        guard status == 200 else {
-            if status == 401 { throw AccountLoginError.signInRequired }
-            if [403, 404, 409].contains(status) { throw AccountLoginError.changed }
-            throw AccountLoginError.unavailable
-        }
+        guard status == 200 else { throw Self.error(for: status) }
         guard bytes.count <= 4096, let wire = String(data: bytes, encoding: .utf8) else {
             throw AccountLoginError.invalidResponse
         }
@@ -138,10 +138,71 @@ public struct RemoteStationBindingApproval {
         return proof
     }
 
+    public enum ConsentOutcome { case noRequest, cancelled, recorded }
+
+    public func reviewConsent(session: AccountLoginSession, now: () -> UInt64, current: () -> Bool,
+                              confirm: (StationBindingChallenge) async -> Bool) async throws -> ConsentOutcome {
+        func checkLogin() throws {
+            let clock = now()
+            guard current(), !Task.isCancelled, session.configuration.resource == origin,
+                  session.configuration.clientID == "astation", session.configuration.apiScopes.contains("astation.remote"),
+                  !session.accessToken.isEmpty, !session.subject.isEmpty, let authTime = session.authenticatedAt,
+                  let seconds = UInt64(exactly: authTime), seconds <= clock / 1000,
+                  session.expiresAt.timeIntervalSince1970 * 1000 > Double(clock) else { throw AccountLoginError.changed }
+        }
+        try checkLogin()
+        var call = URLRequest(url: URL(string: origin + "/agora-build/v1/binding/consent-request")!)
+        call.setValue("Bearer " + session.accessToken, forHTTPHeaderField: "Authorization")
+        let (data, status) = try await http.send(call)
+        try checkLogin()
+        guard status == 200 else { throw Self.error(for: status) }
+        guard data.count <= 8192, let text = String(data: data, encoding: .utf8),
+              let envelope = try JSONSerialization.jsonObject(with: Data(canonicalJson(json: text).utf8)) as? [String: Any],
+              envelope.count == 1, let request = envelope["request"] else { throw AccountLoginError.invalidResponse }
+        if request is NSNull { return .noRequest }
+        guard let object = request as? [String: Any] else { throw AccountLoginError.invalidResponse }
+        let body = try JSONSerialization.data(withJSONObject: object)
+        let challenge = try parseStationBindingChallenge(challengeJson: String(decoding: body, as: UTF8.self))
+        guard challenge.origin == origin, challenge.issuer == session.configuration.issuer,
+              challenge.subject != session.subject else { throw AccountLoginError.changed }
+        switch (challenge.action, challenge.expectedBinding) {
+        case (.bind, .neverBound): break
+        case let (.transfer, .bound(_, _, owner)) where owner == session.subject: break
+        default: throw AccountLoginError.changed
+        }
+        func checkReview() throws {
+            try checkLogin()
+            let clock = now()
+            guard clock >= challenge.issuedAt, clock < challenge.expiresAt else { throw RemoteStationBindingError.consentExpired }
+        }
+        try checkReview()
+        guard await confirm(challenge) else { return .cancelled }
+        try checkReview()
+        call.url = URL(string: origin + "/agora-build/v1/logs/" + challenge.genesisHash + "/binding/transfer-consent")!
+        call.httpMethod = "POST"
+        call.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        call.httpBody = body
+        let (reply, code) = try await http.send(call)
+        try checkLogin()
+        guard code == 200 else { throw Self.error(for: code) }
+        guard reply.count <= 4096,
+              try canonicalJson(json: String(decoding: reply, as: UTF8.self)) == #"{"consented":true}"# else {
+            throw AccountLoginError.invalidResponse
+        }
+        return .recorded
+    }
+
+    private static func error(for status: Int) -> AccountLoginError {
+        if status == 401 { return .signInRequired }
+        if [403, 404, 409].contains(status) { return .changed }
+        return .unavailable
+    }
+
     /// Retry a protected, previously approved proof verbatim. The Station can return
     /// its durable receipt even after the challenge expires if the first request committed.
     public func submit(proof: String, session: AccountLoginSession, accountID: String, genesisHash: String, retry: Bool,
-                       now: () -> UInt64, current: () -> Bool) async throws -> RemoteStationBindingReceipt {
+                       now: () -> UInt64, current: () -> Bool,
+                       awaitingConsent: () -> Void = {}) async throws -> RemoteStationBindingReceipt {
         guard proof.utf8.count <= 16_384, current(), !Task.isCancelled,
               session.configuration.resource == origin, session.configuration.clientID == "astation",
               session.configuration.apiScopes.contains("astation.remote"), !session.accessToken.isEmpty,
@@ -164,23 +225,33 @@ public struct RemoteStationBindingApproval {
             return UInt64(exactly: authTime) == challenge.authTime
         }
         guard retry || originalSession() else { throw AccountLoginError.changed }
-        var (data, status) = try await http.send(call)
-        guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
-        if retry && status == 410 && (try? canonicalJson(json: String(decoding: data, as: UTF8.self))) == #"{"error":{"code":"binding_proof_expired"}}"# {
-            throw RemoteStationBindingError.expiredWithoutCommit
-        }
-        if retry && status == 202 {
-            guard originalSession(), (try? canonicalJson(json: String(decoding: data, as: UTF8.self))) == #"{"pending":true}"# else {
+        var inspecting = retry
+        var reportedWait = false
+        let data: Data
+        while true {
+            let clock = now()
+            guard current(), !Task.isCancelled, session.expiresAt.timeIntervalSince1970 * 1000 > Double(clock) else {
                 throw AccountLoginError.changed
             }
-            call.url = base.appendingPathComponent("commit")
-            (data, status) = try await http.send(call)
+            if clock >= challenge.expiresAt { inspecting = true }
+            call.url = base.appendingPathComponent(inspecting ? "receipt" : "commit")
+            let (reply, status) = try await http.send(call)
             guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
-        }
-        guard status == 200 else {
-            if status == 401 { throw AccountLoginError.signInRequired }
-            if [403, 404, 409].contains(status) { throw AccountLoginError.changed }
-            throw AccountLoginError.unavailable
+            if status == 200 { data = reply; break }
+            if inspecting && status == 410 && (try? canonicalJson(json: String(decoding: reply, as: UTF8.self))) == #"{"error":{"code":"binding_proof_expired"}}"# {
+                throw RemoteStationBindingError.expiredWithoutCommit
+            }
+            guard status == 202 else { throw Self.error(for: status) }
+            let response = try canonicalJson(json: String(decoding: reply, as: UTF8.self))
+            if inspecting {
+                guard response == #"{"pending":true}"#, originalSession() else { throw AccountLoginError.changed }
+                guard now() < challenge.expiresAt else { throw RemoteStationBindingError.awaitingReceipt }
+                inspecting = false
+            } else {
+                guard response == #"{"awaiting_consent":true}"# else { throw AccountLoginError.invalidResponse }
+                if !reportedWait { awaitingConsent(); reportedWait = true }
+                try await Task.sleep(for: .seconds(1))
+            }
         }
         guard data.count <= 4096, let text = String(data: data, encoding: .utf8) else {
             throw AccountLoginError.invalidResponse
