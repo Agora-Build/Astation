@@ -238,6 +238,10 @@ pub(crate) struct PolicyCheckpoint {
     pub cursor: u64,
     pub revision: u64,
     pub received_at: i64,
+    // Beginning of a completed ordinary feed read. Slow HTTP responses cannot
+    // extend binding-based admission by their transit time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feed_read_started_ms: Option<i64>,
     pub denied: bool,
     pub integrations: BTreeMap<String, IntegrationPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +263,7 @@ impl PolicyCheckpoint {
             cursor: 0,
             revision: 0,
             received_at: 0,
+            feed_read_started_ms: None,
             denied: true,
             integrations: BTreeMap::new(),
             portal_snapshot: None,
@@ -284,6 +289,7 @@ impl PolicyCheckpoint {
         }
         let mut next = self.clone();
         // An ordinary feed response cannot refresh the independently changing bindings.
+        next.feed_read_started_ms = None;
         next.portal_snapshot_revision = None;
         next.binding_releases.clear();
         if let Some(snapshot) = page.integrations {
@@ -403,12 +409,38 @@ impl PolicyCheckpoint {
             }
         }
         let mut next = self.clone();
+        if snapshot.cursor != self.cursor {
+            next.feed_read_started_ms = None;
+        }
         next.revision = self.revision.checked_add(1).ok_or(())?;
         // Collection cannot replace live policy, refresh its lease or clear a denial.
         next.availability = snapshot.accounts.as_ref().map(|a| Availability::from_checkpoint(snapshot.cursor, a));
         next.portal_snapshot = Some(snapshot);
         next.portal_snapshot_revision = Some(next.revision);
         Ok(next)
+    }
+
+    pub(crate) fn record_completed_read(&mut self, started_ms: i64, ended_ms: i64) {
+        if started_ms >= 0 && ended_ms >= started_ms && !self.denied
+            && self.portal_snapshot.as_ref().is_some_and(|s|
+                s.cursor <= self.cursor && s.pending_releases.is_some())
+        {
+            self.feed_read_started_ms = Some(started_ms);
+        }
+    }
+
+    pub(crate) fn binding_feed_current(&self, account: &str, genesis: &str, now_ms: i64) -> bool {
+        if !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+            return true;
+        }
+        let Some(snapshot) = &self.portal_snapshot else { return false };
+        let Some(bindings) = &snapshot.bindings else { return false };
+        if !bindings.iter().any(|r| r.account_id == account && r.genesis_hash == genesis) {
+            return true;
+        }
+        !self.denied && snapshot.pending_releases.is_some() && snapshot.cursor <= self.cursor
+            && self.feed_read_started_ms.and_then(|start| now_ms.checked_sub(start))
+                .is_some_and(|age| (0..60_000).contains(&age))
     }
 
     pub(crate) fn allows_delegated_release(&self, owner: &str) -> bool {
@@ -600,6 +632,7 @@ impl PolicyStore {
             return Err(());
         }
         checkpoint.denied = true;
+        checkpoint.feed_read_started_ms = None;
         checkpoint.availability = None;
         checkpoint.portal_snapshot_revision = None;
         checkpoint.revision = checkpoint.revision.checked_add(1).ok_or(())?;

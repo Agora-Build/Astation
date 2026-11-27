@@ -164,31 +164,37 @@ impl StationIntegrations {
         }))
     }
 
-    /// One bounded worker per replica. Checkpoint CAS fences overlapping polls.
+    /// Checkpoint CAS fences overlapping polls from different replicas.
     async fn run(self: Arc<Self>) {
         let mut reconcile = true;
+        let bounded_poll = self.app.recovery.active_delegated_binding().is_some()
+            && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding);
+        // Signing and reporting can wait on several hosts. Keep those waits
+        // outside the built-in Station's feed polling deadline.
+        let (maintenance, mut ticks) = tokio::sync::watch::channel(false);
+        if bounded_poll {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                while ticks.changed().await.is_ok() {
+                    let caught_up = *ticks.borrow_and_update();
+                    runtime.after_poll(caught_up).await;
+                }
+            });
+        }
         loop {
             if !matches!(self.policies.claim_poll(&self.binding).await, Ok(true)) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             // Even a full page or an unsigned nudge cannot exceed 120 polls/min.
             let result = self.portal.poll(&self.policies, reconcile).await;
-            if result.is_ok() {
-                if matches!(result, Ok(false)) && self.app.recovery.collects_portal_checkpoint(&self.binding.station_origin) {
-                    self.collect_portal_checkpoint_if_due().await;
+            if let Ok(full) = result {
+                if bounded_poll {
+                    maintenance.send_replace(!full);
+                } else {
+                    self.after_poll(!full).await;
                 }
-                if let Some(fence) = self.app.recovery.active_delegated_binding() {
-                    if matches!(result, Ok(false))
-                        && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
-                        && self.policies.apply_binding_releases(&self.binding, fence).await.is_err()
-                    {
-                        tracing::warn!("could not apply pending Portal binding releases");
-                    }
-                    self.reconcile_delegated_services().await;
-                }
-                self.report_revocations().await;
-                self.report_readiness().await;
             }
             reconcile = matches!(result, Err(PortalError::CursorAhead));
             let immediate = matches!(
@@ -197,9 +203,26 @@ impl StationIntegrations {
             );
             tokio::time::sleep(Duration::from_millis(if immediate { 1000 } else { 500 })).await;
             if !immediate {
-                tokio::select! { _ = self.nudge.notified() => {}, _ = tokio::time::sleep(Duration::from_secs(59)) => {} }
+                let deadline = if bounded_poll { poll_deadline } else { tokio::time::Instant::now() + Duration::from_secs(59) };
+                tokio::select! { _ = self.nudge.notified() => {}, _ = tokio::time::sleep_until(deadline) => {} }
             }
         }
+    }
+
+    async fn after_poll(&self, caught_up: bool) {
+        if caught_up && self.app.recovery.collects_portal_checkpoint(&self.binding.station_origin) {
+            self.collect_portal_checkpoint_if_due().await;
+        }
+        if let Some(fence) = self.app.recovery.active_delegated_binding() {
+            if caught_up && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
+                && self.policies.apply_binding_releases(&self.binding, fence).await.is_err()
+            {
+                tracing::warn!("could not apply pending Portal binding releases");
+            }
+            self.reconcile_delegated_services().await;
+        }
+        self.report_revocations().await;
+        self.report_readiness().await;
     }
 
     async fn collect_portal_checkpoint_if_due(&self) {

@@ -346,12 +346,17 @@ impl PortalReportClient {
         } else {
             old.cursor
         };
+        let read_started_ms = chrono::Utc::now().timestamp_millis();
         match self.changes(cursor).await {
             Ok(page) => {
                 let full = page.changes.len() == PAGE_LIMIT;
-                let next = old
-                    .apply(cursor, page, chrono::Utc::now().timestamp())
+                let received = chrono::Utc::now();
+                let mut next = old
+                    .apply(cursor, page, received.timestamp())
                     .map_err(|_| PortalError::Contract)?;
+                if !full && !old.denied && (cursor != 0 || old.cursor == 0) {
+                    next.record_completed_read(read_started_ms, received.timestamp_millis());
+                }
                 store
                     .commit(&old, &next)
                     .await
