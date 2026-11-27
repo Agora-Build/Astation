@@ -912,6 +912,10 @@ by the observed checkpoint. Station matches the signed active member and key
 to the stored provisioning context for this issuer, Station, owner, and genesis.
 A paused service needs a new cover followed by a hold. An active service needs
 a new cover followed by a release so a host that kept the old hold can resume.
+For a bound list on the built-in Station, the review requires a completed
+change-feed read within the same 60-second window used by the live signer.
+If the read ages out, the review withholds the release even when the retained
+checkpoint still shows the owner as enabled.
 A known manager revoke survives a Portal resume. A matching reviewed copy
 preserves the effect of a former manager's revoke. Portal revocation separately
 requires the service's own revoke for reporting, and a later interrupt request

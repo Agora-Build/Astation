@@ -745,12 +745,28 @@ async fn postgres_delegated_recovery_commits_to_this_lists_owner_binding() {
                 "state":"ready","scopes":["agent.view"],"r9Svc":draft["fingerprint"],
                 "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}],
             "accounts":{"complete":complete,"disabled":if disabled { vec![OWNER] } else { vec![] }},
+            "pendingReleases":[],
             "bindings":[{"account":owner,"accountId":fixture.log.account_id(),"genesisHash":genesis,
                 "bindingId":id,"version":version,"bindingState":state}]}});
         let snapshot =
             PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding)
                 .unwrap();
-        let next = old.apply_checkpoint(snapshot, old.received_at).unwrap();
+        let mut next = old.apply_checkpoint(snapshot.clone(), old.received_at).unwrap();
+        if version == 1 {
+            let now = chrono::Utc::now().timestamp_millis();
+            next.record_completed_read(now - 60_000, now);
+            runtime.policies.commit_for_recovery(&old, &next, Some(&fence)).await.unwrap();
+            let stale = review().await.unwrap();
+            let evidence = &stale["portal_service_evidence"];
+            assert_eq!(evidence["owner_availability"], "enabled");
+            assert_eq!(evidence["owner_binding"]["state"], "bound");
+            assert_eq!(evidence["services"][0]["snapshot_review"],
+                json!({"status":"owner_availability_unresolved"}));
+            old = next;
+            next = old.apply_checkpoint(snapshot, old.received_at).unwrap();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        next.record_completed_read(now, now);
         runtime
             .policies
             .commit_for_recovery(&old, &next, Some(&fence))
