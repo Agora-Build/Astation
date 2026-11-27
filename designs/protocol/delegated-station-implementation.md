@@ -261,7 +261,9 @@ expires with the earlier of their token and the challenge. The response
 contains only `{"consented":true}`.
 
 At commit, Station locks the root and reads the room lookup again, including
-retained offline rooms. A change of room or owner requires a fresh challenge.
+retained offline rooms and the issuer-mapped account on a proved host's
+recovery root. When the root and a registration name different owners, each
+foreign owner must consent. A change of room or owner requires a fresh challenge.
 Every resolved owner must still be enabled, and every required consent must
 still be valid. Conflicting ownership or an unmapped registration prevents the
 binding. The transition, nonce consumption, route retirement and Portal report

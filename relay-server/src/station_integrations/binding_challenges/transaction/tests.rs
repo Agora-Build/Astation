@@ -299,6 +299,43 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         .execute(&replica)
         .await
         .unwrap();
+    // Registration and a proved route have independent ownership evidence.
+    // Even if every existing room resolves to the prospective owner, the
+    // proved host's other root owner must still consent.
+    let mut rollback = replica.begin().await.unwrap();
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE genesis_hash=$2")
+        .bind(third["sub"].as_str().unwrap())
+        .bind(&genesis)
+        .execute(&mut *rollback)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'phone',$4) ON CONFLICT DO NOTHING")
+        .bind(&auth.issuer).bind(origin).bind(&genesis).bind(third["sub"].as_str().unwrap())
+        .execute(&mut *rollback).await.unwrap();
+    let cut = room_consents::review(
+        &mut rollback,
+        &runtime.binding,
+        &checkpoint,
+        &genesis,
+        third["sub"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        cut.owners,
+        std::collections::BTreeSet::from([OWNER.to_owned()])
+    );
+    rollback.rollback().await.unwrap();
+
+    let mut writer = replica.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('offline-b',739185))")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    writer.rollback().await.unwrap();
     let hub = &runtime.app.relay;
     let relay_socket = hub.local().register(
         &old_relay.connection.conn,

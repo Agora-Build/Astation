@@ -20,8 +20,10 @@ pub(super) async fn review(
         return Ok(None);
     };
     let owners: BTreeSet<_> = rooms
+        .rooms
         .values()
         .flatten()
+        .chain(rooms.proved_root_owner.iter())
         .filter(|owner| owner.as_str() != subject)
         .cloned()
         .collect();

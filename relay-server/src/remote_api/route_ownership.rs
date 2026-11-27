@@ -593,15 +593,25 @@ async fn room_owners(
         .bind(principal).bind(BINDING_TTL_SECS).fetch_all(db).await
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct BindingRooms {
+    pub rooms: BTreeMap<String, Option<String>>,
+    pub proved_root_owner: Option<String>,
+}
+
 /// The caller holds the root lock. A registration can already hold a room
 /// lock while waiting for that root, so return a retry instead of waiting.
 pub(crate) async fn binding_rooms(
     db: &mut PgConnection,
     station: &FeedBinding,
     genesis: &str,
-) -> Result<Option<BTreeMap<String, Option<String>>>, sqlx::Error> {
-    let (principal, rooms): (String, Vec<String>) = sqlx::query_as(
-        "SELECT account_subject, ARRAY(
+) -> Result<Option<BindingRooms>, sqlx::Error> {
+    let (principal, proved_root_owner, rooms): (String, Option<String>, Vec<String>) = sqlx::query_as(
+        "SELECT account_subject, CASE WHEN COALESCE(state->'routes','{}'::jsonb)<>'{}'::jsonb
+            OR COALESCE(state->'proxies','{}'::jsonb)<>'{}'::jsonb OR EXISTS
+                (SELECT 1 FROM station_room_proofs WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3))
+            THEN (SELECT subject FROM account_identities WHERE issuer=$1 AND principal=account_subject)
+            END, ARRAY(
             SELECT room FROM station_proved_room_owners WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3)
             UNION SELECT room FROM station_room_proofs WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3)
             UNION SELECT jsonb_array_elements_text(jsonb_path_query_array(state, '$.routes.*.room')
@@ -625,7 +635,9 @@ pub(crate) async fn binding_rooms(
         };
         result.insert(row.room, account);
     }
-    Ok(Some(result))
+    // A proved host's own durable root association and its room registration
+    // may name different accounts. Preserve both ownership checks on first bind.
+    Ok(Some(BindingRooms { rooms: result, proved_root_owner }))
 }
 
 impl super::super::RecoveryStore {
