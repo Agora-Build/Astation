@@ -9,6 +9,8 @@ pub(crate) const MAX_POLICY_AGE_SECS: i64 = 120;
 
 #[path = "integration_availability.rs"]
 mod availability;
+#[path = "integration_binding_releases.rs"]
+mod binding_releases;
 use availability::Availability;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +461,13 @@ impl PolicyCheckpoint {
                  AND account_id=$2 AND genesis=$3
                  AND ($5::bigint IS NULL OR version > $5 OR (version=$5
                       AND binding_id=$4::jsonb->>'bindingId' AND account=$4::jsonb->>'account'))
+             ) OR EXISTS (
+               SELECT 1 FROM station_applied_binding_releases a
+               WHERE (a.issuer,a.portal_origin,a.station_origin)=($6,$7,$8)
+                 AND (a.account_id,a.genesis)=($2,$3) AND ($5::bigint IS NULL OR a.version > $5
+                   OR (a.version=$5 AND ($4::jsonb->>'bindingState' <> 'released'
+                     OR a.report->>'account' <> $4::jsonb->>'account'
+                     OR a.report->>'bindingId' <> $4::jsonb->>'bindingId')))
              ) OR EXISTS (
                SELECT 1 FROM station_integration_policy p
                CROSS JOIN LATERAL jsonb_array_elements(

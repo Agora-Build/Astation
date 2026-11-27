@@ -201,6 +201,13 @@ must catch up to that cursor. An observed account disable or incomplete baseline
 requires a strictly later, complete account view before release. Station retains
 these cursor bounds when a credential is retired. Recovery checks the same
 bounds when reviewing a proposed release.
+The active built-in Station applies an authenticated D27 admin release only
+when its D27 checkpoint names the same bound owner, R9 account, genesis,
+binding ID and version. A higher observation or conflicting binding at that
+version on another reporting credential blocks application. One PostgreSQL
+transaction retains the release ID, advances the binding to `released`, and
+queues the exact `binding_changed` report. Replicas share that row across
+report credential rotation and restart. Delivery follows route closure.
 Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
 comparison remain required. No provider, signing, publication or reopening is

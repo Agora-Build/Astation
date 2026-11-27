@@ -664,3 +664,135 @@ fn binding_release_requires_the_builtin_station_and_exact_target() {
     event["binding"]["version"] = json!(0);
     assert!(apply(true,&event).is_err());
 }
+
+async fn save_release_checkpoint(
+    store: &PolicyStore, station: &FeedBinding, mut bindings: Value, pending: Option<Value>,
+) -> PolicyCheckpoint {
+    let mut prior = store.load(station).await.unwrap();
+    if prior.revision == 0 {
+        let page = json!({"changes":[{"kind":"noop","id":12}],"integrations":[],"cursor":12});
+        let live = prior.apply(0, serde_json::from_value(page).unwrap(), 100).unwrap();
+        store.commit(&prior, &live).await.unwrap();
+        prior = live;
+    }
+    let mut cut = source(true);
+    bindings.as_array_mut().unwrap().sort_by(|a,b| a["accountId"].as_str().cmp(&b["accountId"].as_str()));
+    cut["checkpoint"]["bindings"] = bindings;
+    if let Some(pending) = pending {
+        cut["checkpoint"]["pendingReleases"] = pending;
+    }
+    let observed = prior.apply_checkpoint(parse(&cut, station).unwrap(), 101).unwrap();
+    store.commit(&prior, &observed).await.unwrap();
+    observed
+}
+
+fn release_for(row: &Value, id: &str) -> Value {
+    let mut release = row.clone();
+    release.as_object_mut().unwrap().remove("bindingState");
+    release["releaseId"] = json!(id);
+    release["requestedAt"] = json!("2026-11-23T00:00:00.000Z");
+    release
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
+    use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
+
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = PolicyStore(db.pool.clone());
+    let station = binding(true);
+    let fence = RecoveryFence::new(&station.station_origin, 1).unwrap();
+    assert!(fence.initialize(&db.pool, false).await.unwrap().ready);
+    assert_eq!(store.apply_binding_releases(&station, &fence).await, Ok(0));
+    let rows = source(true)["checkpoint"]["bindings"].clone();
+    let pending = json!([release_for(&rows[0], "release-3")]);
+    save_release_checkpoint(&store, &station, rows.clone(), None).await;
+    assert_eq!(store.apply_binding_releases(&station, &fence).await, Ok(0));
+    let stale = save_release_checkpoint(&store, &station, rows.clone(), Some(pending.clone())).await;
+
+    let mut rotated = station.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let peer = PolicyStore(db.reconnect(2).await);
+    save_release_checkpoint(&peer, &rotated, rows.clone(), Some(pending)).await;
+    // Failure at the write leaves the journal retryable and no partial new version.
+    sqlx::query("ALTER TABLE station_applied_binding_releases ADD CONSTRAINT reject_write CHECK(false)")
+        .execute(&db.pool).await.unwrap();
+    assert!(store.apply_binding_releases(&station, &fence).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_applied_binding_releases")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("ALTER TABLE station_applied_binding_releases DROP CONSTRAINT reject_write")
+        .execute(&db.pool).await.unwrap();
+    let (a, b) = tokio::join!(
+        store.apply_binding_releases(&station, &fence),
+        peer.apply_binding_releases(&rotated, &fence),
+    );
+    assert_eq!(a.unwrap() + b.unwrap(), 1);
+    peer.0.close().await;
+    let restarted = PolicyStore(db.reconnect(2).await);
+    let genesis = "b".repeat(64);
+    let report_id = "binding_changed:7dfbbee91cf11a9b4d23acfaca028c777bf50cfca7e84291a21b43b6323bef1f";
+    let expected = json!({"reportId":report_id,"state":"binding_changed","bindingState":"released",
+        "account":OWNER,"genesisHash":genesis,"accountId":"acct-1","bindingId":"bind-1","version":4});
+    let reports: Vec<Value> = sqlx::query_scalar("SELECT report FROM station_applied_binding_releases WHERE release_id='release-3'")
+        .fetch_all(&restarted.0).await.unwrap();
+    assert_eq!(reports, [expected]);
+    assert_eq!(restarted.apply_binding_releases(&rotated, &fence).await, Ok(0));
+    let mut misleading = rows.clone();
+    misleading[0]["version"] = json!(4);
+    let conflict = save_release_checkpoint(&restarted, &rotated, misleading, Some(json!([]))).await;
+    let mut tx = db.pool.begin().await.unwrap();
+    for checkpoint in [stale, conflict] {
+        assert!(!checkpoint.allows_list_release_in(&mut tx, OWNER, "acct-1", &genesis).await.unwrap());
+    }
+    tx.commit().await.unwrap();
+    restarted.0.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_binding_release_requires_an_exact_current_bound_head_and_open_fence() {
+    use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
+
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let store = PolicyStore(db.pool.clone());
+    let station = binding(true);
+    let fence = RecoveryFence::new(&station.station_origin, 1).unwrap();
+    assert!(fence.initialize(&db.pool, false).await.unwrap().ready);
+    let mut rows = Vec::new();
+    let mut pending = Vec::new();
+    for (index, case) in ["missing","higher","conflict","exhausted","released","wrong-target","future"].iter().enumerate() {
+        let mut row = source(true)["checkpoint"]["bindings"][0].clone();
+        row["accountId"] = json!(case);
+        if *case == "exhausted" { row["version"] = json!(9_007_199_254_740_991_u64); }
+        let mut release = release_for(&row, &format!("rel-{index}"));
+        if *case == "released" { row["bindingState"] = json!("released"); }
+        if *case == "wrong-target" { release["bindingId"] = json!("other"); }
+        if *case == "future" {
+            let mut later = release_for(&row, "later");
+            later["version"] = json!(8);
+            pending.push(later);
+        }
+        pending.push(release);
+        rows.push(row);
+    }
+    let mut rotated = station.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let mut old_rows = rows.clone();
+    old_rows[1]["version"] = json!(4);
+    old_rows[2]["account"] = json!(OTHER);
+    save_release_checkpoint(&store, &rotated, json!(old_rows), None).await;
+    let missing = rows.remove(0);
+    save_release_checkpoint(&store, &station, json!(rows), Some(json!(pending))).await;
+    assert_eq!(store.apply_binding_releases(&station, &fence).await, Ok(0));
+    rows.push(missing);
+    save_release_checkpoint(&store, &station, json!(rows), Some(json!([]))).await;
+    assert!(!fence.initialize(&db.pool, true).await.unwrap().ready);
+    assert!(store.apply_binding_releases(&station, &fence).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_applied_binding_releases")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(count, 0);
+    db.cleanup().await;
+}

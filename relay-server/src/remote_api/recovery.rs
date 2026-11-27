@@ -214,6 +214,10 @@ impl RecoveryStore {
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
 
+    pub(crate) fn active_delegated_binding(&self) -> Option<&delegated_recovery::Binding> {
+        self.delegated_origin.get().and(self.delegated_recovery.get())
+    }
+
     pub(crate) fn closed_review_binding(&self) -> Option<&delegated_recovery::Binding> {
         self.recovery_review_only.get().and(self.delegated_recovery.get())
     }
