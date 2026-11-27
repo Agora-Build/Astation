@@ -81,6 +81,25 @@ impl SigningCeilings {
             .await
     }
 
+    /// Discover lists even when their entire Station recovery root was lost.
+    pub(crate) async fn root_registrations(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT genesis_hash COLLATE \"C\" AS genesis, count(*),
+                    count(*) FILTER (WHERE highest_ms > 0)
+             FROM station_service_signing_ceilings
+             WHERE $1::text IS NULL OR genesis_hash COLLATE \"C\" > $1
+             GROUP BY genesis ORDER BY genesis LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.0)
+        .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn fixture(pool: PgPool) -> Self {
         sqlx::raw_sql(include_str!("../signing-store/schema.sql"))

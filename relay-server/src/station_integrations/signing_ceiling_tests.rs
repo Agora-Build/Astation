@@ -13,6 +13,66 @@ use crate::{
 
 #[tokio::test]
 #[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages() {
+    use crate::remote_api::recovery::delegated_recovery::list_roots;
+
+    let primary = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    let signing = SigningCeilings::fixture(external.pool.clone()).await;
+    let fence = Binding::new("https://station.example", 1).unwrap();
+    fence.initialize(&primary.pool, false).await.unwrap();
+    assert!(list_roots(&primary.pool, &fence, &signing, None).await.is_err());
+    fence.initialize(&primary.pool, true).await.unwrap();
+    let empty = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    assert_eq!(empty["roots"], json!([]));
+    assert!(empty["next_after"].is_null());
+
+    // Retained only, signing store only, and shared. Unused registrations are evidence too.
+    sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state)
+                 SELECT lpad(to_hex(i),64,'0'),'owner','{}'::jsonb
+                 FROM generate_series(1,96) i WHERE i % 3 <> 1")
+        .execute(&primary.pool).await.unwrap();
+    sqlx::query("INSERT INTO station_service_signing_ceilings(account_id,genesis_hash,service_id,key_hash)
+                 SELECT 'account',lpad(to_hex(i),64,'0'),'service','key'
+                 FROM generate_series(1,96) i WHERE i % 3 <> 0")
+        .execute(&external.pool).await.unwrap();
+    let hash = |i: u32| format!("{i:064x}");
+    signing.register_new_key("account", &hash(64), "other", "key").await.unwrap();
+    signing.reserve("account", &hash(64), "other", "key", 0, 1..=2).await.unwrap();
+    let replica = primary.reconnect(2).await;
+    let first = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    assert_eq!(first["next_after"], hash(64));
+    assert_eq!(first["roots"].as_array().unwrap().len(), 64);
+    assert_eq!(first["roots"][63], json!({"genesis_hash":hash(64),"root_present":false,
+        "registered_keys":2,"keys_with_reservations":1}));
+    assert_eq!(list_roots(&replica, &fence, &signing, None).await.unwrap(), first);
+    let second = list_roots(&replica, &fence, &signing, first["next_after"].as_str()).await.unwrap();
+    assert!(second["next_after"].is_null());
+    let rows: Vec<_> = [&first, &second].into_iter()
+        .flat_map(|page| page["roots"].as_array().unwrap()).collect();
+    assert_eq!(rows.len(), 96);
+    for (i, row) in (1..=96).zip(rows) {
+        assert_eq!(row["genesis_hash"], hash(i));
+        assert_eq!(row["root_present"], i % 3 != 1);
+        assert_eq!(row["registered_keys"].as_i64(), Some(if i == 64 { 2 } else { i64::from(i % 3 != 0) }));
+        assert_eq!(row["keys_with_reservations"].as_i64(), Some(i64::from(i == 64)));
+    }
+    // Exactly one full remaining page must have no continuation.
+    let exact = list_roots(&replica, &fence, &signing, Some(&hash(32))).await.unwrap();
+    assert_eq!(exact["roots"].as_array().unwrap().len(), 64);
+    assert!(exact["next_after"].is_null());
+    let newer = Binding::new(&fence.origin, 2).unwrap();
+    newer.initialize(&primary.pool, true).await.unwrap();
+    assert!(list_roots(&replica, &fence, &signing, Some(&hash(64))).await.is_err());
+    sqlx::query("DROP TABLE station_service_signing_ceilings").execute(&external.pool).await.unwrap();
+    assert!(list_roots(&replica, &newer, &signing, None).await.is_err());
+    replica.close().await;
+    primary.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
 async fn postgres_delegated_signing_checks_recovery_observations_before_reserving() {
     let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
     sqlx::raw_sql(include_str!("../../signing-store/schema.sql")).execute(&external.pool).await.unwrap();

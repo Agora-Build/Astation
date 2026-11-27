@@ -169,6 +169,54 @@ pub(crate) async fn inspect(pool: &PgPool, origin: &str) -> Result<Option<Status
         .await
 }
 
+/// Compare the same page of both stores before choosing a continuation.
+/// A registration at zero can survive a failed provisioning transaction too.
+pub(crate) async fn list_roots(
+    pool: &PgPool,
+    binding: &Binding,
+    signing: &SigningCeilings,
+    after: Option<&str>,
+) -> Result<Value, sqlx::Error> {
+    use std::collections::BTreeMap;
+
+    const PAGE_SIZE: usize = 64;
+    let limit = (PAGE_SIZE + 1) as i64;
+    if after.is_some_and(|cursor| !canonical_genesis(cursor)) {
+        return Err(invalid_root());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'").execute(&mut *tx).await?;
+    binding.lock_mode(&mut tx, false).await?;
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT genesis_hash FROM remote_recovery_roots
+         WHERE $1::text IS NULL OR genesis_hash COLLATE \"C\" > $1
+         ORDER BY genesis_hash COLLATE \"C\" LIMIT $2",
+    )
+    .bind(after).bind(limit).fetch_all(&mut *tx).await?;
+    let mut roots = BTreeMap::new();
+    for genesis in retained {
+        roots.insert(genesis, (true, 0, 0));
+    }
+    for (genesis, registered, reserved) in signing.root_registrations(after, limit).await? {
+        if !canonical_genesis(&genesis) {
+            return Err(invalid_root());
+        }
+        let row = roots.entry(genesis).or_insert((false, 0, 0));
+        row.1 = registered;
+        row.2 = reserved;
+    }
+    let more = roots.len() > PAGE_SIZE;
+    let mut page = Vec::new();
+    for (genesis, (present, registered, reserved)) in roots.into_iter().take(PAGE_SIZE) {
+        page.push(json!({"genesis_hash":genesis, "root_present":present,
+            "registered_keys":registered, "keys_with_reservations":reserved}));
+    }
+    let next = page.last().filter(|_| more).map(|row| &row["genesis_hash"]);
+    tx.commit().await?;
+    Ok(json!({"origin":binding.origin, "generation":binding.generation.to_string(),
+        "roots":page, "next_after":next}))
+}
+
 /// Inspect one retained account root and its fence in the same database snapshot,
 /// including while serving is fenced. Never advance membership or mutate history.
 pub(crate) async fn inspect_root(
