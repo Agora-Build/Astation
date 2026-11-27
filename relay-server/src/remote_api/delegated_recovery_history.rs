@@ -197,6 +197,10 @@ pub(super) async fn inspection(
         let mut hashes = Vec::new();
         let current_plan = checkpoint.plan_id == prepared.plan_id;
         signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
+            if operator_review {
+                journals.observe(&verified.signer, &verified.journal, generation, current_plan,
+                    verified.records.iter().map(ControlRecord::record_id));
+            }
             if current_plan {
                 latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
                     (verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
@@ -217,7 +221,6 @@ pub(super) async fn inspection(
                 add_record(&mut records, &record, stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
-                journals.observe(&verified.signer, &verified.journal, generation, current_plan);
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
