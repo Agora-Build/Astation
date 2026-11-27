@@ -663,8 +663,9 @@ signed native revoke or interruption. Unsigned intent and service-signed state
 cannot be substituted. The current shared verifier must accept each new native
 manager signature. The replacement preserves the exact principal, key, action,
 interruption choice, host revoke sequence and audit fields. Only its signer,
-record ID, timestamp and service feed ID change. A service copy must name the
-prepared replacement feed; a host interruption remains feed-independent.
+record ID, timestamp and service feed ID can change. A service copy names the
+original feed or the prepared replacement feed at the same Station. A host
+interruption remains feed-independent.
 The operator associates the source commitment; the control signature authenticates
 the exact stop body only. It is not an attestation of complete recovery history.
 
@@ -686,6 +687,13 @@ All generations' copies and signing lower bounds remain retained; current
 membership reclassifies a removed manager without erasing their old signature
 or clock obligation. Corrupt signatures are refused under the original plan's
 verified membership, including after a restart.
+
+Every accepted copy also enters the replacement snapshot as a retained stop in
+its own right. When its signer still has authority, the snapshot carries its
+exact bytes once, even if the copy also satisfies an earlier stop. If its
+signer has lost authority, it appears in the new review under its own record
+ID and needs a verified replacement. The Station recalculates the reconstruction
+hash for plans with copies so that an older staged snapshot can be rebuilt.
 
 The source `evidence_hash` remains the commitment to checkpoints/imports. A new
 `reconstruction_hash` additionally commits to the retained manager copies.

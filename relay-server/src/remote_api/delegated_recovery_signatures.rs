@@ -120,7 +120,7 @@ async fn load(
     prepared: &Prepared,
     log: &Membership,
     binding: &Binding,
-    signed: &BTreeMap<String, Value>,
+    signed: &mut BTreeMap<String, Value>,
     report: &Value,
 ) -> Result<(Vec<Retained>, BTreeMap<String, u64>), sqlx::Error> {
     let selection = "FROM station_delegated_recovery_signatures s \
@@ -140,7 +140,7 @@ async fn load(
     let rows: Vec<Retained> = sqlx::query_as(&format!(
         "SELECT s.plan_id,s.record_id,s.original_record_id,s.evidence_hash,s.record, \
          p.candidate_feed_id,p.retained->>'account_subject' AS subject,p.retained->'membership' AS membership \
-         {selection} ORDER BY p.generation,s.record_id"))
+         {selection} ORDER BY p.generation,(s.record->'body'->>'issued_at')::bigint,s.record_id"))
         .bind(&binding.origin).bind(log.genesis_hash().to_hex()).bind(binding.generation)
         .fetch_all(&mut *connection).await?;
     let mut lower_bounds = BTreeMap::new();
@@ -173,6 +173,10 @@ async fn load(
         {
             return Err(invalid());
         }
+        // A signed replacement is itself a stop, including after its plan
+        // is abandoned. Later replacements can refer to this exact object.
+        signed.insert(row.record_id.clone(), row.record.clone());
+        if signed.len() > super::history::MAX_RECORDS { return Err(invalid()); }
         // Even a subsequently removed manager's accepted signature stays a
         // clock obligation. Its current authority is reported separately.
         let lower = lower_bounds
@@ -230,12 +234,12 @@ async fn retain_checked(
     let record_ids: Vec<_> = input.replacements.iter().map(|(_, record)| record.record_id().to_owned()).collect();
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = super::checkpoint_for_owner(&mut tx, binding, genesis, false, owner).await?;
-    let signed = super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    let mut signed = super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
     if prepared.plan_id != plan_id || report["evidence_hash"] != input.evidence_hash {
         return Err(invalid());
     }
     let (rows, mut lower_bounds) =
-        load(&mut tx, &prepared, &log, binding, &signed, &report).await?;
+        load(&mut tx, &prepared, &log, binding, &mut signed, &report).await?;
     for (principal, value) in report["known_history"]["observed_signing_lower_bounds"]
         .as_object()
         .ok_or_else(invalid)?
@@ -255,7 +259,6 @@ async fn retain_checked(
             &log,
         )?;
         if !matches!(verify_control(&record, &log), ControlCheck::Valid(_))
-            || signed.contains_key(record.record_id())
             || unsigned_id(&report, record.record_id())
         {
             return Err(invalid());
@@ -276,6 +279,7 @@ async fn retain_checked(
             }
             continue;
         }
+        if signed.contains_key(record.record_id()) { return Err(invalid()); }
         let lower = lower_bounds.entry(record.principal().name()).or_default();
         if record.issued_at() <= *lower {
             return Err(invalid());
@@ -310,7 +314,7 @@ pub(super) async fn inspection(
     log: &Membership,
     binding: &Binding,
     report: &Value,
-    signed: &BTreeMap<String, Value>,
+    signed: &mut BTreeMap<String, Value>,
 ) -> Result<(Value, BTreeMap<String, ControlRecord>), sqlx::Error> {
     let (rows, lower_bounds) = load(connection, prepared, log, binding, signed, report).await?;
     let mut commitments = Vec::new();
