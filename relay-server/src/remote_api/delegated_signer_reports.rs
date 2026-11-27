@@ -62,8 +62,8 @@ pub(crate) async fn submit(
         tx.commit().await?;
         return Ok(receipt);
     }
-    let (head, challenge_json, expires): (Value, Value, i64) = sqlx::query_as(
-        "SELECT membership_head,challenge,expires_at FROM station_delegated_signer_challenges
+    let (head, challenge_json, expires, external_source_hash): (Value, Value, i64, Option<String>) = sqlx::query_as(
+        "SELECT membership_head,challenge,expires_at,external_source_hash FROM station_delegated_signer_challenges
          WHERE plan_id=$1 AND signer=$2 AND slot=$3",
     )
     .bind(&plan.plan_id)
@@ -83,7 +83,11 @@ pub(crate) async fn submit(
         || recovery.candidate_feed_id() != plan.candidate_feed_id
         || recovery.generation() != binding.generation as u64
         || recovery.source_hash().to_hex() != plan.source_hash
-        || evidence["evidence_hash"] != recovery.evidence_hash().to_hex()
+        // Another author may have added signed exports while this prompt was open.
+        // Retain the report under its signed round. Any independent source change
+        // still requires a new challenge. Older rows have no independent hash.
+        || (evidence["evidence_hash"] != recovery.evidence_hash().to_hex()
+            && external_source_hash.as_ref() != Some(&source.external_source_hash))
         || head != log.head().to_json()
     {
         return Err(SubmitError::Changed);

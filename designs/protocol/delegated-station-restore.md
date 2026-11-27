@@ -132,14 +132,20 @@ The account client posts `{"report": <signed report>, "records": [<signed record
 to `POST /api/remote/v1/logs/{genesis}/control/recovery/signer-reports`.
 Under the closed fence and locked owner root, Station verifies the SDK report
 and exports against the saved challenge, exact head, plan, current evidence
-and database time. The first observation of a journal, or a change to its signed summary for the
-same member, slot and process, commits the exact submission hash to the review.
-After all authors have contributed, each can confirm that common evidence hash.
-The Mac keeps the held journal revision while renewing a challenge over the same
-frozen inventory. It durably advances its local checkpoint before returning the
-new request and before exposing its signature. An identical journal confirmation
-changes the reconstruction hash while leaving the evidence hash available to
-the other authors. New evidence requires fresh confirmations. Each request is bounded to 256 KiB
+and database time. The round's evidence hash includes the distinct signed records
+discovered through current author reports. A first report with an empty journal,
+a record already in the base, or a journal revision with the same signed records
+can confirm that round. Each accepted report commits its full submission hash to
+the reconstruction review, including drafts and journal metadata. Conflicting
+journal observations remain visible to the operator.
+
+A newly exported signed record changes the evidence hash. All authors then
+confirm the new round. A still-valid outstanding report for the previous round
+can arrive after another author exports a new record. Station retains the late
+response under its original challenge. A change to the checkpoint, imports or
+native archives requires a new challenge even for retention. The Mac keeps the held journal revision while renewing
+its challenge and durably advances its local checkpoint before exposing the new
+signature. Each request is bounded to 256 KiB
 and the Station retains up to 256 submissions per plan.
 
 A successful response contains `plan_id`, `retained_only: true` and
