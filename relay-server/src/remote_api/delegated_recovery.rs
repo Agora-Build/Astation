@@ -148,6 +148,7 @@ async fn has_delegated_history(
     // Station into a fresh installation. Plans and observations reference the fence.
     let retained: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM station_delegated_reporting)
+             OR EXISTS (SELECT 1 FROM station_applied_binding_releases)
              OR EXISTS (SELECT 1 FROM station_verifier_rosters)
              OR EXISTS (SELECT 1 FROM station_integration_policy WHERE recovery_generation IS NOT NULL)
              OR EXISTS (SELECT 1 FROM remote_recovery_roots WHERE state->'delegated' <> '{}'::jsonb)",

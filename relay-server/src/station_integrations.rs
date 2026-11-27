@@ -178,7 +178,13 @@ impl StationIntegrations {
                 if matches!(result, Ok(false)) && self.app.recovery.collects_portal_checkpoint(&self.binding.station_origin) {
                     self.collect_portal_checkpoint_if_due().await;
                 }
-                if self.app.recovery.delegated_enabled() {
+                if let Some(fence) = self.app.recovery.active_delegated_binding() {
+                    if matches!(result, Ok(false))
+                        && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
+                        && self.policies.apply_binding_releases(&self.binding, fence).await.is_err()
+                    {
+                        tracing::warn!("could not apply pending Portal binding releases");
+                    }
                     self.reconcile_delegated_services().await;
                 }
                 self.report_revocations().await;
