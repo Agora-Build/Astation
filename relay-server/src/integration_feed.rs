@@ -1,5 +1,6 @@
 //! Authenticated Portal policy. Unsigned nudges never advance this checkpoint.
 use serde::{Deserialize, Serialize};
+use crate::integration_checkpoint::PendingRelease;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -174,6 +175,9 @@ pub(crate) struct Change {
     #[serde(default, deserialize_with = "present")]
     integration_id: Option<Option<String>>,
     pub kind: String,
+    at: Option<serde_json::Value>,
+    release_id: Option<serde_json::Value>,
+    binding: Option<serde_json::Value>,
     // The event's historical state is deliberately not used as current policy.
     pub integration: Option<IntegrationPolicy>,
     #[serde(default, deserialize_with = "present")]
@@ -185,6 +189,26 @@ pub(crate) struct Change {
 }
 
 impl Change {
+    fn binding_release(&self) -> Result<PendingRelease, ()> {
+        let target = self.binding.as_ref().and_then(|b| b.as_object()).ok_or(())?;
+        if self.integration_id != Some(None) || self.integration.is_some()
+            || self.reason.as_ref().and_then(|v| v.as_str()) != Some("agora_build")
+            || self.state.as_ref() != Some(&serde_json::Value::Null) || target.len() != 4
+        {
+            return Err(());
+        }
+        let text = |name: &str| target.get(name).and_then(|v| v.as_str()).map(str::to_owned).ok_or(());
+        let release = PendingRelease {
+            release_id: self.release_id.as_ref().and_then(|v| v.as_str()).ok_or(())?.into(),
+            account: self.account.as_ref().and_then(|v| v.as_str()).ok_or(())?.into(),
+            account_id: text("accountId")?, genesis_hash: text("genesisHash")?, binding_id: text("bindingId")?,
+            version: target.get("version").and_then(|v| v.as_u64()).ok_or(())?,
+            requested_at: self.at.as_ref().and_then(|v| v.as_str()).ok_or(())?.into(),
+        };
+        release.validate()?;
+        Ok(release)
+    }
+
     pub(crate) fn integration_id(&self) -> Option<&str> {
         self.integration_id.as_ref().and_then(Option::as_deref)
     }
@@ -195,6 +219,15 @@ pub(crate) struct FeedPage {
     pub changes: Vec<Change>,
     pub cursor: u64,
     pub integrations: Option<Vec<InitialIntegration>>,
+}
+
+impl FeedPage {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ()> {
+        let value = atem_client::canonical::StrictValue::parse(
+            bytes, crate::integration_checkpoint::MAX_CHECKPOINT_BYTES,
+        ).map_err(|_| ())?;
+        serde_json::from_value(value.value().clone()).map_err(|_| ())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +244,9 @@ pub(crate) struct PolicyCheckpoint {
     pub portal_snapshot_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     availability: Option<Availability>,
+    // Last ordinary page only. The shared journal retains every release at commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    binding_releases: Vec<PendingRelease>,
 }
 
 impl PolicyCheckpoint {
@@ -226,6 +262,7 @@ impl PolicyCheckpoint {
             portal_snapshot: None,
             portal_snapshot_revision: None,
             availability: None,
+            binding_releases: Vec::new(),
         })
     }
 
@@ -246,6 +283,7 @@ impl PolicyCheckpoint {
         let mut next = self.clone();
         // An ordinary feed response cannot refresh the independently changing bindings.
         next.portal_snapshot_revision = None;
+        next.binding_releases.clear();
         if let Some(snapshot) = page.integrations {
             next.integrations.clear();
             for row in snapshot {
@@ -274,6 +312,12 @@ impl PolicyCheckpoint {
                 return Err(());
             }
             previous = change.id;
+            if change.kind == "binding_released" {
+                if !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+                    return Err(());
+                }
+                next.binding_releases.push(change.binding_release()?);
+            }
             if let Some(id) = change.integration_id() {
                 if !client_id(id, "i-") {
                     return Err(());
@@ -410,6 +454,12 @@ impl PolicyCheckpoint {
     ) -> Result<bool, ()> {
         sqlx::query_scalar(
             "SELECT EXISTS (
+               SELECT 1 FROM station_binding_release_requests
+               WHERE issuer=$6 AND portal_origin=$7 AND station_origin=$8
+                 AND account_id=$2 AND genesis=$3
+                 AND ($5::bigint IS NULL OR version > $5 OR (version=$5
+                      AND binding_id=$4::jsonb->>'bindingId' AND account=$4::jsonb->>'account'))
+             ) OR EXISTS (
                SELECT 1 FROM station_integration_policy p
                CROSS JOIN LATERAL jsonb_array_elements(
                  p.checkpoint::jsonb->'portal_snapshot'->'bindings') AS observation(value)
@@ -421,6 +471,7 @@ impl PolicyCheckpoint {
         )
         .bind(self.binding.storage_key()?).bind(account_id).bind(genesis)
         .bind(current.map(sqlx::types::Json)).bind(current.map(|row| row.version as i64))
+        .bind(&self.binding.issuer).bind(&self.binding.portal_origin).bind(&self.binding.station_origin)
         .fetch_one(tx).await.map_err(|_| ())
     }
 
@@ -592,11 +643,17 @@ impl PolicyStore {
             return Err(());
         }
         let changed_availability = next.availability != previous.availability || next.cursor != previous.cursor;
-        if (next.portal_snapshot_revision == Some(next.revision) || changed_availability)
+        if (next.portal_snapshot_revision == Some(next.revision) || changed_availability || !next.binding_releases.is_empty())
             && crate::integration_checkpoint::PortalCheckpoint::built_in(&next.binding)
         {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 29))")
                 .bind(next.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
+            let releases = if next.portal_snapshot_revision == Some(next.revision) {
+                next.portal_snapshot.as_ref().and_then(|s| s.pending_releases.as_deref()).unwrap_or_default()
+            } else {
+                &next.binding_releases
+            };
+            PendingRelease::retain(&mut tx, &next.binding, releases).await?;
             if changed_availability {
                 availability::retain_observation(&mut tx, &next.binding, next.cursor, next.availability.as_ref()).await?;
             }
