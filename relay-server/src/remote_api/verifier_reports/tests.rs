@@ -484,6 +484,39 @@ async fn postgres_replicas_commit_once_and_restart_without_exposing_failed_write
         origin: ORIGIN.into(),
         command,
     };
+    #[cfg(feature = "delegated-host-work")]
+    let portal = {
+        use crate::integration_checkpoint::PortalCheckpoint;
+        use crate::integration_feed::{FeedBinding, PolicyStore};
+        let portal = FeedBinding {
+            issuer: "https://auth.example".into(), portal_origin: "https://portal.example".into(),
+            station_origin: ORIGIN.into(), report_client_id: "s-01234567890123456789012345".into(),
+        };
+        assert_eq!(store.perform(&genesis,"alice",op(create(&f,&c))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        store.set_verifier_portal(&portal).unwrap();
+        replica.set_verifier_portal(&portal).unwrap();
+        let owner = "ab01234567890123456789012345";
+        sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice')")
+            .bind(&portal.issuer).bind(owner).execute(&db.pool).await.unwrap();
+        let policies = PolicyStore(db.pool.clone());
+        let empty = policies.load(&portal).await.unwrap();
+        let page = json!({"changes":[{"id":1,"kind":"noop"}],"cursor":1,"integrations":[]});
+        let initial = empty.apply(0, serde_json::from_value(page).unwrap(), 100).unwrap();
+        policies.commit(&empty, &initial).await.unwrap();
+        let cut = json!({"changes":[],"cursor":1,"checkpoint":{
+            "at":"2026-11-23T00:00:00.000Z","integrations":[],"accounts":{"complete":true,"disabled":[]},
+            "bindings":[{"account":owner,"accountId":f.log.account_id(),"genesisHash":genesis,
+                "bindingId":"binding-1","version":1,"bindingState":"bound"}],"pendingReleases":[]}});
+        let source = PortalCheckpoint::parse(&serde_json::to_vec(&cut).unwrap(), &portal).unwrap();
+        let observed = initial.apply_checkpoint(source, 101).unwrap();
+        policies.commit(&initial, &observed).await.unwrap();
+        assert_eq!(replica.perform(&genesis,"alice",op(create(&f,&c))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut fresh = observed.apply(1, serde_json::from_value(json!({"changes":[],"cursor":1})).unwrap(),now/1000).unwrap();
+        fresh.record_completed_read(now, now);
+        policies.commit(&observed, &fresh).await.unwrap();
+        portal
+    };
     assert_eq!(
         store.perform(&genesis, "alice", op(create(&f, &c))).await.0,
         StatusCode::OK
@@ -518,7 +551,10 @@ async fn postgres_replicas_commit_once_and_restart_without_exposing_failed_write
         .unwrap();
     let restarted = RecoveryStore::postgres(db.reconnect(2).await);
     #[cfg(feature = "delegated-host-work")]
-    restarted.configure_delegated(ORIGIN, 1).await.unwrap();
+    {
+        restarted.configure_delegated(ORIGIN, 1).await.unwrap();
+        restarted.set_verifier_portal(&portal).unwrap();
+    }
     assert_eq!(
         restarted
             .perform(&genesis, "alice", op(Command::Read { nonce: nonce(&c) }))
@@ -536,6 +572,23 @@ async fn postgres_replicas_commit_once_and_restart_without_exposing_failed_write
     );
     #[cfg(feature = "delegated-host-work")]
     {
+        // A release on the peer blocks both reading an existing nonce and
+        // writing a valid proof for it, even before the Portal sees our report.
+        let policies = crate::integration_feed::PolicyStore(db.pool.clone());
+        let before = policies.load(&portal).await.unwrap();
+        let page = json!({"changes":[{"id":2,"kind":"binding_released","integrationId":null,
+            "state":null,"reason":"agora_build","at":"2026-11-23T00:00:00.000Z",
+            "releaseId":"release-1","account":"ab01234567890123456789012345","binding":{
+            "accountId":f.log.account_id(),"genesisHash":genesis,"bindingId":"binding-1","version":1}}],"cursor":2});
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut released = before.apply(1,serde_json::from_value(page).unwrap(),now/1000).unwrap();
+        released.record_completed_read(now, now);
+        policies.commit(&before, &released).await.unwrap();
+        for cmd in [Command::Read { nonce:nonce(&c) }, publish(&c, report(&f,&c,Some(3)))] {
+            let reply = restarted.perform(&genesis,"alice",op(cmd)).await;
+            assert_eq!(reply.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(reply.1.0["error"]["code"], "service_suspended");
+        }
         super::super::delegated_recovery::Binding::new(ORIGIN, 1)
             .unwrap()
             .initialize(&db.pool, true)

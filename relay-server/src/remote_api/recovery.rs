@@ -173,6 +173,7 @@ pub struct RecoveryStore {
     pool: Option<PgPool>,
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
     room_ownership: Option<(String, String)>,
+    verifier_portal: OnceLock<crate::integration_feed::FeedBinding>,
     delegated_origin: OnceLock<String>,
     delegated_recovery: OnceLock<delegated_recovery::Binding>,
     recovery_review_only: OnceLock<()>,
@@ -183,6 +184,11 @@ pub struct RecoveryStore {
 
 impl RecoveryStore {
     pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
+
+    pub(crate) fn set_verifier_portal(&self, portal: &crate::integration_feed::FeedBinding) -> Result<(), ()> {
+        if self.verifier_portal.get_or_init(|| portal.clone()) != portal { return Err(()); }
+        Ok(())
+    }
 
     pub(crate) async fn configure_delegated(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
         if self.recovery_review_only.get().is_some() {
@@ -665,6 +671,7 @@ impl RecoveryStore {
             pool: None,
             memory: None,
             room_ownership: None,
+            verifier_portal: OnceLock::new(),
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -683,6 +690,7 @@ impl RecoveryStore {
             pool: Some(pool),
             memory: None,
             room_ownership,
+            verifier_portal: OnceLock::new(),
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -728,6 +736,7 @@ impl RecoveryStore {
             pool: None,
             memory: Some(Mutex::new(HashMap::new())),
             room_ownership: None,
+            verifier_portal: OnceLock::new(),
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
@@ -845,13 +854,26 @@ impl RecoveryStore {
         }
         let owner = saved.as_ref().map(|(owner, _)| owner.as_str()).or(subject).map(str::to_owned);
         let Some(owner) = owner else { return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found")) };
-        let root = match saved {
+        let root: Option<Root> = match saved {
             Some((_, value)) => match serde_json::from_value(value) {
                 Ok(r) => Some(r),
                 Err(_) => return Ok(unavailable()),
             },
             None => None,
         };
+        if let Operation::VerifierReport { origin, .. } = &operation {
+            if self.delegated_enabled() && crate::account_identity::built_in_station(origin) {
+                let Some(root) = root.as_ref() else {
+                    return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
+                };
+                let Some(portal) = self.verifier_portal.get().filter(|p| &p.station_origin == origin) else {
+                    return Ok(unavailable());
+                };
+                if !verifier_reports::portal_allows(connection, portal, &owner, &root.account, genesis).await? {
+                    return Ok(error(StatusCode::SERVICE_UNAVAILABLE, "service_suspended"));
+                }
+            }
+        }
         let proved_room = match (&operation, self.room_ownership.as_ref()) {
             (Operation::HostRoute { room, proxy, .. }, Some(scope)) => Some((scope, room.clone(), proxy.is_some())),
             _ => None,

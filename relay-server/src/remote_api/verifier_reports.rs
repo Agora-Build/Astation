@@ -23,6 +23,26 @@ const MAX_REPORTS: usize = 4;
 const MAX_BODY: usize = 16_640;
 const TOMBSTONE_MS: u64 = 30_000;
 
+/// Called with the account root locked. Refuse a competing policy writer
+/// instead of waiting for its root lock while holding our own.
+pub(super) async fn portal_allows(
+    tx: &mut sqlx::PgConnection, portal: &crate::integration_feed::FeedBinding,
+    principal: &str, account: &str, genesis: &str,
+) -> Result<bool, sqlx::Error> {
+    let invalid = || sqlx::Error::Protocol("invalid verifier feed policy".into());
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT subject FROM account_identities WHERE issuer=$1 AND principal=$2",
+    ).bind(&portal.issuer).bind(principal).fetch_optional(&mut *tx).await?;
+    let Some(owner) = owner else { return Ok(false) };
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT checkpoint FROM station_integration_policy WHERE binding=$1 FOR SHARE NOWAIT",
+    ).bind(portal.storage_key().map_err(|_| invalid())?).fetch_optional(&mut *tx).await?;
+    let policy = crate::integration_feed::PolicyStore::decode_checkpoint(portal, row).map_err(|_| invalid())?;
+    if !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) { return Ok(false); }
+    let allowed = policy.allows_list_release_in(tx, &owner, account, genesis).await.map_err(|_| invalid())?;
+    Ok(allowed && policy.recent_d27_read(chrono::Utc::now().timestamp_millis()))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {

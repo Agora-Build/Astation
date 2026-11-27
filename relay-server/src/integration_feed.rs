@@ -438,7 +438,12 @@ impl PolicyCheckpoint {
         if !bindings.iter().any(|r| r.account_id == account && r.genesis_hash == genesis) {
             return true;
         }
-        !self.denied && snapshot.pending_releases.is_some() && snapshot.cursor <= self.cursor
+        self.recent_d27_read(now_ms)
+    }
+
+    pub(crate) fn recent_d27_read(&self, now_ms: i64) -> bool {
+        !self.denied && self.portal_snapshot.as_ref().is_some_and(|s|
+            s.pending_releases.is_some() && s.cursor <= self.cursor)
             && self.feed_read_started_ms.and_then(|start| now_ms.checked_sub(start))
                 .is_some_and(|age| (0..60_000).contains(&age))
     }
@@ -585,6 +590,10 @@ impl PolicyStore {
         .fetch_optional(connection)
         .await
         .map_err(|_| ())?;
+        Self::decode_checkpoint(binding, saved)
+    }
+
+    pub(crate) fn decode_checkpoint(binding: &FeedBinding, saved: Option<String>) -> Result<PolicyCheckpoint, ()> {
         match saved {
             None => PolicyCheckpoint::empty(binding.clone()),
             Some(saved) => {
