@@ -310,7 +310,9 @@ async fn review_intent(
     let mut log =
         Membership::from_stored(&intent.account, &genesis, &membership).map_err(|_| invalid())?;
     log.advance(&crate::remote_api::recovery::now());
-    if log.head() != intent.head {
+    if log.head() != intent.head
+        || (current.is_none() && policy.retained_room_owner_denied(db, &genesis_hex).await?)
+    {
         return Ok(None);
     }
     Ok(Some((log, policy)))
@@ -425,11 +427,12 @@ mod tests {
         let (db, runtime, fixture) = fixture_at_station(&auth.issuer, None, origin).await;
         let station = &runtime.binding;
         let previous = runtime.policies.load(station).await.unwrap();
+        let offline_owner = "ab00000000000000000000000007";
         let portal = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
             "at":"2026-11-24T10:00:00.000Z","integrations":[{
                 "id":ID,"ownerAccount":OWNER,"state":"awaiting_approval","scopes":["agent.view","agent.prompt","agent.approve"],
                 "r9Svc":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}],
-            "accounts":{"complete":true,"disabled":[]},"bindings":[],"pendingReleases":[]}});
+            "accounts":{"complete":true,"disabled":[offline_owner]},"bindings":[],"pendingReleases":[]}});
         let snapshot = PortalCheckpoint::parse(portal.to_string().as_bytes(), station).unwrap();
         let mut current = previous
             .apply_checkpoint(snapshot, previous.received_at)
@@ -500,6 +503,56 @@ mod tests {
             .configure_delegated(origin, 1)
             .await
             .unwrap();
+        // The old room has no live socket. Even this list's first binding
+        // cannot pass a disabled owner's retained registration to another user.
+        sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+            VALUES ($1,$2,$3,'offline-room',$4)")
+            .bind(&station.issuer).bind(origin).bind(fixture.log.genesis_hash().to_hex()).bind(offline_owner)
+            .execute(&db.pool).await.unwrap();
+        // A later ordinary feed read may already cover the observed denial.
+        // The active account view must still reject this disabled owner.
+        sqlx::query("DELETE FROM station_delegated_availability_fences WHERE account=$1")
+            .bind(offline_owner)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let refused = (
+            StatusCode::CONFLICT,
+            json!({"error":{"code":"binding_unavailable"}}),
+        );
+        assert_eq!(post(&text, &claims).await, refused);
+        let room_owner = "ab00000000000000000000000008";
+        sqlx::query(
+            "UPDATE station_proved_room_owners SET account_subject=$1 WHERE room='offline-room'",
+        )
+        .bind(room_owner)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO station_delegated_availability_fences
+            (issuer,portal_origin,station_origin,account,minimum_cursor) VALUES ($1,$2,$3,$4,$5)",
+        )
+        .bind(&station.issuer)
+        .bind(&station.portal_origin)
+        .bind(origin)
+        .bind(room_owner)
+        .bind(current.cursor as i64 + 1)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(post(&text, &claims).await, refused);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_binding_challenges")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DELETE FROM station_delegated_availability_fences WHERE account=$1")
+            .bind(room_owner)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
         let (first, retry) = tokio::join!(post(&text, &claims), post(&text, &claims));
         assert_eq!(first.0, StatusCode::OK, "{}", first.1);
         assert_eq!(first, retry);
