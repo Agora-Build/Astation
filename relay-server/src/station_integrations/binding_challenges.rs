@@ -167,6 +167,7 @@ async fn handle(
                 Ok(transaction::Submission::Confirmed(receipt)) => Ok(Some(receipt)),
                 Ok(transaction::Submission::Refused) => Ok(None),
                 Ok(transaction::Submission::Outstanding) => {
+                    if tx.rollback().await.is_err() { return unavailable(); }
                     return (StatusCode::ACCEPTED, Json(json!({"pending":true}))).into_response()
                 }
                 Ok(transaction::Submission::Expired) => {
@@ -196,7 +197,12 @@ async fn handle(
             Ok(()) => Json(body).into_response(),
             Err(_) => unavailable(),
         },
-        Ok(None) => error(StatusCode::CONFLICT, "binding_unavailable"),
+        // A follow-up request on another connection uses NOWAIT. Release the
+        // root lock before returning the refusal to the caller.
+        Ok(None) => match tx.rollback().await {
+            Ok(()) => error(StatusCode::CONFLICT, "binding_unavailable"),
+            Err(_) => unavailable(),
+        },
         Err(_) => unavailable(),
     }
 }
