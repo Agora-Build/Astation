@@ -2,6 +2,30 @@
 use super::*;
 use sqlx::PgConnection;
 
+pub(super) async fn external_requests(
+    State(IntegrationState(runtime)): State<IntegrationState>, Path(genesis): Path<String>,
+    headers: HeaderMap, body: axum::body::Body,
+) -> Response {
+    let Some(runtime) = runtime.filter(|r| r.app.recovery.delegated_enabled()) else { return unavailable() };
+    let Ok(_permit) = runtime.requests.try_acquire() else { return error(StatusCode::TOO_MANY_REQUESTS, "verifier_inventory_busy") };
+    let request = async {
+        let raw = match bearer_token(&headers) { Ok(raw) => raw, Err(e) => return token_error(&e, "agent.view") };
+        let token = match runtime.verifier.verify_verifier_token(raw).await {
+            Ok(token) => token, Err(e) => return token_error(&e, "agent.view"),
+        };
+        let invalid = || error(StatusCode::BAD_REQUEST, "invalid_verifier_request");
+        let Ok(bytes) = axum::body::to_bytes(body, 4096).await else { return invalid() };
+        let Ok(input) = atem_client::canonical::StrictValue::parse(&bytes, 4096) else { return invalid() };
+        let input = input.value();
+        if input.as_object().is_none_or(|fields| fields.len() != 2) { return invalid() }
+        let (Some(slot), Some(head)) = (input["slot"].as_str(), atem_client::membership::Head::from_json(&input["expected"])) else { return invalid() };
+        match runtime.app.recovery.external_verifier_requests(&runtime.binding, &genesis, &token, slot, head).await {
+            Ok(reply) => reply.into_response(), Err(_) => unavailable(),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), request).await.unwrap_or_else(|_| unavailable())
+}
+
 pub(super) async fn services(
     State(IntegrationState(runtime)): State<IntegrationState>,
     Path(genesis): Path<String>,

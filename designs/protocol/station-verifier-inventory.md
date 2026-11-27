@@ -373,6 +373,33 @@ still needs its separately authorized carrier; its report cannot be inferred
 from a native process or a Station-managed service. No report secret or private
 key is uploaded, and no new signing/execution gate is enabled by these routes.
 
+### Fetching a challenge with an integration token
+
+With delegated host work enabled, an external service posts
+`{"slot":"sdk","expected":{"seq":...,"hash":"..."}}` to
+`/agora-build/v1/logs/{genesis}/verifier-requests`. The bearer is its existing
+five-minute Agora.Build integration access token with `agent.view` and this
+Station as its sole audience. Station derives the service member from
+`client_id`. The caller supplies the slot and its own pinned head.
+
+Station compares the token owner and `r9_svc` fingerprint with its authenticated
+Portal feed, the owner of the recovery root and the service in signed membership.
+The last completed feed read must have started less than 60 seconds ago. A
+built-in Station also checks the account and device-list binding. Another report
+credential that has already observed a newer cursor prevents delivery until the
+local feed catches up.
+
+A successful response is `{"challenges":[...]}`. Station commits the time of the
+first fetch before sending it. Retrying the fetch preserves the original
+receipt and expiry. Pause, revocation, owner disablement or service-key
+replacement invalidates the affected challenges. Resuming requires a fresh
+nonce. Rotating the integration's OAuth client key preserves the R9 service
+grant. Foreign roots, owners and fingerprints return the same 404. Responses
+carry `Cache-Control: no-store`.
+
+External report submission and the consumer's handling of two processes that
+answer one challenge are tracked on Astation #101 and Portal #41.
+
 ### Manager review of a member's verifier processes
 
 In the Mac app, open **Manage Host Senders** and choose **Review Member

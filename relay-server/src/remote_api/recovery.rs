@@ -952,6 +952,13 @@ impl RecoveryStore {
                 }
             }
         }
+        let new_service_nonce = match (&operation, root.as_ref(), self.verifier_portal.get()) {
+            (Operation::VerifierReport { origin, command: verifier_reports::Command::Create { challenge, .. } }, Some(root), Some(portal))
+                if self.delegated_enabled() && portal.station_origin == *origin => {
+                verifier_reports::external::new_service_challenge(root, challenge)
+            }
+            _ => None,
+        };
         let admitting_proof = matches!(&operation, Operation::HostRoute { .. });
         let admitted_room = match &operation {
             Operation::HostRoute { room, .. } => Some(room.clone()),
@@ -962,10 +969,13 @@ impl RecoveryStore {
             (Operation::HostRoute { room, proxy, .. }, Some(scope)) => Some((scope, room.clone(), proxy.is_some())),
             _ => None,
         };
-        let (root, reply) = match apply(root, hash, operation, now()) {
+        let (mut root, reply) = match apply(root, hash, operation, now()) {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
+        if let (Some((nonce, id)), Some(portal)) = (new_service_nonce, self.verifier_portal.get()) {
+            verifier_reports::external::bind(connection, portal, &owner, hash, &mut root, &nonce, &id).await?;
+        }
         if let Some(room) = admitted_room {
             let service = self.route_service(connection, &owner, &root.account, genesis, &room).await?;
             if service != RouteService::Allowed {
