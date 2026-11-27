@@ -131,42 +131,116 @@ async fn postgres_proved_relay_and_proxy_receive_only_confirmed_suspensions() {
     db.cleanup().await;
 }
 
-#[tokio::test]
-#[ignore = "requires isolated Postgres"]
-async fn postgres_live_client_channel_gets_its_own_close_after_a_peer_disables_its_owner() {
+async fn open_client(
+    base: &str,
+    fixture: &Fixture,
+    principal: &str,
+    channel: &str,
+) -> super::TestSocket {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
-    let store = RecoveryStore::postgres(db.pool.clone());
-    store.configure_delegated(ORIGIN, 1).await.unwrap();
-    attach_test_room_owner(&store, ORIGIN).await;
-    let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
-    f.publish(&store).await;
-    let app = state(store.clone());
-    let (base, server) = spawn_relay(app.clone()).await;
-    let mut host = connect_atem(&base, "phone", "host-a").await;
-    super::prove(&mut host, &f.keys, &f.host_key, &f.log, "host-a").await;
-    assert_eq!(next_client_json(&mut host).await["op"], "heads");
     let url = base.replace(
         "/ws",
         &format!(
             "/api/remote/v1/channels?genesis={}&host=host-a",
-            f.log.genesis_hash().to_hex()
+            fixture.log.genesis_hash().to_hex()
         ),
     );
     let mut request = url.into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("authorization", "Bearer alice".parse().unwrap());
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {principal}").parse().unwrap(),
+    );
     let mut client = tokio_tungstenite::connect_async(request).await.unwrap().0;
     send_json(
         &mut client,
-        json!({"type":"channel","event":"open","channel":"client_1","transport":"relay"}),
+        json!({"type":"channel","event":"open","channel":channel,"transport":"relay"}),
     )
     .await;
+    client
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and Redis"]
+async fn postgres_delegated_suspension_closes_cross_replica_channels_before_the_routed_notice() {
+    use crate::cluster::redis::{connect_cluster, test_support};
+    let _redis = test_support::REDIS_LOCK.lock().await;
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    let peer_store = RecoveryStore::postgres(db.reconnect(5).await);
+    for store in [&store, &peer_store] {
+        store.configure_delegated(ORIGIN, 1).await.unwrap();
+        attach_test_room_owner(store, ORIGIN).await;
+    }
+    let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+    f.publish(&store).await;
+    let other = Fixture::new(f.created - 1);
+    other.publish_for(&store, "bob").await;
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'bob')")
+        .bind(test_portal().issuer)
+        .bind("ab01234567890123456789012346")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut replicas = Vec::new();
+    for s in [&store, &peer_store] {
+        let mut app = state(s.clone());
+        let cluster = connect_cluster(
+            &test_support::test_url(),
+            app.identity.clone(),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        app.relay = cluster.relay.clone();
+        let (url, server) = spawn_relay(app).await;
+        replicas.push((url, server, cluster));
+    }
+    let host_base = &replicas[0].0;
+    let client_base = &replicas[1].0;
+    let client_hub = &replicas[1].2.relay;
+    let mut old_host = connect_atem(host_base, "phone", "routed-a").await;
+    super::prove(&mut old_host, &f.keys, &f.host_key, &f.log, "routed-a").await;
+    assert_eq!(next_client_json(&mut old_host).await["op"], "heads");
+    let mut old_client = open_client(client_base, &f, "alice", "old").await;
+    let old_open = next_client_json(&mut old_host).await;
+    let old_binding = client_hub
+        .channels()
+        .host_binding(old_open["channel"].as_str().unwrap())
+        .unwrap();
+    let mut host = connect_atem(host_base, "phone", "routed-a").await;
+    super::prove(&mut host, &f.keys, &f.host_key, &f.log, "routed-a").await;
+    assert_eq!(next_client_json(&mut host).await["op"], "heads");
+    let mut other_host = connect_atem(host_base, "phone", "routed-b").await;
+    super::prove(
+        &mut other_host,
+        &other.keys,
+        &other.host_key,
+        &other.log,
+        "routed-b",
+    )
+    .await;
+    assert_eq!(next_client_json(&mut other_host).await["op"], "heads");
+    let mut other_client = open_client(client_base, &other, "bob", "unchanged").await;
+    let other_open = next_client_json(&mut other_host).await;
+    let mut client = open_client(client_base, &f, "alice", "client_1").await;
     let open = next_client_json(&mut host).await;
     assert_eq!(open["event"], "open");
     let handle = open["channel"].as_str().unwrap();
-    let binding = app.relay.channels().host_binding(handle).unwrap();
+    let binding = client_hub.channels().host_binding(handle).unwrap();
+    assert_ne!(binding.connection.replica, client_hub.replica_id());
+    let mut second = open_client(client_base, &f, "alice", "client_2").await;
+    let second_open = next_client_json(&mut host).await;
+    let mut already_closed = open_client(client_base, &f, "alice", "ended").await;
+    let ended = next_client_json(&mut host).await;
+    send_json(
+        &mut host,
+        json!({"type":"channel","event":"close","channel":ended["channel"],"reason":"closed"}),
+    )
+    .await;
+    assert_eq!(
+        next_client_json(&mut already_closed).await["channel"],
+        "ended"
+    );
     let peer = PolicyStore(db.reconnect(2).await);
     let previous = peer.load(&test_portal()).await.unwrap();
     let mut snapshot = previous.portal_snapshot.clone().unwrap();
@@ -175,20 +249,73 @@ async fn postgres_live_client_channel_gets_its_own_close_after_a_peer_disables_i
     let mut stopped = previous.apply_checkpoint(snapshot, now / 1000).unwrap();
     stopped.record_completed_read(now, now);
     peer.commit(&previous, &stopped).await.unwrap();
+    assert!(store
+        .with_host_suspension(&old_binding, |_| async {
+            panic!("disclosed suspension to replaced host")
+        })
+        .await
+        .is_none());
+    send_json(
+        &mut old_client,
+        json!({"type":"channel","event":"frame","channel":"old","frame":{"probe":true}}),
+    )
+    .await;
+    crate::relay::tests::assert_closed(&mut old_client).await;
     // A host frame already in the broker must pass the current policy on
     // its way out of the queue. The client must see only its terminal close.
     let queued = json!({"type":"channel","event":"frame","channel":handle,"frame":{"probe":true}});
-    assert!(app.relay.channels().reply(handle, &binding.connection, &queued.to_string()));
+    assert!(client_hub
+        .channels()
+        .reply(handle, &binding.connection, &queued.to_string()));
     assert_eq!(
         next_client_json(&mut client).await,
         json!({"type":"channel","event":"close","channel":"client_1","reason":"service_suspended"})
     );
     crate::relay::tests::assert_closed(&mut client).await;
-    host.close(None).await.unwrap();
-    drop(host);
-    drop(client);
-    server.abort();
-    let _ = server.await;
+    // The routed host detects the policy change while the remote client
+    // owns the broker routes. Only its two still-open wire handles close.
+    send_json(&mut host, queued).await;
+    let mut expected =
+        std::collections::BTreeSet::from([handle, second_open["channel"].as_str().unwrap()]);
+    for _ in 0..2 {
+        let close = next_client_json(&mut host).await;
+        assert_eq!(close["reason"], "service_suspended");
+        assert!(expected.remove(close["channel"].as_str().unwrap()));
+    }
+    assert_eq!(
+        next_client_json(&mut host).await,
+        atem_client::station_notice::ServiceSuspended::new(DISABLED)
+            .unwrap()
+            .to_json()
+    );
+    crate::relay::tests::assert_closed(&mut host).await;
+    send_json(
+        &mut second,
+        json!({"type":"channel","event":"frame","channel":"client_2","frame":{"probe":true}}),
+    )
+    .await;
+    assert_eq!(
+        next_client_json(&mut second).await["reason"],
+        "service_suspended"
+    );
+    send_json(&mut other_host, json!({"type":"channel","event":"frame","channel":other_open["channel"],"frame":{"unrelated":true}})).await;
+    assert_eq!(
+        next_client_json(&mut other_client).await,
+        json!({"type":"channel","event":"frame","channel":"unchanged","frame":{"unrelated":true}})
+    );
+    drop((
+        host,
+        client,
+        second,
+        other_host,
+        other_client,
+        already_closed,
+    ));
+    for (_, server, cluster) in replicas {
+        server.abort();
+        cluster.abort();
+    }
     peer.0.close().await;
+    peer_store.pool().unwrap().close().await;
     db.cleanup().await;
 }
