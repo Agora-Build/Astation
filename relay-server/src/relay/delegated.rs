@@ -119,12 +119,13 @@ impl RelayHub {
         let Some(store) = self.inner.recovery.get().filter(|s| s.delegated_enabled()) else {
             return true;
         };
-        store
+        let sent = store
             .with_delegated_response(binding, None, |response| {
                 self.queue_delegated(binding, response)
             })
             .await
-            == Some(true)
+            == Some(true);
+        sent || self.hold_suspended_proxy(binding, None).await
     }
 
     pub(super) async fn delegated_call(&self, connection: &str, text: &str) -> Result<bool, ()> {

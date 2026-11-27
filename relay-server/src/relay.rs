@@ -407,7 +407,7 @@ impl RelayHub {
                 return false;
             };
             let sent = store.with_host_route(binding, send).await;
-            if sent.is_none() && !self.keep_verification(connection).await {
+            if sent.is_none() && !self.hold_suspended_proxy(binding, None).await && !self.keep_verification(connection).await {
                 self.local()
                     .close_with(connection, CLOSE_TRY_AGAIN, "host route changed");
             }
@@ -424,8 +424,13 @@ impl RelayHub {
             };
             store
                 .with_host_route(&binding, || async {
-                    (binding.proxy.is_none() || self.proxy_current(&source.conn).await)
-                        && self.channels().reply(handle, source, frame)
+                    let current = match &binding.proxy {
+                        None => true,
+                        Some(_) if source.replica == self.replica_id() => self.proxy_current(&source.conn).await,
+                        Some(proxy) => matches!(self.room(&binding.room).await, Ok(Some(room))
+                            if room.verified && room.owner.as_ref() == Some(&proxy.native)),
+                    };
+                    current && self.channels().reply(handle, source, frame)
                 })
                 .await
                 .unwrap_or(false)
@@ -897,6 +902,13 @@ impl RelayHub {
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
                     }
                     BusEvent::Inbox(InboxMessage::ChannelDelivered { delivery, accepted }) => hub.channels().delivered(&delivery, accepted),
+                    BusEvent::Inbox(InboxMessage::CheckChannelProxy { connection_id, generation, reply_to, delivery }) => {
+                        let same = hub.host_binding(&connection_id).and_then(|b| b.proxy)
+                            .is_some_and(|proxy| proxy.generation == generation);
+                        let accepted = same && hub.local().contains(&connection_id) && hub.proxy_current(&connection_id).await;
+                        let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
+                    }
+                    BusEvent::Inbox(InboxMessage::RetireChannels { source, handles }) => hub.channels().retire_channels(&source, &handles),
                     BusEvent::Inbox(InboxMessage::ChannelReply { handle, source, frame, reply_to, delivery }) => {
                         let accepted = hub.channel_reply_checked(&handle, &source, &frame).await;
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
@@ -1128,7 +1140,7 @@ impl RelayHub {
         for binding in &bindings {
             if let Some(store) = self.inner.recovery.get() {
                 let current = store.with_host_route(binding, || async { () }).await.is_some();
-                if !current && !self.keep_verification(&binding.connection.conn).await {
+                if !current && !self.hold_suspended_proxy(binding, None).await && !self.keep_verification(&binding.connection.conn).await {
                     self.local().close_with(&binding.connection.conn, CLOSE_TRY_AGAIN, "host route changed");
                 }
             }
@@ -2656,6 +2668,15 @@ where S: futures_util::Sink<Message> + Unpin {
 async fn write_host_frame<S>(sink: &mut S, frame: crate::cluster::local::SocketFrame, hub: Option<&RelayHub>, channels: Option<&host_suspension::RoutedHostChannels>) -> bool
 where S: futures_util::Sink<Message> + Unpin {
     use crate::cluster::local::FrameScope;
+    if let Some((FrameScope::ProxySuspension, binding)) = &frame.route {
+        let (Some(hub), Some(channels)) = (hub, channels) else { return false };
+        if channels.binding.get() != Some(binding) || binding.proxy.is_none() { return false; }
+        // The policy can recover between queue admission and dispatch.
+        return channels.notify(hub, sink, &frame.text).await.unwrap_or(true);
+    }
+    let proxy_heads = frame.route.as_ref().is_some_and(|(scope, binding)|
+        *scope == FrameScope::DelegatedFeed && binding.proxy.is_some())
+        && serde_json::from_str::<serde_json::Value>(&frame.text).is_ok_and(|v| v["op"] == "heads");
     let send = || async move {
         match channels {
             Some(channels) => channels.write(sink, frame.text).await,
@@ -2668,11 +2689,16 @@ where S: futures_util::Sink<Message> + Unpin {
     let write = || async {
         if hub.host_binding(&binding.connection.conn).as_ref() != Some(&binding)
             || !hub.delegated_peer_current(&binding).await { return None; }
-        Some(send().await)
+        let sent = send().await;
+        if sent && proxy_heads {
+            if let Some(channels) = channels { channels.served_heads(); }
+        }
+        Some(sent)
     };
     let written = match scope {
         FrameScope::HostRoute => store.with_host_route(&binding, write).await,
         FrameScope::DelegatedFeed => store.with_delegated_route(&binding, write).await,
+        FrameScope::ProxySuspension => unreachable!("handled before ordinary route writes"),
     }.flatten();
     match written {
         Some(sent) => sent,
@@ -2713,7 +2739,7 @@ where
                     let flush = async {
                         if close_code == CLOSE_TRY_AGAIN {
                             if let (Some(channels), Some(hub)) = (&channels, &hub) {
-                                if channels.finish(hub, &mut ws_sink).await { return true; }
+                                if let Some(sent) = channels.notify(hub, &mut ws_sink, "").await { return sent; }
                             }
                         }
                         while let Ok(text) = outbox.frames.try_recv() {

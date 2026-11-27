@@ -32,8 +32,15 @@ impl Drop for Test {
 
 impl Test {
     async fn new() -> Self {
-        let mut state = crate::tests::test_state();
-        state.recovery = RecoveryStore::memory();
+        Self::with_store(RecoveryStore::memory()).await
+    }
+
+    async fn with_store(store: Arc<RecoveryStore>) -> Self {
+        Self::with_state(crate::tests::test_state(), store).await
+    }
+
+    async fn with_state(mut state: AppState, store: Arc<RecoveryStore>) -> Self {
+        state.recovery = store;
         state.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
         let fixture = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         fixture.publish(&state.recovery).await;
@@ -119,6 +126,223 @@ impl Test {
         send_json(&mut socket, host_route_message(&object)).await;
         socket
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and Redis"]
+async fn postgres_delegated_remote_broker_checks_the_proxy_on_its_own_replica() {
+    use crate::cluster::redis::{connect_cluster, test_support};
+    use crate::station_integrations::tests::attach_test_room_owner;
+    let _redis = test_support::REDIS_LOCK.lock().await;
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    attach_test_room_owner(&store, ORIGIN).await;
+    let mut host_state = crate::tests::test_state();
+    let cluster = connect_cluster(
+        &test_support::test_url(),
+        host_state.identity.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    host_state.relay = cluster.relay.clone();
+    let t = Test::with_state(host_state, store).await;
+    let mut broker_state = t.state.clone();
+    let broker = connect_cluster(
+        &test_support::test_url(),
+        broker_state.identity.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    broker_state.relay = broker.relay.clone();
+    broker_state.recovery = RecoveryStore::postgres(db.reconnect(5).await);
+    broker_state
+        .recovery
+        .configure_delegated(ORIGIN, 1)
+        .await
+        .unwrap();
+    attach_test_room_owner(&broker_state.recovery, ORIGIN).await;
+    let (base, server) = spawn_relay(broker_state.clone()).await;
+    let mut proxy = t.proxy(RouteKind::Proxy).await;
+    assert_eq!(next_client_json(&mut proxy).await["op"], "host_route_ok");
+    assert_eq!(next_client_json(&mut proxy).await["op"], "heads");
+    let url = base.replace(
+        "/ws",
+        &format!(
+            "/api/remote/v1/channels?genesis={}&host=host-a",
+            t.fixture.log.genesis_hash().to_hex()
+        ),
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer alice".parse().unwrap());
+    let mut client = tokio_tungstenite::connect_async(request).await.unwrap().0;
+    send_json(
+        &mut client,
+        json!({"type":"channel","event":"open","channel":"mobile","transport":"relay"}),
+    )
+    .await;
+    let open = next_client_json(&mut proxy).await;
+    let handle = open["channel"].as_str().unwrap();
+    let binding = broker.relay.channels().host_binding(handle).unwrap();
+    assert_ne!(binding.connection.replica, broker.relay.replica_id());
+    assert!(binding.proxy.is_some());
+    let reply =
+        json!({"type":"channel","event":"frame","channel":handle,"frame":{"verified":true}});
+    send_json(&mut proxy, reply.clone()).await;
+    assert_eq!(
+        next_client_json(&mut client).await,
+        json!({"type":"channel","event":"frame","channel":"mobile","frame":{"verified":true}})
+    );
+
+    t.state
+        .identity
+        .unbind("paired-session", "phone")
+        .await
+        .unwrap();
+    assert!(broker
+        .relay
+        .channels()
+        .reply(handle, &binding.connection, &reply.to_string()));
+    crate::relay::tests::assert_closed(&mut client).await;
+    drop((proxy, client, t));
+    server.abort();
+    broker.abort();
+    cluster.abort();
+    broker_state.recovery.pool().unwrap().close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_proxy_resumes_on_its_current_local_authentication() {
+    use crate::integration_feed::{FeedBinding, PolicyStore};
+    use crate::station_integrations::tests::{attach_test_room_owner, OWNER};
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    attach_test_room_owner(&store, ORIGIN).await;
+    let t = Test::with_store(store).await;
+    let mut proxy = t.proxy(RouteKind::Proxy).await;
+    assert_eq!(next_client_json(&mut proxy).await["op"], "host_route_ok");
+    let heads = next_client_json(&mut proxy).await;
+    let ToHost::Heads(heads) = ToHost::decode(heads.to_string().as_bytes()).unwrap() else {
+        panic!("heads")
+    };
+    let call = ControlSync {
+        request_id: Uuid::new_v4().to_string(),
+        origin: ORIGIN.into(),
+        feed_id: Some(heads.feeds[0].feed_id.clone()),
+        after: 0,
+    };
+    let binding = t
+        .state
+        .relay
+        .inner
+        .host_routes
+        .lock()
+        .unwrap()
+        .values()
+        .find(|b| b.proxy.is_some())
+        .unwrap()
+        .clone();
+    let policy = PolicyStore(db.reconnect(2).await);
+    let portal = FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: ORIGIN.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    };
+    let mut previous = policy.load(&portal).await.unwrap();
+    for (cursor, kind) in [
+        (1, "account_disabled"),
+        (2, "account_enabled"),
+        (3, "account_disabled"),
+    ] {
+        let channel = if kind == "account_disabled" {
+            let (channel, _frames, closed) = t
+                .state
+                .relay
+                .channels()
+                .register(
+                    t.state.relay.replica_id(),
+                    "alice",
+                    binding.connection.clone(),
+                    "mobile",
+                )
+                .unwrap();
+            t.state
+                .relay
+                .channels()
+                .bind_host(&channel, binding.clone());
+            let open =
+                json!({"type":"channel","event":"open","transport":"relay","channel":channel});
+            assert!(
+                t.state
+                    .relay
+                    .deliver_channel(&binding.connection, open.to_string())
+                    .await
+            );
+            assert_eq!(next_client_json(&mut proxy).await, open);
+            Some((channel, closed))
+        } else {
+            None
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut page = json!({"changes":[{"id":cursor,"kind":kind,"integrationId":null,"state":null,"reason":"agora_build","account":OWNER}],
+                            "cursor":cursor});
+        if previous.cursor == 0 {
+            page["integrations"] = json!([]);
+        }
+        let mut next = previous
+            .apply(
+                previous.cursor,
+                serde_json::from_value(page).unwrap(),
+                now / 1000,
+            )
+            .unwrap();
+        next.record_completed_read(now, now);
+        policy.commit(&previous, &next).await.unwrap();
+        previous = next;
+        assert!(t.state.relay.delegated_heads(&binding).await);
+        if let Some((channel, mut closed)) = channel {
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                json!({"type":"channel","event":"close","channel":channel,"reason":"service_suspended"})
+            );
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                atem_client::station_notice::ServiceSuspended::new(
+                    "service suspended: account disabled at Agora.Build"
+                )
+                .unwrap()
+                .to_json()
+            );
+            tokio::time::timeout(Duration::from_secs(2), closed.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(*closed.borrow());
+            t.state.relay.cleanup_expired().await;
+            send_json(&mut proxy, call.to_json().unwrap()).await;
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                json!({"type":"relay","op":"control_sync_refused","code":"forbidden"})
+            );
+        } else {
+            assert_eq!(next_client_json(&mut proxy).await["op"], "heads");
+            send_json(&mut proxy, call.to_json().unwrap()).await;
+            assert_eq!(
+                next_client_json(&mut proxy).await["op"],
+                "control_sync_result"
+            );
+        }
+    }
+    proxy.close(None).await.unwrap();
+    drop(t);
+    policy.0.close().await;
+    db.cleanup().await;
 }
 
 #[tokio::test]

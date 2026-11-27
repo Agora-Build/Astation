@@ -99,6 +99,7 @@ pub struct SocketOutbox {
 pub(crate) enum FrameScope {
     HostRoute,
     DelegatedFeed,
+    ProxySuspension,
 }
 
 /// Keep the exact authorization checked at enqueue through the socket write.
