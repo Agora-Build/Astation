@@ -110,7 +110,7 @@ pub(crate) async fn prepare_with_sources(
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    let stops = review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
     let reservations = match ceilings {
         Some(store) => Some(store.reservations(log.account_id(), genesis).await.map_err(|_| invalid())?),
         None => None,
@@ -134,8 +134,12 @@ pub(crate) async fn prepare_with_sources(
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
+        let revokes = snapshot_stops::staged_service_revokes(
+            &mut tx, stops, &prepared, &log, &binding.origin,
+            report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
+        ).await?;
         let source = portal_services::observe(&mut tx, binding, portal, vault, subject, &log,
-            reservations.as_deref(), &observed, &report).await?;
+            reservations.as_deref(), &observed, &report, &revokes).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,

@@ -352,6 +352,68 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_coverage_ends_only_with_this_snapshots_verified_revoke() {
+        use super::super::tests::{append_body, fixture, request};
+        use crate::integration_checkpoint::PortalCheckpoint;
+        use crate::remote_api::recovery::delegated_recovery::{plan, Binding};
+
+        let (db, runtime, fixture) = fixture().await;
+        let genesis = fixture.log.genesis_hash().to_hex();
+        let origin = &runtime.binding.station_origin;
+        runtime.app.recovery.configure_delegated(origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+        let key = draft["fingerprint"].as_str().unwrap();
+        append_body(&runtime, &fixture, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        policy(&runtime, "ready", key, None).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        policy(&runtime, "revoking", key, Some(false)).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        policy(&runtime, "revoked", key, Some(true)).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        let history = feed(&runtime, &genesis).await;
+        assert_eq!(history[1]["body"]["action"], "revoke");
+        assert_eq!(history[2]["body"]["action"], "interrupt_running");
+
+        let fence = Binding::new(origin, 2).unwrap();
+        fence.initialize(&db.pool, true).await.unwrap();
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
+            "at":"2026-11-23T10:00:00.000Z","integrations":[{
+                "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":key,
+                "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+            }]}});
+        let checkpoint = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+        let next = previous.apply_checkpoint(checkpoint, previous.received_at).unwrap();
+        runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+        let replica = db.reconnect(2).await;
+        let review = || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding), None);
+        let before = review().await.unwrap();
+        assert_eq!(before["portal_service_evidence"]["services"][0]["snapshot_review"],
+            json!({"status":"coverage_unresolved","fresh_stop_actions":[]}));
+        let hash = before["reconstruction_hash"].as_str().unwrap();
+        let staged = plan::snapshot_stops::stage(&db.pool, &fence, &genesis, hash).await.unwrap();
+        assert_eq!(staged["stop_count"], 2);
+        let after = review().await.unwrap();
+        assert_eq!(after["portal_service_evidence"]["services"][0]["snapshot_review"],
+            json!({"status":"coverage_ended","coverage_end":{"reason":"snapshot_revoke",
+                "record_id":history[1]["body"]["record_id"]},"fresh_stop_actions":[]}));
+        assert_eq!(after["recovery_ready"], false);
+
+        let plan_id = staged["plan_id"].as_str().unwrap();
+        sqlx::query("UPDATE station_delegated_snapshot_stops SET reconstruction_hash=$2 WHERE plan_id=$1")
+            .bind(plan_id).bind("0".repeat(64)).execute(&db.pool).await.unwrap();
+        assert_eq!(review().await.unwrap()["portal_service_evidence"], before["portal_service_evidence"]);
+        // Retaining the revoke alone must not hide the missing interrupt.
+        sqlx::query("UPDATE station_delegated_snapshot_stops SET reconstruction_hash=$2,records=$3 WHERE plan_id=$1")
+            .bind(plan_id).bind(hash).bind(json!([history[1]])).execute(&db.pool).await.unwrap();
+        assert!(review().await.is_err());
+        replica.close().await;
+        drop(runtime);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_recovery_fences_http_and_preserves_reports_and_client_stops() {
         use crate::remote_api::recovery::delegated_recovery::Binding;
         let (database, mut runtime, _) = super::super::tests::fixture().await;

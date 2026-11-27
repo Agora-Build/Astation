@@ -2,13 +2,13 @@
 use super::{checkpoint, invalid, review_evidence, source_hash, Binding, Prepared};
 use atem_client::{
     control::{
-        check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlRecord,
+        check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlPrincipal, ControlRecord,
         RefusalReason, SnapshotConsistency, SnapshotInput,
     },
     membership::Membership,
 };
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::BTreeMap;
 
 pub(super) struct StopSources {
@@ -22,7 +22,7 @@ impl StopSources {
         log: &Membership,
         origin: &str,
         plan: &Prepared,
-    ) -> Result<Value, sqlx::Error> {
+    ) -> Result<Vec<ControlRecord>, sqlx::Error> {
         let mut originals = Vec::new();
         let mut snapshot = Vec::new();
         for (id, value) in self.signed {
@@ -63,10 +63,48 @@ impl StopSources {
         {
             return Err(invalid());
         }
-        Ok(Value::Array(
-            snapshot.iter().map(|r| r.object().to_json()).collect(),
-        ))
+        Ok(snapshot)
     }
+}
+
+fn records_json(records: &[ControlRecord]) -> Value {
+    Value::Array(records.iter().map(|r| r.object().to_json()).collect())
+}
+
+/// Read only the stop component already committed for this reconstruction.
+/// Reassembly also checks omitted or substituted records after a restore.
+pub(super) async fn staged_service_revokes(
+    connection: &mut PgConnection,
+    sources: StopSources,
+    plan: &Prepared,
+    log: &Membership,
+    origin: &str,
+    reconstruction: &str,
+) -> Result<BTreeMap<(String, String), String>, sqlx::Error> {
+    let staged: Option<Value> = sqlx::query_scalar(
+        "SELECT records FROM station_delegated_snapshot_stops
+         WHERE plan_id=$1 AND reconstruction_hash=$2",
+    )
+    .bind(&plan.plan_id)
+    .bind(reconstruction)
+    .fetch_optional(connection)
+    .await?;
+    let mut revokes = BTreeMap::new();
+    if let Some(staged) = staged {
+        let records = sources.assemble(log, origin, plan)?;
+        if records_json(&records) != staged {
+            return Err(invalid());
+        }
+        for record in records {
+            if let (ControlPrincipal::Service(id), ControlAction::Revoke { .. }) =
+                (record.principal(), record.action())
+            {
+                let fingerprint = record.principal_key().ok_or_else(invalid)?.to_hex();
+                revokes.entry((id.clone(), fingerprint)).or_insert_with(|| record.record_id().to_owned());
+            }
+        }
+    }
+    Ok(revokes)
 }
 
 pub(crate) async fn stage(
@@ -81,7 +119,7 @@ pub(crate) async fn stage(
     if review["reconstruction_hash"] != expected {
         return Err(invalid());
     }
-    let records = sources.assemble(&log, &binding.origin, &plan)?;
+    let records = records_json(&sources.assemble(&log, &binding.origin, &plan)?);
     let records_hash = source_hash(&records)?;
     // The fence and root are locked. Only a changed review replaces a row.
     // An exact retry after a lost response verifies the committed component below.
