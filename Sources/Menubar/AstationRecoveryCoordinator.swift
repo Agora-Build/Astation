@@ -1105,6 +1105,26 @@ final class AstationRecoveryCoordinator {
         publication = nil
     }
 
+    /// A proof requires a foreground owner confirmation even for a recently unlocked Mac.
+    func approveStationBinding(action: BindingAction, previous: ExpectedBinding, session: AccountLoginSession,
+                               current: () -> Bool) async throws -> String {
+        guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
+        let approvals = try RemoteStationBindingApproval(origin: relayURL)
+        return try await approvals.prove(action: action, previous: previous, session: session, managerID: managerID,
+            membership: {
+                try self.requireDurableRecoveryCheckpoint()
+                let log = try RemoteMembershipCheckpoint.load(accountID: self.accountID, genesisHash: kit.genesisHash,
+                    entries: self.saved.entries, storedJSON: self.saved.membership, now: self.now())
+                _ = try log.advance(now: self.now())
+                try self.identity.requireVerifierManager(log: log, memberID: self.managerID)
+                return log
+            }, now: { self.now().wallMs }, current: current, confirm: { review in
+                await withCheckedContinuation { continuation in
+                    DeviceOwnerAuth.authenticate(reason: review.confirmation) { continuation.resume(returning: $0) }
+                }
+            }, sign: { try self.identity.signStationBinding($0, expectedKey: $1) })
+    }
+
     private func refreshedLog(genesis: String, transport: RemoteRecoveryTransport? = nil) async throws -> MembershipLog {
         guard !saved.entries.isEmpty else { throw RemoteRecoveryError.notCommitted }
         try requireDurableRecoveryCheckpoint()

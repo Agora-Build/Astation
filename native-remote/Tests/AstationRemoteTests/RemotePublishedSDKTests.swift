@@ -1,4 +1,5 @@
 import AtemClient
+@testable import AstationRemote
 import Foundation
 import XCTest
 
@@ -204,6 +205,70 @@ final class RemotePublishedSDKTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testNativeBindingSignsOnlyTheTransferReviewedAgainstTheLoginAndLocalHead() async throws {
+        let source = try fixture("r9-vectors-station-binding")
+        let vector = try XCTUnwrap(rows(source["valid"]).first { $0["label"] as? String == "transfer_p256" })
+        let log = try self.log(vector, reports: source)
+        let json = try self.json(XCTUnwrap(vector["challenge"]))
+        let challenge = try parseStationBindingChallenge(challengeJson: json)
+        let originalProof = try XCTUnwrap(vector["proof"] as? String)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(originalProof.utf8)) as? [String: Any])
+        let sig = try XCTUnwrap(RemoteRecoveryKit.decodeBase64URL(XCTUnwrap(envelope["sig"] as? String), count: 64))
+        let station = "https://station-dev.agora.build"
+        let config = try AccountOIDCConfiguration(issuer: "https://auth.dev.agora.build", clientID: "astation",
+            resource: station, requiredScope: "astation.remote")
+        let login = AccountLoginSession(configuration: config, subject: challenge.subject, accessToken: "test-bearer",
+            refreshToken: "", expiresAt: Date(timeIntervalSince1970: Double(challenge.expiresAt) / 1000),
+            authenticatedAt: Int64(challenge.authTime))
+        let transport = BindingChallengeHTTP(challenge: Data(json.utf8))
+        let client = try RemoteStationBindingApproval(origin: station, http: transport)
+        var clock = challenge.issuedAt
+        var stillCurrent = true
+        var confirmations = 0
+        var signatures = 0
+        func prove(_ action: BindingAction, previous: ExpectedBinding, confirm: () -> Bool) async throws -> String {
+            try await client.prove(action: action, previous: previous, session: login, managerID: "dev-phone",
+                membership: { log }, now: { clock }, current: { stillCurrent }, confirm: { review in
+                    confirmations += 1
+                    XCTAssertEqual(review.origin, station)
+                    XCTAssertEqual(review.subject, login.subject)
+                    XCTAssertEqual(review.accountID, log.accountId())
+                    if case .bound(_, _, let owner) = previous { XCTAssertTrue(review.confirmation.contains(owner)) }
+                    return confirm()
+                }, sign: { approved, key in
+                    signatures += 1
+                    XCTAssertEqual(key, log.member(deviceId: "dev-phone")?.authKey)
+                    let request = try approved.consume()
+                    XCTAssertEqual(request.label, "atem-station-binding-v1")
+                    XCTAssertTrue(request.freshConfirmation)
+                    XCTAssertThrowsError(try approved.consume())
+                    return sig
+                })
+        }
+        let proof = try await prove(.transfer, previous: challenge.expectedBinding) { true }
+        XCTAssertEqual(try canonicalJson(json: proof), try canonicalJson(json: originalProof))
+        let sent = await transport.lastRequest
+        XCTAssertEqual(sent?.url?.absoluteString, station + "/agora-build/v1/logs/" + log.genesisHash() + "/binding/challenge")
+        XCTAssertEqual(sent?.value(forHTTPHeaderField: "Authorization"), "Bearer test-bearer")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(sent?.httpBody)) as? [String: Any])
+        XCTAssertEqual(body["action"] as? String, "transfer")
+        XCTAssertEqual(body["signer"] as? String, "member:dev-phone")
+        for (action, previous) in [(BindingAction.unbind, challenge.expectedBinding), (.transfer, .neverBound)] {
+            do { _ = try await prove(action, previous: previous) { true }; XCTFail("changed intent") }
+            catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        }
+        XCTAssertEqual(confirmations, 1)
+        do { _ = try await prove(.transfer, previous: challenge.expectedBinding) { false }; XCTFail("cancelled") }
+        catch { XCTAssertNotNil(error as? RemoteRecoveryError) }
+        do { _ = try await prove(.transfer, previous: challenge.expectedBinding) { stillCurrent = false; return true }; XCTFail("retired login") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        stillCurrent = true
+        do { _ = try await prove(.transfer, previous: challenge.expectedBinding) { clock = challenge.expiresAt; return true }; XCTFail("expired") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        XCTAssertEqual(signatures, 1)
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {
@@ -238,5 +303,18 @@ final class RemotePublishedSDKTests: XCTestCase {
                 XCTAssertEqual(revokeSeq, (expected["revoke_seq"] as? NSNumber)?.uint64Value)
             }
         }
+    }
+}
+
+
+private actor BindingChallengeHTTP: AccountOIDCHTTP {
+    let challenge: Data
+    private(set) var lastRequest: URLRequest?
+
+    init(challenge: Data) { self.challenge = challenge }
+
+    func send(_ request: URLRequest) async throws -> (Data, Int) {
+        lastRequest = request
+        return (challenge, 200)
     }
 }
