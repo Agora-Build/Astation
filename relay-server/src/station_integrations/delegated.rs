@@ -725,7 +725,7 @@ mod tests {
         integration["id"] = json!(ID);
         let value = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
             "at":"2026-11-24T10:00:00.000Z","integrations":[integration],
-            "accounts":{"complete":true,"disabled":[OWNER]},"bindings":[]
+            "accounts":{"complete":true,"disabled":[OWNER]},"bindings":[],"pendingReleases":[]
         }});
         let exact = PortalCheckpoint::parse(&serde_json::to_vec(&value).unwrap(), &runtime.binding).unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -789,7 +789,21 @@ mod tests {
                     "integrationId":null,"state":null,"reason":"agora_build"});
                 let page = json!({"changes":[change(cut, "account_disabled"),change(cut+1, "account_enabled")],
                     "cursor":cut+1});
-                let enabled = before.apply(before.cursor, serde_json::from_value(page).unwrap(), now).unwrap();
+                let mut enabled = before.apply(before.cursor, serde_json::from_value(page).unwrap(), now).unwrap();
+                replica.commit(&before, &enabled).await.unwrap();
+                // The owner is enabled, but a full page or a slow response
+                // supplies no fresh evidence for a new release.
+                assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+                let before = enabled;
+                let caught_up = json!({"changes":[],"cursor":before.cursor});
+                enabled = before.apply(before.cursor, serde_json::from_value(caught_up.clone()).unwrap(), now).unwrap();
+                let received = chrono::Utc::now().timestamp_millis();
+                enabled.record_completed_read(received - 60_000, received);
+                replica.commit(&before, &enabled).await.unwrap();
+                assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+                let before = enabled;
+                enabled = before.apply(before.cursor, serde_json::from_value(caught_up).unwrap(), now).unwrap();
+                enabled.record_completed_read(received, received);
                 replica.commit(&before, &enabled).await.unwrap();
             }
             let result = runtime.reconcile_delegated_service(ID).await;

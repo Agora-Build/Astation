@@ -799,6 +799,68 @@ async fn postgres_binding_release_requires_an_exact_current_bound_head_and_open_
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_bound_feed_age_starts_before_http_and_requires_a_completed_read() {
+    use crate::integration_feed::PAGE_LIMIT;
+    use crate::integration_portal::tests::Fixture;
+
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let store = PolicyStore(db.pool.clone());
+    let peer = PolicyStore(db.reconnect(2).await);
+    let mut portal = Fixture::new().await;
+    portal.binding.station_origin = binding(true).station_origin;
+    let client = portal.client();
+    let genesis = "b".repeat(64);
+    let accepted = |p: &PolicyCheckpoint, now| p.binding_feed_current("acct-1", &genesis, now);
+    let initial = save_release_checkpoint(&store, &portal.binding, source(true)["checkpoint"]["bindings"].clone(),
+        Some(json!([]))).await;
+    assert!(!accepted(&initial, chrono::Utc::now().timestamp_millis()));
+    *portal.shared.feed.lock().await = Some(json!({"cursor":12,"changes":[]}));
+
+    // Hold the HTTP response after the server observes the request.
+    let reply = portal.shared.feed.lock().await;
+    let poll = client.poll(&store, false);
+    tokio::pin!(poll);
+    let seen = async {
+        while portal.shared.cursors.lock().await.is_empty() { tokio::task::yield_now().await; }
+    };
+    tokio::select! {
+        _ = tokio::time::timeout(std::time::Duration::from_secs(2), seen) => {
+            assert_eq!(*portal.shared.cursors.lock().await, [12]);
+        }
+        early = &mut poll => panic!("poll returned before the Portal response: {early:?}"),
+    }
+    let seen_ms = chrono::Utc::now().timestamp_millis();
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    drop(reply);
+    assert_eq!(poll.await, Ok(false));
+    let fresh = peer.load(&portal.binding).await.unwrap();
+    let start = serde_json::to_value(&fresh).unwrap()["feed_read_started_ms"].as_i64().unwrap();
+    assert!(start <= seen_ms);
+    assert!(!accepted(&fresh, start - 1));
+    assert!(accepted(&fresh, start + 59_999));
+    assert!(!accepted(&fresh, start + 60_000));
+
+    portal.set_status(503);
+    assert!(client.poll(&store, false).await.is_err());
+    assert_eq!(peer.load(&portal.binding).await.unwrap(), fresh);
+    portal.set_status(200);
+    let end = 12 + PAGE_LIMIT as u64;
+    let changes: Vec<_> = (13..=end).map(|id| json!({"id":id,"kind":"noop"})).collect();
+    *portal.shared.feed.lock().await = Some(json!({"cursor":end,"changes":changes}));
+    assert_eq!(client.poll(&store, false).await, Ok(true));
+    assert!(!accepted(&peer.load(&portal.binding).await.unwrap(), start));
+    *portal.shared.feed.lock().await = Some(json!({"cursor":end,"changes":[]}));
+    assert_eq!(client.poll(&store, false).await, Ok(false));
+    assert!(accepted(&peer.load(&portal.binding).await.unwrap(), chrono::Utc::now().timestamp_millis()));
+    portal.set_status(403);
+    assert!(client.poll(&store, false).await.is_err());
+    assert!(!accepted(&peer.load(&portal.binding).await.unwrap(), start));
+    peer.0.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_binding_release_confirmation_requires_authoritative_settlement() {
     use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
 
