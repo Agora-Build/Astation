@@ -16,7 +16,7 @@ pub(crate) struct DelegatedReportAnswer {
     pub retry_after_ms: Option<u64>,
 }
 
-fn delegated_report_body(intent: &ReportIntent) -> Value {
+pub(crate) fn delegated_report_body(intent: &ReportIntent) -> Value {
     let mut body = json!({"integrationId":intent.report.integration_id(),
         "state":intent.report.kind(), "reportId":intent.report_id});
     match &intent.report {
@@ -111,11 +111,11 @@ pub(crate) struct IntegrationReport<'a> {
 impl PortalReportClient {
     /// Called only with an intent from a committed ledger. Unlike legacy
     /// reports, every HTTP status has a shared, explicit settlement rule.
-    pub(crate) async fn delegated_report(&self, intent: &ReportIntent) -> DelegatedReportAnswer {
+    pub(crate) async fn delegated_report(&self, body: &Value) -> DelegatedReportAnswer {
         let retry = || DelegatedReportAnswer { answer: ReportAnswer::Retry, retry_after_ms: None };
         let Ok(token) = self.access_token().await else { return retry() };
         let Ok(response) = self.http.post(format!("{}/api/v1/stations/reports", self.binding.portal_origin))
-            .bearer_auth(token).json(&delegated_report_body(intent)).send().await else { return retry() };
+            .bearer_auth(token).json(body).send().await else { return retry() };
         let status = response.status().as_u16();
         let retry_after_ms = if status == 429 {
             response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok())
@@ -597,7 +597,7 @@ pub(crate) mod tests {
             (200, ReportAnswer::Confirm), (403, ReportAnswer::StopReporting),
             (409, ReportAnswer::Refuse), (429, ReportAnswer::Retry), (302, ReportAnswer::Refuse), (204, ReportAnswer::Refuse)] {
             fixture.set_status(status);
-            assert_eq!(client.delegated_report(&intent).await.answer, answer);
+            assert_eq!(client.delegated_report(&delegated_report_body(&intent)).await.answer, answer);
         }
         assert_eq!(fixture.shared.tokens.load(Ordering::SeqCst), 2);
         assert!(fixture.shared.reports.lock().await.iter().all(|report| report == &body));

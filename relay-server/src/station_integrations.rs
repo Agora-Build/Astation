@@ -48,6 +48,7 @@ mod revocation;
 mod delegated;
 mod verifier_inventory;
 mod binding_challenges;
+mod binding_reports;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationState(pub Option<Arc<StationIntegrations>>);
