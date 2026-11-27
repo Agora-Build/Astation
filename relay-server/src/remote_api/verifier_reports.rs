@@ -57,6 +57,8 @@ pub(super) struct Record {
     external_grant: Option<external::Grant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     first_external_fetch_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    external_answered: bool,
 }
 
 pub(super) enum Command {
@@ -188,6 +190,7 @@ pub(super) fn apply(
                 closed: false,
                 external_grant: None,
                 first_external_fetch_ms: None,
+                external_answered: false,
             };
             if let Some(previous) = records.get(&nonce) {
                 if previous.challenge != record.challenge || previous.head != record.head {

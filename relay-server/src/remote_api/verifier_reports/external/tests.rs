@@ -222,9 +222,17 @@ async fn exercise_inbox(origin: &str) {
         .await
         .unwrap();
     let read = async |token: &VerifiedServiceToken, slot: &str| {
-        peer.external_verifier_requests(binding, &genesis, token, slot, log.head())
-            .await
-            .unwrap()
+        peer.external_verifier(
+            binding,
+            &genesis,
+            token,
+            ExternalVerifierRequest::Inbox {
+                slot: slot.into(),
+                expected: log.head(),
+            },
+        )
+        .await
+        .unwrap()
     };
     assert_eq!(
         read(&token, "sdk").await.1 .0["challenges"],
@@ -239,6 +247,84 @@ async fn exercise_inbox(origin: &str) {
         .await
         .unwrap();
     assert_eq!(read(&other, "sdk").await.0, StatusCode::NOT_FOUND);
+    let answered = make(4).await;
+    let answer_nonce = URL_SAFE_NO_PAD.encode(answered.nonce());
+    let signed = |process: u8| {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let signer = format!("service:{member}");
+        let mut body = atem_client::member_report::verifier_report_body(
+            &log, &answered, &signer, "sdk", origin, now,
+        )
+        .unwrap()
+        .to_json();
+        body["process"] = json!(URL_SAFE_NO_PAD.encode([process; 16]));
+        atem_client::SignedObject::sign(&f.keys, &key, body)
+            .unwrap()
+            .to_json()
+    };
+    let submit = async |report: &Value| {
+        use tower::ServiceExt;
+        let request = axum::http::Request::post(format!(
+            "/agora-build/v1/logs/{genesis}/verifier-reports/{answer_nonce}"
+        ))
+        .header("authorization", format!("Bearer {raw}"))
+        .body(axum::body::Body::from(json!({"report":report}).to_string()))
+        .unwrap();
+        let reply = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(reply.headers()["cache-control"], "no-store");
+        let status = reply.status();
+        let bytes = axum::body::to_bytes(reply.into_body(), 16384)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    let native_read = async || {
+        store
+            .perform(
+                &genesis,
+                PRINCIPAL,
+                Operation::VerifierReport {
+                    origin: origin.into(),
+                    command: Command::Read {
+                        nonce: answer_nonce.clone(),
+                    },
+                },
+            )
+            .await
+    };
+    let one = signed(1);
+    let two = signed(2);
+    assert_eq!(submit(&one).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        http(&raw).await.1["challenges"].as_array().unwrap().len(),
+        2
+    );
+    sqlx::raw_sql(
+        "CREATE CONSTRAINT TRIGGER reject_answer AFTER UPDATE ON remote_recovery_roots
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_fetch()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(submit(&one).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    sqlx::query("DROP TRIGGER reject_answer ON remote_recovery_roots")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(native_read().await.1 .0["reports"], json!([]));
+    let accepted = (StatusCode::OK, json!({"accepted":true}));
+    assert_eq!(submit(&one).await, accepted);
+    assert_eq!(submit(&one).await, accepted);
+    assert_eq!(native_read().await.1 .0["reports"], json!([one]));
+    assert_eq!(http(&raw).await.1["challenges"], json!([first.to_json()]));
+    assert_eq!(submit(&two).await.0, StatusCode::CONFLICT);
+    assert_eq!(submit(&one).await.0, StatusCode::CONFLICT);
+    let reports = native_read().await.1 .0["reports"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(reports.len(), 2);
+    assert!(reports.contains(&one) && reports.contains(&two));
     // Another replica can observe a pause using a rotated report credential first.
     let mut rotated = binding.clone();
     rotated.report_client_id = "s-11234567890123456789012345".into();
@@ -261,6 +347,8 @@ async fn exercise_inbox(origin: &str) {
         .await
         .unwrap();
     assert_eq!(http(&raw).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(submit(&one).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(native_read().await.0, StatusCode::CONFLICT);
     poll(vec![
         (2, "integration_paused", "paused"),
         (3, "integration_resumed", "ready"),

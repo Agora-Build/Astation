@@ -389,6 +389,7 @@ pub(crate) fn routes_with_runtime(runtime: Option<Arc<StationIntegrations>>) -> 
         .route("/agora-build/v1/logs/:genesis/binding/transfer-consent", post(binding_challenges::consent))
         .route("/agora-build/v1/logs/:genesis/verifiers/services", post(verifier_inventory::services))
         .route("/agora-build/v1/logs/:genesis/verifier-requests", post(verifier_inventory::external_requests))
+        .route("/agora-build/v1/logs/:genesis/verifier-reports/:nonce", post(verifier_inventory::external_answer))
         .route(
             "/agora-build/v1/integrations/:id/provision",
             post(provision),

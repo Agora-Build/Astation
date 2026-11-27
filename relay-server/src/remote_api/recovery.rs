@@ -48,6 +48,7 @@ pub(crate) mod verifier_replicas;
 
 #[path = "verifier_reports.rs"]
 pub(super) mod verifier_reports;
+pub(crate) use verifier_reports::external::ExternalVerifierRequest;
 
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
@@ -939,7 +940,12 @@ impl RecoveryStore {
             },
             None => None,
         };
-        if let Operation::VerifierReport { origin, .. } = &operation {
+        if let Operation::VerifierReport { origin, command } = &operation {
+            if let Some(root) = root.as_ref() {
+                if !verifier_reports::external::readable(connection, self.verifier_portal.get(), &owner, hash, root, command).await? {
+                    return Ok(error(StatusCode::CONFLICT, "verifier_report_context_changed"));
+                }
+            }
             if self.delegated_enabled() && crate::account_identity::built_in_station(origin) {
                 let Some(root) = root.as_ref() else {
                     return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
