@@ -388,9 +388,20 @@ async fn serve(
                 let Some(reply) = reply else { break };
                 let is_close = Envelope::parse(&reply.text).is_some_and(|e| e.event == "close");
                 if is_close { guard.notify_host = false; }
-                let result = tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(reply.text))).await;
+                let write = || tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(reply.text)));
+                // A peer may have disabled the account after queue admission.
+                // Hold the proved association through the bounded socket write.
+                let sent = if let Some(binding) = &binding {
+                    matches!(recovery.with_host_route(binding, write).await, Some(Ok(Ok(()))))
+                } else if let Some(route) = &owner_route {
+                    recovery.with_owner_route(route, None, || async {
+                        hub.owner_route_current(route).await && matches!(write().await, Ok(Ok(())))
+                    }).await == Some(true)
+                } else {
+                    false
+                };
                 drop(reply._bytes);
-                if !matches!(result, Ok(Ok(()))) || is_close { break; }
+                if !sent || is_close { break; }
             }
             incoming = socket.next() => {
                 match incoming {
@@ -409,6 +420,13 @@ async fn serve(
                     _ => break,
                 }
             }
+        }
+    }
+    if let Some(binding) = binding.as_ref().filter(|_| recovery.delegated_enabled()) {
+        if recovery.host_suspension(binding).await.is_some() {
+            guard.notify_host = false;
+            let close = json!({"type":"channel","event":"close","channel":open.channel,"reason":"service_suspended"});
+            let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Text(close.to_string()))).await;
         }
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;

@@ -160,6 +160,39 @@ async fn no_mac_reconnect_restores_route_after_entire_directory_restart() {
 }
 
 #[tokio::test]
+async fn queued_owner_present_reply_requires_the_room_owner_at_dispatch() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let store = RecoveryStore::memory();
+    let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+    f.publish(&store).await;
+    let app = state(store);
+    let (base, server) = spawn_relay(app.clone()).await;
+    let (mut owner, _) = crate::relay::tests::connect_astation(&base, "phone").await;
+    let mut host = connect_atem(&base, "phone", "host-a").await;
+    assert_eq!(next_client_json(&mut host).await["op"], "host_challenge");
+    assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+    let url = base.replace("/ws", &format!("/api/remote/v1/channels?genesis={}&host=host-a", f.log.genesis_hash().to_hex()));
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert("authorization", "Bearer alice".parse().unwrap());
+    let mut client = tokio_tungstenite::connect_async(request).await.unwrap().0;
+    send_json(&mut client, json!({"type":"channel","event":"open","channel":"mobile","transport":"relay"})).await;
+    let open = next_client_json(&mut host).await;
+    let handle = open["channel"].as_str().unwrap();
+    let route = app.relay.channels().owner_route(handle).unwrap();
+    let reply = json!({"type":"channel","event":"frame","channel":handle,"frame":{"probe":true}}).to_string();
+    assert!(app.relay.channels().reply(handle, &route.connection, &reply));
+    assert_eq!(next_client_json(&mut client).await["frame"], json!({"probe":true}));
+
+    // A peer has already removed the owner from the directory. The local
+    // broker still has a queued reply and the durable membership is unchanged.
+    let room = app.relay.room("phone").await.unwrap().unwrap();
+    app.relay.directory().leave_astation("phone", &room.owner.unwrap().conn).await.unwrap();
+    assert!(app.relay.channels().reply(handle, &route.connection, &reply));
+    crate::relay::tests::assert_closed(&mut client).await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn owner_present_bootstrap_without_a_membership_pin_keeps_carrier_a() {
     let app = state(RecoveryStore::memory());
     let (base, server) = spawn_relay(app).await;

@@ -19,6 +19,15 @@ const ORIGIN: &str = "https://station-dev.agora.build";
 const DISABLED: &str = "service suspended: account disabled at Agora.Build";
 const NO_OWNER: &str = "service suspended: no Agora.Build owner at this Station";
 
+fn test_portal() -> crate::integration_feed::FeedBinding {
+    crate::integration_feed::FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: ORIGIN.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn postgres_proved_relay_and_proxy_receive_only_confirmed_suspensions() {
@@ -29,12 +38,7 @@ async fn postgres_proved_relay_and_proxy_receive_only_confirmed_suspensions() {
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     f.publish(&store).await;
     let policy = PolicyStore(db.pool.clone());
-    let portal = crate::integration_feed::FeedBinding {
-        issuer: "https://auth.example".into(),
-        portal_origin: "https://portal.example".into(),
-        station_origin: ORIGIN.into(),
-        report_client_id: "s-01234567890123456789012345".into(),
-    };
+    let portal = test_portal();
     let mut previous = policy.load(&portal).await.unwrap();
     let (base, server) = spawn_relay(state(store.clone())).await;
     for (expected, fresh) in [(DISABLED, true), (DISABLED, false), (NO_OWNER, true)] {
@@ -124,5 +128,67 @@ async fn postgres_proved_relay_and_proxy_receive_only_confirmed_suspensions() {
         assert_eq!(saved[key], json!({}));
     }
     server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_live_client_channel_gets_its_own_close_after_a_peer_disables_its_owner() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
+    attach_test_room_owner(&store, ORIGIN).await;
+    let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+    f.publish(&store).await;
+    let app = state(store.clone());
+    let (base, server) = spawn_relay(app.clone()).await;
+    let mut host = connect_atem(&base, "phone", "host-a").await;
+    super::prove(&mut host, &f.keys, &f.host_key, &f.log, "host-a").await;
+    assert_eq!(next_client_json(&mut host).await["op"], "heads");
+    let url = base.replace(
+        "/ws",
+        &format!(
+            "/api/remote/v1/channels?genesis={}&host=host-a",
+            f.log.genesis_hash().to_hex()
+        ),
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer alice".parse().unwrap());
+    let mut client = tokio_tungstenite::connect_async(request).await.unwrap().0;
+    send_json(
+        &mut client,
+        json!({"type":"channel","event":"open","channel":"client_1","transport":"relay"}),
+    )
+    .await;
+    let open = next_client_json(&mut host).await;
+    assert_eq!(open["event"], "open");
+    let handle = open["channel"].as_str().unwrap();
+    let binding = app.relay.channels().host_binding(handle).unwrap();
+    let peer = PolicyStore(db.reconnect(2).await);
+    let previous = peer.load(&test_portal()).await.unwrap();
+    let mut snapshot = previous.portal_snapshot.clone().unwrap();
+    snapshot.accounts.as_mut().unwrap().disabled = vec![OWNER.into()];
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut stopped = previous.apply_checkpoint(snapshot, now / 1000).unwrap();
+    stopped.record_completed_read(now, now);
+    peer.commit(&previous, &stopped).await.unwrap();
+    // A host frame already in the broker must pass the current policy on
+    // its way out of the queue. The client must see only its terminal close.
+    let queued = json!({"type":"channel","event":"frame","channel":handle,"frame":{"probe":true}});
+    assert!(app.relay.channels().reply(handle, &binding.connection, &queued.to_string()));
+    assert_eq!(
+        next_client_json(&mut client).await,
+        json!({"type":"channel","event":"close","channel":"client_1","reason":"service_suspended"})
+    );
+    crate::relay::tests::assert_closed(&mut client).await;
+    host.close(None).await.unwrap();
+    drop(host);
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    peer.0.close().await;
     db.cleanup().await;
 }
