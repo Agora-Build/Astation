@@ -15,6 +15,15 @@ pub(super) struct Availability {
 }
 
 impl super::PolicyCheckpoint {
+    /// None means that the local baseline cannot establish this account's state.
+    pub(crate) fn route_account_disabled(&self, owner: Option<&str>) -> Option<bool> {
+        let view = self.availability.as_ref()?;
+        if !view.current_at(self.cursor) || owner.is_some_and(|id| !account_id(id)) {
+            return None;
+        }
+        Some(owner.is_some_and(|id| view.disabled.contains(id)))
+    }
+
     /// A never-bound list still has room owners, including rooms whose last
     /// connection has since closed. A live presence scan cannot replace them.
     pub(crate) async fn retained_room_owner_denied(
@@ -50,11 +59,13 @@ impl Availability {
     }
 
     pub(super) fn enabled_at(&self, cursor: u64, owner: &str) -> bool {
-        self.cursor == cursor
-            && self.caught_up
-            && self.complete
+        self.current_at(cursor)
             && account_id(owner)
             && !self.disabled.contains(owner)
+    }
+
+    fn current_at(&self, cursor: u64) -> bool {
+        self.cursor == cursor && self.caught_up && self.complete
     }
 
     pub(super) fn advance(&mut self, from: u64, to: u64, changes: &[Change]) -> Result<(), ()> {

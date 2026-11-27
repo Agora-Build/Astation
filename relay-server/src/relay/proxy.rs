@@ -260,7 +260,8 @@ async fn run(
                 }
                 hub.delegated_heads(&route).await.then_some(())
             }
-            Err(crate::remote_api::recovery::HostRouteError::Refused(frame)) => {
+            Err(crate::remote_api::recovery::HostRouteError::Refused(frame)
+                | crate::remote_api::recovery::HostRouteError::Suspended(frame)) => {
                 hub.local().send_required(&id, frame.to_string());
                 None
             }

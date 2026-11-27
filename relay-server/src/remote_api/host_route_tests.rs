@@ -15,6 +15,10 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "host_suspension_tests.rs"]
+mod suspension;
+
 #[path = "host_verification_tests.rs"]
 mod verification;
 

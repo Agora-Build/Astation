@@ -1,5 +1,5 @@
 //! Ownership evidence for proved routes on the built-in Station.
-use super::super::HostBinding;
+use super::super::{HostBinding, RouteService};
 use super::{invalid_root, Membership, Root};
 use crate::auth::session_id_for_room;
 use crate::identity_store::BINDING_TTL_SECS;
@@ -439,19 +439,19 @@ pub(super) async fn inspect(
 
 /// Check the signed-in service owner inside the transaction that admits the
 /// proof or dispatches the frame. The caller holds the proved root lock.
-pub(in crate::remote_api::recovery) async fn may_serve(
+pub(in crate::remote_api::recovery) async fn route_service(
     db: &mut PgConnection,
     station: &FeedBinding,
     principal: &str,
     account: &str,
     genesis: &str,
     room: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<RouteService, sqlx::Error> {
     let policy = PolicyStore::lock_for_binding(db, station)
         .await
         .map_err(|_| invalid_root())?;
     if !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) {
-        return Ok(false);
+        return Ok(RouteService::Unavailable);
     }
     let binding = policy.effective_binding(db, account, genesis).await?;
     if policy
@@ -459,26 +459,35 @@ pub(in crate::remote_api::recovery) async fn may_serve(
         .await
         .map_err(|_| invalid_root())?
     {
-        return Ok(false);
+        return Ok(RouteService::Unavailable);
     }
     let owner = match binding {
-        Some(row) if row.binding_state == "bound" => row.account,
-        Some(_) => return Ok(false),
-        None => {
-            let Some(owner) = legacy_owner(db, station, genesis, room, principal).await? else {
-                return Ok(false);
-            };
-            owner
-        }
+        Some(row) if row.binding_state == "bound" => Some(row.account),
+        Some(_) => None,
+        None => legacy_owner(db, station, genesis, room, principal).await?,
     };
-    if !policy.allows_delegated_release(&owner) {
-        return Ok(false);
+    let Some(disabled) = policy.route_account_disabled(owner.as_deref()) else {
+        return Ok(RouteService::Unavailable);
+    };
+    // Disabled observations reserve cursor + 1 for that account. A higher
+    // floor, or a higher global cut, means another replica has newer evidence.
+    let behind: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM station_delegated_availability_fences
+         WHERE issuer=$1 AND portal_origin=$2 AND station_origin=$3
+           AND ((account='' AND minimum_cursor>$5)
+             OR (account=$4 AND minimum_cursor>$5+$6)))"
+    )
+    .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+    .bind(owner.as_deref()).bind(policy.cursor as i64).bind(i64::from(disabled))
+    .fetch_one(db).await?;
+    if behind || !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) {
+        return Ok(RouteService::Unavailable);
     }
-    let denied: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM station_delegated_availability_fences
-        WHERE issuer=$1 AND portal_origin=$2 AND station_origin=$3 AND account IN ('',$4) AND minimum_cursor>$5)")
-        .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
-        .bind(&owner).bind(policy.cursor as i64).fetch_one(db).await?;
-    Ok(!denied && policy.recent_d27_read(chrono::Utc::now().timestamp_millis()))
+    Ok(match owner {
+        None => RouteService::NoOwner,
+        Some(_) if disabled => RouteService::Disabled,
+        Some(_) => RouteService::Allowed,
+    })
 }
 
 async fn legacy_owner(
@@ -504,8 +513,10 @@ async fn legacy_owner(
         .bind(&station.issuer).bind(&station.station_origin).bind(genesis).bind(room).bind(session)
         .bind(principal).bind(BINDING_TTL_SECS).fetch_one(db).await?;
     let (retained, conflicted, direct, registered, session_owner, has_session, root) = row;
-    if conflicted
-        || registered && direct.is_none()
+    if conflicted {
+        return Err(invalid_root());
+    }
+    if registered && direct.is_none()
         || has_session && session_owner.is_none()
         || session.is_some() && !has_session && retained.is_none()
     {
@@ -513,7 +524,10 @@ async fn legacy_owner(
     }
     let mut candidates = [retained, direct, session_owner].into_iter().flatten();
     if let Some(owner) = candidates.next() {
-        return Ok((account_id(&owner) && candidates.all(|s| s == owner)).then_some(owner));
+        if !account_id(&owner) || candidates.any(|s| s != owner) {
+            return Err(invalid_root());
+        }
+        return Ok(Some(owner));
     }
     Ok(root.filter(|s| account_id(s)))
 }
