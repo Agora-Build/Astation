@@ -122,6 +122,21 @@ final class StationLocalProxy {
             if phase == .proof, op == "host_route_refused" {
                 refuse(finalLocal: bytes); return
             }
+            if phase == .ready, op == "service_suspended" {
+                guard bytes.count <= 1024, fields["v"] == .integer(1),
+                      Set(object.keys) == ["type", "op", "v", "text"],
+                      let reason = fields["text"]?.string, (1...256).contains(reason.utf8.count),
+                      !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !reason.unicodeScalars.contains(where: {
+                          [.control, .format, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
+                      }) else { return }
+                // The host owns the suspension gate. Invalidate outstanding
+                // Station calls and forward the original notice on this link.
+                pending = nil
+                timer?.cancel()
+                forwardLocal(bytes)
+                return
+            }
             guard phase == .ready, let reply = try? relayDecodeToHost(message: text) else { return }
             switch reply {
             case .heads(let heads, _):
