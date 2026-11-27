@@ -23,8 +23,8 @@ const MAX_REPORTS: usize = 4;
 const MAX_BODY: usize = 16_640;
 const TOMBSTONE_MS: u64 = 30_000;
 
-/// Called with the account root locked. Refuse a competing policy writer
-/// instead of waiting for its root lock while holding our own.
+/// Check the authenticated owner of an account-private verifier operation.
+/// Mailbox callers already hold the root lock, so do not wait for a policy writer.
 pub(super) async fn portal_allows(
     tx: &mut sqlx::PgConnection, portal: &crate::integration_feed::FeedBinding,
     principal: &str, account: &str, genesis: &str,

@@ -47,9 +47,10 @@ pub(crate) async fn verifiers(
     let Some(registry) = state.recovery.verifier_replicas() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "verifier_inventory_unavailable");
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(10), registry.snapshot_for(&genesis, &owner)).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), registry.snapshot_for(&genesis, &owner, state.recovery.verifier_portal.get())).await {
         Ok(Ok(Some(snapshot))) => (StatusCode::OK, axum::Json(snapshot)),
         Ok(Ok(None)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+        Ok(Err(super::verifier_replicas::InventoryError::Suspended)) => error(StatusCode::SERVICE_UNAVAILABLE, "service_suspended"),
         _ => error(StatusCode::SERVICE_UNAVAILABLE, "verifier_inventory_unavailable"),
     }
 }
