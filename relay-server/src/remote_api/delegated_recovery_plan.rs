@@ -16,6 +16,8 @@ pub(crate) mod reporting_history;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
+#[path = "delegated_service_drafts.rs"]
+mod service_drafts;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
@@ -145,6 +147,9 @@ pub(crate) async fn prepare_with_sources(
             "source": source,
         }))?.into();
         report["portal_service_evidence"] = source;
+        if vault.is_some() && ceilings.is_some() {
+            report["service_drafts"] = service_drafts::prepare(&mut tx, &prepared, &log, binding, &report).await?;
+        }
         report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
     }
     tx.commit().await?;

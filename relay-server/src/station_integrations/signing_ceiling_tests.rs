@@ -688,3 +688,92 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     primary.cleanup().await;
     external.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_service_drafts_retry_without_signing_or_reopening() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use atem_client::control::{ControlAction, ControlBody};
+
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql")).execute(&external.pool).await.unwrap();
+    let (primary, runtime, fixture) = fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    let service = format!("svc-{ID}");
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    let enrollment = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(&runtime, &fixture, serde_json::from_str(enrollment["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    let key = enrollment["fingerprint"].as_str().unwrap();
+    let store = recovery.signing_ceilings.get().unwrap();
+    assert_eq!(recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0, StatusCode::OK);
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+    let replica = primary.reconnect(2).await;
+    let policy = async |state: &str| {
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-27T10:00:00.000Z",
+            "integrations":[{"id":ID,"ownerAccount":OWNER,"state":state,"scopes":["agent.view"],"r9Svc":key,
+            "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}]}});
+        let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+        let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
+        runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+    };
+    let prepare = async |pool: &sqlx::PgPool| {
+        plan::prepare_with_sources(pool, &fence, &genesis, Some(store), Some(&runtime.binding), Some(&runtime.vault)).await
+    };
+    policy("paused").await;
+    let (a, b) = tokio::join!(prepare(&primary.pool), prepare(&replica));
+    let review = a.unwrap();
+    let draft = &review["service_drafts"];
+    assert_eq!(draft, &b.unwrap()["service_drafts"]);
+    assert_eq!(draft["status"], "prepared");
+    let bodies: Vec<_> = draft["unsigned_bodies"].as_array().unwrap().iter()
+        .map(|body| ControlBody::from_json(body).unwrap()).collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0].action, ControlAction::Cover);
+    assert_eq!(bodies[1].action, ControlAction::Hold);
+    assert_eq!(bodies[0].issued_at + 1, bodies[1].issued_at);
+    assert_ne!(bodies[0].record_id, bodies[1].record_id);
+    assert_eq!(bodies[0].principal.id(), service);
+    assert_eq!(bodies[0].principal_key.unwrap().to_hex(), key);
+    assert_eq!(bodies[0].feed.as_ref().unwrap().feed_id, review["candidate_feed_id"]);
+    assert_eq!(store.reservations(fixture.log.account_id(), &genesis).await.unwrap()[0].highest_ms, 0);
+    let read = "SELECT bodies FROM station_delegated_service_drafts WHERE plan_id=$1";
+    let plan_id = review["plan_id"].as_str().unwrap();
+    policy("ready").await;
+    sqlx::raw_sql("CREATE FUNCTION reject_draft() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected failure'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_draft AFTER UPDATE ON station_delegated_service_drafts
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_draft()")
+        .execute(&primary.pool).await.unwrap();
+    assert!(prepare(&replica).await.is_err());
+    assert_eq!(sqlx::query_scalar::<_,Value>(read).bind(plan_id).fetch_one(&replica).await.unwrap(), draft["unsigned_bodies"]);
+    sqlx::query("DROP TRIGGER reject_draft ON station_delegated_service_drafts").execute(&primary.pool).await.unwrap();
+    let resumed = prepare(&replica).await.unwrap();
+    let active = &resumed["service_drafts"];
+    assert_ne!(active["source_hash"], draft["source_hash"]);
+    assert_eq!(active["unsigned_bodies"][1]["action"], "release");
+    assert_ne!(active["unsigned_bodies"][0]["record_id"], draft["unsigned_bodies"][0]["record_id"]);
+    // Change both the stored object and its digest: retry checks the exact action too.
+    let mut wrong = active["unsigned_bodies"].clone();
+    wrong[1]["action"] = json!("hold");
+    let digest = atem_client::canonical::jcs(&wrong).unwrap();
+    let hash = ring::digest::digest(&ring::digest::SHA256, digest.as_bytes()).as_ref()
+        .iter().map(|b| format!("{b:02x}")).collect::<String>();
+    sqlx::query("UPDATE station_delegated_service_drafts SET bodies=$1,bodies_hash=$2")
+        .bind(&wrong).bind(hash).execute(&primary.pool).await.unwrap();
+    assert!(prepare(&replica).await.is_err());
+    let future = chrono::Utc::now().timestamp_millis() as u64 + 60_000;
+    store.reserve(fixture.log.account_id(), &genesis, &service, key, 0, future..=future).await.unwrap();
+    let waiting = prepare(&replica).await.unwrap();
+    assert_eq!(waiting["service_drafts"]["status"], "waiting_for_clock");
+    assert_eq!(waiting["recovery_ready"], false);
+    assert!(feed(&runtime, &genesis).await.is_empty());
+    assert!(fence.lock(&mut *replica.acquire().await.unwrap()).await.is_err());
+    replica.close().await;
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
