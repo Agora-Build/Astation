@@ -370,7 +370,7 @@ public final class RemoteControlPublication {
             return request
         }
         guard saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
-        try draftJournal(log, manager).withPermittedStopChange(origin: body.origin) {
+        try draftJournal(log, manager).withPermittedStopChange(bodyJSON: operation.bodyJSON) {
             try transaction { $0.operations.append(operation) }
         }
         return request
@@ -405,7 +405,7 @@ public final class RemoteControlPublication {
         let signer = try RemoteConfirmedSigner(provider: provider, request: request, confirmedAt: confirmedAt, now: now)
         guard current() else { signer.invalidate(); throw RemoteChannelError.staleLink }
         let journal = try authorJournal(log, manager)
-        try journal.requireStopChange(origin: body.origin)
+        try journal.requireStopChange(bodyJSON: operation.bodyJSON)
         if operation.attempted != true {
             try commit { $0.operations[index].attempted = true }
         }
@@ -506,7 +506,7 @@ public final class RemoteControlPublication {
               try retainedSignature(operation, journal: journal) == nil else {
             throw RemoteControlPublicationError.requiresReview
         }
-        try journal.withPermittedStopChange(origin: body.origin) {
+        try journal.withPermittedStopChange(bodyJSON: operation.bodyJSON) {
             _ = try transaction { $0.operations.remove(at: index) }
         }
     }

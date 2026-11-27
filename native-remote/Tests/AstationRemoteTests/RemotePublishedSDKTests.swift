@@ -149,13 +149,68 @@ final class RemotePublishedSDKTests: XCTestCase {
         }
     }
 
+    func testPublishedSignerReportPlanPredicate() throws {
+        let source = try fixture("r9-vectors-signer-report")
+        let cases = try rows(source["plan_predicate"])
+        XCTAssertEqual(cases.count, 32)
+        for vector in cases {
+            let label = try XCTUnwrap(vector["label"] as? String)
+            let membership = try log(vector, reports: source)
+            let body = try XCTUnwrap(vector["body"] as? String)
+            let member = try XCTUnwrap(vector["member"] as? String)
+            let origin = try XCTUnwrap(vector["origin"] as? String)
+            let classify = { try signerReportPlanRecord(log: membership, bodyJson: body, member: member, origin: origin) }
+            if let code = vector["code"] as? String {
+                XCTAssertThrowsError(try classify(), label) { error in
+                    guard case let AtemError.Report(actual, _) = error else { return XCTFail("\(label): \(error)") }
+                    XCTAssertEqual(actual, code, label)
+                }
+            } else if try XCTUnwrap(vector["in_plan"] as? Bool) {
+                XCTAssertEqual(try classify(), .inPlan, label)
+            } else {
+                let reason = try XCTUnwrap(vector["reason"] as? String)
+                XCTAssertEqual(try classify(), .notInPlan(reason: reason), label)
+            }
+        }
+    }
+
+    func testPublishedStationBindingProofsUseThePackagedVerifier() throws {
+        let source = try fixture("r9-vectors-station-binding")
+        let valid = try rows(source["valid"])
+        let invalid = try rows(source["invalid"])
+        XCTAssertEqual(valid.count, 16)
+        XCTAssertEqual(invalid.count, 153)
+        for vector in valid + invalid {
+            let membership = try log(vector, reports: source)
+            let proof = try XCTUnwrap(vector["proof"] as? String)
+            let challenge = try json(XCTUnwrap(vector["challenge"]))
+            let now = try XCTUnwrap(vector["now_ms"] as? NSNumber).uint64Value
+            let verify = {
+                try verifyStationBinding(log: membership, proofJson: proof, expectedChallengeJson: challenge, nowMs: now)
+            }
+            if let code = vector["code"] as? String {
+                XCTAssertThrowsError(try verify()) { error in
+                    guard case let AtemError.Report(actual, _) = error else { return XCTFail("\(error)") }
+                    XCTAssertEqual(actual, code)
+                }
+            } else {
+                let expected = try XCTUnwrap(vector["expect"] as? [String: Any])
+                let result = try verify()
+                XCTAssertEqual(result.atHead, expected["at_head"] as? Bool)
+                XCTAssertEqual(result.signer, expected["signer"] as? String)
+                XCTAssertEqual(result.subject, expected["subject"] as? String)
+                XCTAssertEqual(result.nonce, expected["nonce"] as? String)
+            }
+        }
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {
             (try XCTUnwrap($0["label"] as? String), try json(XCTUnwrap($0["record"])))
         })
         let cases = try rows(source["snapshots"])
-        XCTAssertEqual(cases.count, 36)
+        XCTAssertEqual(cases.count, 44)
         for vector in cases {
             let membership = try log(vector)
             func recordSet(_ key: String) throws -> [String] {
