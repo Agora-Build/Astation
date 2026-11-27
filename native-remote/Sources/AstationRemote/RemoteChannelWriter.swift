@@ -15,6 +15,7 @@ public enum RemoteChannelCloseReason: String, Sendable {
     case unknownChannel = "unknown_channel"
     case tooLarge = "too_large"
     case handshakeFailed = "handshake_failed"
+    case serviceSuspended = "service_suspended"
 }
 
 /// Outbound R9.7a envelopes. Inner frames come from the shared core and retain their original bytes.
