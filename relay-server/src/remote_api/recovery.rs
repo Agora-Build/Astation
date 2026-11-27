@@ -512,6 +512,14 @@ impl RecoveryStore {
         .await
     }
 
+    /// A channel may close because its association changed or because the
+    /// account lost service. Only the same still-proved link can learn the latter.
+    pub(crate) async fn host_suspension(&self, binding: &HostBinding) -> Option<&'static str> {
+        self.root_verdict(&binding.genesis, &binding.room,
+            |root, log| root.current(binding) && binding.valid(log),
+            |_, _| std::future::ready(())).await?.err()
+    }
+
     pub(crate) async fn with_owner_route<T, F, Fut>(
         &self,
         route: &OwnerRoute,
@@ -629,6 +637,16 @@ impl RecoveryStore {
         F: FnOnce(&Root, &Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
+        self.root_verdict(genesis, room, predicate, action).await?.ok()
+    }
+
+    async fn root_verdict<T, P, F, Fut>(&self, genesis: &str, room: &str, predicate: P, action: F)
+        -> Option<Result<T, &'static str>>
+    where
+        P: FnOnce(&Root, &Membership) -> bool,
+        F: FnOnce(&Root, &Membership) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             self.with_root_inner(genesis, room, predicate, action),
@@ -644,7 +662,7 @@ impl RecoveryStore {
         room: &str,
         predicate: P,
         action: F,
-    ) -> Option<T>
+    ) -> Option<Result<T, &'static str>>
     where
         P: FnOnce(&Root, &Membership) -> bool,
         F: FnOnce(&Root, &Membership) -> Fut,
@@ -665,7 +683,7 @@ impl RecoveryStore {
             let roots = memory.lock().await;
             let (_, root) = roots.get(genesis)?;
             let log = valid(root)?;
-            return Some(action(root, &log).await);
+            return Some(Ok(action(root, &log).await));
         }
         let pool = self.pool.as_ref()?;
         let mut tx = pool.begin().await.ok()?;
@@ -685,11 +703,12 @@ impl RecoveryStore {
         let (principal,state) = saved?;
         let root: Root = serde_json::from_value(state).ok()?;
         let log = valid(&root)?;
-        if self.route_service(&mut tx,&principal,&root.account,genesis,room).await.ok()? != RouteService::Allowed {
-            return None;
+        let service = self.route_service(&mut tx, &principal, &root.account, genesis, room).await.ok()?;
+        if service != RouteService::Allowed {
+            return service.suspension_text().map(Err);
         }
         // No state changes: dropping the read transaction releases its locks.
-        Some(action(&root, &log).await)
+        Some(Ok(action(&root, &log).await))
     }
 
     async fn route_service(
