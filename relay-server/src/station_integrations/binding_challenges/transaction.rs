@@ -93,13 +93,14 @@ pub(super) async fn submit(
         )
         .await?
         {
-            Some(receipt) => Submission::Confirmed(receipt),
+            Some(receipt) => Submission::Applied(receipt),
             None => Submission::Refused,
         },
     )
 }
 
 pub(super) enum Submission {
+    Applied(Value),
     Confirmed(Value),
     Outstanding,
     Expired,

@@ -143,6 +143,11 @@ async fn handle(
             )
             .await
             {
+                Ok(transaction::Submission::Applied(receipt)) => {
+                    if tx.commit().await.is_err() { return unavailable(); }
+                    runtime.app.recovery.notify_delegated_change();
+                    return Json(receipt).into_response();
+                }
                 Ok(transaction::Submission::Confirmed(receipt)) => Ok(Some(receipt)),
                 Ok(transaction::Submission::Refused) => Ok(None),
                 Ok(transaction::Submission::Outstanding) => {
@@ -172,12 +177,7 @@ async fn handle(
     };
     match result {
         Ok(Some(body)) => match tx.commit().await {
-            Ok(()) => {
-                if matches!(operation, Operation::Commit) {
-                    runtime.app.recovery.notify_delegated_change();
-                }
-                Json(body).into_response()
-            }
+            Ok(()) => Json(body).into_response(),
             Err(_) => unavailable(),
         },
         Ok(None) => error(StatusCode::CONFLICT, "binding_unavailable"),

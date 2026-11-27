@@ -242,6 +242,8 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         .register("consumer", "alice", other, "two")
         .unwrap();
     let old_routes = [old_relay.clone(), old_proxy.clone()];
+    let updates = runtime.app.recovery.delegated_changes();
+    let before_commit = *updates.borrow();
     sqlx::raw_sql("CREATE FUNCTION reject_bind_commit() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN RAISE EXCEPTION 'commit fault'; END $$;
         CREATE CONSTRAINT TRIGGER reject_bind_commit AFTER INSERT ON station_native_binding_transitions
@@ -256,6 +258,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         .fetch_one(&replica).await.unwrap()
     };
     assert_eq!(counts().await, (0, 1));
+    assert_eq!(*updates.borrow(), before_commit);
     hub.close_retired_binding_connections(&peer, &old_routes)
         .await;
     consumer.close_retired_binding_connections(&peer, &[]).await;
@@ -281,6 +284,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     assert_eq!(a.1["version"], 1);
     assert_eq!(a.1["account"], OWNER);
     assert_eq!(counts().await, (1, 0));
+    assert_eq!(*updates.borrow(), before_commit + 1, "receipt retries do not fan out replica notifications");
     let retired: Vec<ConnRef> = sqlx::query_scalar::<_, sqlx::types::Json<Vec<ConnRef>>>(
         "SELECT retired_routes FROM station_native_binding_transitions WHERE version=1",
     )
