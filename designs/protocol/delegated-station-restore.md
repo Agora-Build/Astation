@@ -986,6 +986,23 @@ These are obligations for review. Signing and publication still require a
 current coverage decision, protected key access, complete participants and
 clock validation.
 
+### Candidate service records
+
+With the service vault, Portal binding and independent signing store configured,
+`prepare` also builds `service_drafts.unsigned_bodies`. Each body names the
+candidate feed and the service key matched across the verified list, protected
+provisioning and independent reservation. The cover precedes the hold or
+release. A required service revoke or follow-up interrupt gets its own body.
+A future signing floor makes the batch wait until its entire timestamp range
+has elapsed.
+
+Station retains the bodies with the review commitments. Retrying the same
+review on another replica returns the same record IDs and times. A changed
+review prepares new drafts, and a failed commit preserves the preceding ones.
+Preparation produces no signatures or reservations. Unresolved services remain
+listed in the recovery review. Final signing must recheck participant coverage,
+policy, membership and signing floors before publishing the snapshot.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run
