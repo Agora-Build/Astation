@@ -12,6 +12,7 @@ use atem_client::{
 };
 use sqlx::PgConnection;
 
+pub(super) mod pending;
 mod room_consents;
 mod transaction;
 
@@ -24,6 +25,16 @@ struct Intent {
 }
 
 impl Intent {
+    fn from_challenge(challenge: &StationBindingChallenge) -> Self {
+        Self {
+            action: challenge.action(),
+            account: challenge.account_id().to_owned(),
+            head: challenge.head(),
+            signer: challenge.signer().to_owned(),
+            expected: challenge.expected_binding().clone(),
+        }
+    }
+
     fn parse(bytes: &[u8]) -> Option<Self> {
         let strict = StrictValue::parse(bytes, 4096).ok()?;
         let value = strict.value();
@@ -148,6 +159,10 @@ async fn handle(
                     if tx.commit().await.is_err() { return unavailable(); }
                     runtime.app.recovery.notify_delegated_change();
                     return Json(receipt).into_response();
+                }
+                Ok(transaction::Submission::AwaitingConsent) => {
+                    if tx.commit().await.is_err() { return unavailable(); }
+                    return (StatusCode::ACCEPTED, Json(json!({"awaiting_consent":true}))).into_response();
                 }
                 Ok(transaction::Submission::Confirmed(receipt)) => Ok(Some(receipt)),
                 Ok(transaction::Submission::Refused) => Ok(None),
@@ -390,6 +405,18 @@ async fn review_intent(
     Ok(Some(ReviewedIntent { log, policy, rooms }))
 }
 
+fn eligible_owner(challenge: &StationBindingChallenge, subject: &str) -> bool {
+    match (challenge.action(), challenge.expected_binding()) {
+        (BindingAction::Transfer, ExpectedBinding::Bound(previous)) => {
+            previous.owner == subject
+        }
+        (BindingAction::Bind, ExpectedBinding::NeverBound) => {
+            subject != challenge.subject()
+        }
+        _ => false,
+    }
+}
+
 async fn record_consent(
     db: &mut PgConnection,
     station: &FeedBinding,
@@ -397,19 +424,10 @@ async fn record_consent(
     genesis: Hash32,
     challenge: &StationBindingChallenge,
 ) -> Result<Option<Value>, sqlx::Error> {
-    let eligible = match (challenge.action(), challenge.expected_binding()) {
-        (BindingAction::Transfer, ExpectedBinding::Bound(previous)) => {
-            previous.owner == token.identity.subject
-        }
-        (BindingAction::Bind, ExpectedBinding::NeverBound) => {
-            token.identity.subject != challenge.subject()
-        }
-        _ => false,
-    };
     let Some(auth_time) = token.identity.authenticated_at else {
         return Ok(None);
     };
-    if !eligible
+    if !eligible_owner(challenge, &token.identity.subject)
         || genesis != challenge.genesis_hash()
         || challenge.origin() != station.station_origin
         || challenge.issuer() != station.issuer
@@ -417,13 +435,7 @@ async fn record_consent(
     {
         return Ok(None);
     }
-    let intent = Intent {
-        action: challenge.action(),
-        account: challenge.account_id().to_owned(),
-        head: challenge.head(),
-        signer: challenge.signer().to_owned(),
-        expected: challenge.expected_binding().clone(),
-    };
+    let intent = Intent::from_challenge(challenge);
     let Some(ReviewedIntent { log, policy, rooms }) =
         review_intent(db, station, genesis, &intent, challenge.subject()).await?
     else {
