@@ -67,6 +67,16 @@ feed, membership head, journal identity/range/revision and source/evidence
 commitments. No report can escape before that commit. The report's exposure
 must itself be durable before export/return/transmission.
 
+The Apple journal records the shared SDK's 16-byte process identifier under
+the member key's existing lock. It records the creating process at revision
+zero and each subsequent process at the revision of its first attachment.
+The first draft or signing attempt persists a new journal. Opening an
+existing journal persists any new attachment before returning it to the
+caller. An older journal keeps its identity, signed entries and barriers
+on migration. Its first tracked process has a positive revision, leaving
+earlier processes unknown. Station still requires signed roster evidence
+from the shared SDK to account for a displaced process.
+
 While held, the barrier refuses the plan's new drafts and signatures before
 any prompt and at the key boundary: service stops at that origin, plus
 originless host-principal interrupts. Any active barrier for this account and

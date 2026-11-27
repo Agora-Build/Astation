@@ -19,6 +19,52 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
                 sourceHash: c.sourceHash, evidenceHash: c.evidenceHash))
     }
 
+    func testProcessAttachmentSurvivesRelaunchAndPrecedesSigning() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        func fields() throws -> [String: Any] {
+            try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+                format: nil) as? [String: Any])
+        }
+        let current = verifierReportProcess()
+        let prior = RemoteRecoveryKit.base64URL(Data(repeating: 75, count: 16))
+        var saved = try fields()
+        XCTAssertEqual(saved["processAttachments"] as? [String: Int], [current: 0])
+        saved["processAttachments"] = [prior: 0]
+        f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+        XCTAssertThrowsError(try RemoteControlSigningJournal(log: f.log, memberID: "manager",
+            read: { f.authorBytes["manager"] }, persist: { _ in throw RemoteControlPublicationError.storageUncertain }))
+        XCTAssertEqual(f.keys.signs, 0)
+        let journal = try f.readAuthorJournal("manager")
+        XCTAssertTrue(journal.canEstablishInitialPin)
+        XCTAssertEqual(try fields()["processAttachments"] as? [String: Int], [prior: 0, current: 1])
+        let afterAttach = f.authorBytes
+        XCTAssertEqual(try f.readAuthorJournal("manager").revision, 1)
+        XCTAssertEqual(f.authorBytes, afterAttach)
+        _ = try f.sign(body)
+        XCTAssertFalse(try f.readAuthorJournal("manager").canEstablishInitialPin)
+        XCTAssertEqual(try fields()["processAttachments"] as? [String: Int], [prior: 0, current: 1])
+    }
+
+    func testLegacyJournalMigrationKeepsItsBarrierAndLeavesEarlierProcessesUnknown() throws {
+        let f = try ControlPublicationFixture(), c = try context(f), now = f.clock.wallMs
+        let original = try f.readAuthorJournal("manager")
+        _ = try original.holdForReport(context: c, challengeJSON: challenge(c, now: now), log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
+        var saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+            format: nil) as? [String: Any])
+        saved["version"] = 2
+        saved.removeValue(forKey: "processAttachments")
+        f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+        let migrated = try f.readAuthorJournal("manager")
+        XCTAssertEqual(migrated.id, original.id)
+        XCTAssertFalse(migrated.canEstablishInitialPin)
+        XCTAssertThrowsError(try migrated.requireStopChange(origin: f.origin))
+        let stored = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+            format: nil) as? [String: Any])
+        XCTAssertEqual(stored["processAttachments"] as? [String: UInt64], [verifierReportProcess(): original.revision + 1])
+    }
+
     func testReportCommitsSignedAndDraftSetsIndependentlyAndFreezesBothAfterReopen() throws {
         let f = try ControlPublicationFixture(), host = try f.hostBody(), stop = try f.body()
         _ = try f.prepare(host)
