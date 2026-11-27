@@ -3023,7 +3023,7 @@ extension AstationRecoveryCoordinator {
         if let id = saved.controlJournalIDs?[scope] {
             guard journal.id == id else { throw RemoteRecoveryError.storageUncertain }
         } else {
-            guard journal.revision == 0 else { throw RemoteRecoveryError.requiresReview }
+            guard journal.canEstablishInitialPin else { throw RemoteRecoveryError.requiresReview }
             try journal.establish()
             try persist {
                 $0.version = 6
