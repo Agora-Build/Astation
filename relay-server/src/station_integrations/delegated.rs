@@ -3,7 +3,20 @@ use crate::remote_api::recovery::delegated::{
     Command, LedgerUpdate, ReportControlEvent, ServiceDesired,
 };
 use crate::remote_api::recovery::delegated_recovery::plan::reporting_history::reconcile_report_restart;
-use atem_client::control::{AckLedger, ReportAnswer};
+use atem_client::control::{AckLedger, ReportAnswer, ReportIntent};
+use super::binding_reports::BindingReport;
+
+#[derive(Clone, Copy)]
+enum ReportQueue<'a> {
+    Revocation { genesis: &'a str, owner: &'a str },
+    Ownership,
+}
+
+
+enum PendingReport<'a> {
+    Revocation { genesis: &'a str, owner: &'a str, intent: ReportIntent },
+    Ownership(BindingReport),
+}
 
 impl StationIntegrations {
     pub(super) async fn reconcile_delegated_services(&self) {
@@ -89,6 +102,10 @@ impl StationIntegrations {
         }
         let mut after = String::new();
         loop {
+            if self.app.recovery.active_delegated_binding().is_some_and(|fence| fence.origin == self.binding.station_origin)
+                && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+                self.deliver_reports(ReportQueue::Ownership).await;
+            }
             let Some(accounts) = self.app.recovery.delegated_accounts(&after).await else {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -162,6 +179,10 @@ impl StationIntegrations {
     }
 
     async fn deliver_delegated_reports(&self, genesis: &str, owner: &str) {
+        self.deliver_reports(ReportQueue::Revocation { genesis, owner }).await;
+    }
+
+    async fn deliver_reports(&self, queue: ReportQueue<'_>) {
         // Re-read after each settlement: a final cannot overtake a per-host
         // report, including when another replica settles that report first.
         for _ in 0..8 {
@@ -183,37 +204,28 @@ impl StationIntegrations {
             let Ok(mut events) = serde_json::from_value::<Vec<ReportControlEvent>>(value) else {
                 return;
             };
-            let Ok((status, Json(snapshot))) = self
-                .app
-                .recovery
-                .delegated_operation_in(&mut tx, genesis, owner, Command::ReportingControl(events.clone()))
-                .await else { return };
-            if status != StatusCode::OK {
-                return;
-            }
-            if events.last()
-                != Some(&ReportControlEvent::Resume(
-                    self.binding.report_client_id.clone(),
-                ))
-            {
-                let _ = tx.commit().await;
-                return;
-            }
-            let Ok(ledger) = AckLedger::from_json(&snapshot["ledger"]) else {
-                return;
-            };
-            if ledger.stopped_client_id().is_some() {
-                let _ = tx.commit().await;
-                return;
-            }
-            let Some(intent) = ledger.pending_reports().into_iter().find(|intent| {
-                snapshot["reports"].as_array().is_some_and(|due| {
-                    due.iter()
-                        .any(|value| value["report_id"] == intent.report_id)
-                })
-            }) else {
-                let _ = tx.commit().await;
-                return;
+            let resumed = events.last() == Some(&ReportControlEvent::Resume(self.binding.report_client_id.clone()));
+            let pending = match queue {
+                ReportQueue::Revocation { genesis, owner } => {
+                    let Ok((status, Json(snapshot))) = self.app.recovery.delegated_operation_in(
+                        &mut tx, genesis, owner, Command::ReportingControl(events.clone())).await else { return };
+                    if status != StatusCode::OK { return; }
+                    let Ok(ledger) = AckLedger::from_json(&snapshot["ledger"]) else { return };
+                    let due = ledger.pending_reports().into_iter().find(|intent| {
+                        snapshot["reports"].as_array().is_some_and(|reports| reports.iter()
+                            .any(|value| value["report_id"] == intent.report_id))
+                    });
+                    let Some(intent) = due.filter(|_| resumed && ledger.stopped_client_id().is_none()) else {
+                        let _ = tx.commit().await;
+                        return;
+                    };
+                    PendingReport::Revocation { genesis, owner, intent }
+                }
+                ReportQueue::Ownership => {
+                    if !resumed { return; }
+                    let Ok(Some(report)) = BindingReport::next(&mut tx, &self.binding).await else { return };
+                    PendingReport::Ownership(report)
+                }
             };
             let claim = uuid::Uuid::new_v4().to_string();
             if sqlx::query("UPDATE station_delegated_reporting SET in_flight=$1 WHERE binding=$2")
@@ -249,45 +261,42 @@ impl StationIntegrations {
             if saved_claim.as_ref() != Some(&claim) {
                 return;
             }
-            let result = self.portal.delegated_report(&intent).await;
-            let update = match result.answer {
-                ReportAnswer::Confirm => LedgerUpdate::Confirm(intent.report_id),
-                ReportAnswer::Refuse => {
-                    tracing::error!(report_id = %intent.report_id, "delegated report permanently refused");
-                    LedgerUpdate::Refuse(intent.report_id)
-                }
-                ReportAnswer::StopReporting => {
-                    tracing::error!(client_id = %self.binding.report_client_id, "delegated reporting stopped by Portal");
-                    events.push(ReportControlEvent::Stop(
-                        self.binding.report_client_id.clone(),
-                    ));
-                    if sqlx::query("UPDATE station_delegated_reporting SET events=$1,in_flight=NULL WHERE binding=$2")
-                        .bind(serde_json::to_value(&events).unwrap()).bind(&key)
-                        .execute(&mut *tx).await.is_err() { return; }
-                    // Persist the Station-wide fence even if the account's next
-                    // transaction fails. It applies the journal on its next read.
-                    if tx.commit().await.is_err() {
-                        return;
-                    }
-                    let _ = self
-                        .app
-                        .recovery
-                        .delegated_operation(genesis, owner, Command::ReportingControl(events))
-                        .await;
-                    return;
-                }
-                ReportAnswer::Retry => LedgerUpdate::Retry {
-                    id: intent.report_id,
-                    retry_after_ms: result.retry_after_ms,
-                },
+            let result = match &pending {
+                PendingReport::Revocation { intent, .. } => self.portal.delegated_report(
+                    &crate::integration_portal::delegated_report_body(intent)).await,
+                PendingReport::Ownership(report) => self.portal.delegated_report(&report.body).await,
             };
-            let Ok((status, _)) = self
-                .app
-                .recovery
-                .delegated_operation_in(&mut tx, genesis, owner, Command::Ledger(update))
-                .await else { return };
-            if status != StatusCode::OK {
+            if result.answer == ReportAnswer::StopReporting {
+                tracing::error!(client_id = %self.binding.report_client_id, "delegated reporting stopped by Portal");
+                events.push(ReportControlEvent::Stop(self.binding.report_client_id.clone()));
+                if sqlx::query("UPDATE station_delegated_reporting SET events=$1,in_flight=NULL WHERE binding=$2")
+                    .bind(serde_json::to_value(&events).unwrap()).bind(&key)
+                    .execute(&mut *tx).await.is_err() || tx.commit().await.is_err() { return; }
+                if let ReportQueue::Revocation { genesis, owner } = queue {
+                    let _ = self.app.recovery.delegated_operation(genesis, owner, Command::ReportingControl(events)).await;
+                }
                 return;
+            }
+            match pending {
+                PendingReport::Ownership(report) => {
+                    if result.answer == ReportAnswer::Refuse {
+                        tracing::error!(report_id = %report.body["reportId"], "ownership report permanently refused");
+                    }
+                    if report.settle(&mut tx, &self.binding, &result).await.is_err() { return; }
+                }
+                PendingReport::Revocation { genesis, owner, intent } => {
+                    let update = match result.answer {
+                        ReportAnswer::Confirm => LedgerUpdate::Confirm(intent.report_id),
+                        ReportAnswer::Refuse => {
+                            tracing::error!(report_id = %intent.report_id, "delegated report permanently refused");
+                            LedgerUpdate::Refuse(intent.report_id)
+                        }
+                        ReportAnswer::Retry => LedgerUpdate::Retry { id: intent.report_id, retry_after_ms: result.retry_after_ms },
+                        ReportAnswer::StopReporting => unreachable!("client stop settled above"),
+                    };
+                    let Ok((StatusCode::OK, _)) = self.app.recovery
+                        .delegated_operation_in(&mut tx, genesis, owner, Command::Ledger(update)).await else { return };
+                }
             }
             if sqlx::query("UPDATE station_delegated_reporting SET in_flight=NULL WHERE binding=$1")
                 .bind(&key)
@@ -309,6 +318,10 @@ impl StationIntegrations {
         }
     }
 }
+
+#[cfg(all(test, feature = "delegated-host-work"))]
+#[path = "binding_report_tests.rs"]
+mod binding_report_tests;
 
 #[cfg(all(test, feature = "delegated-host-work"))]
 #[path = "signing_ceiling_tests.rs"]

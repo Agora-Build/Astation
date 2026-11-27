@@ -436,3 +436,106 @@ pub(super) async fn inspect(
         "binding_version":binding.map(|row|row.version),"retained_routes":hosts}),
     )
 }
+
+/// Check the signed-in service owner inside the transaction that admits the
+/// proof or dispatches the frame. The caller holds the proved root lock.
+pub(in crate::remote_api::recovery) async fn may_serve(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    principal: &str,
+    account: &str,
+    genesis: &str,
+    room: &str,
+) -> Result<bool, sqlx::Error> {
+    let policy = PolicyStore::lock_for_binding(db, station)
+        .await
+        .map_err(|_| invalid_root())?;
+    if !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) {
+        return Ok(false);
+    }
+    let binding = policy.effective_binding(db, account, genesis).await?;
+    if policy
+        .has_competing_binding(db, account, genesis, binding.as_ref())
+        .await
+        .map_err(|_| invalid_root())?
+    {
+        return Ok(false);
+    }
+    let owner = match binding {
+        Some(row) if row.binding_state == "bound" => row.account,
+        Some(_) => return Ok(false),
+        None => {
+            let Some(owner) = legacy_owner(db, station, genesis, room, principal).await? else {
+                return Ok(false);
+            };
+            owner
+        }
+    };
+    if !policy.allows_delegated_release(&owner) {
+        return Ok(false);
+    }
+    let denied: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM station_delegated_availability_fences
+        WHERE issuer=$1 AND portal_origin=$2 AND station_origin=$3 AND account IN ('',$4) AND minimum_cursor>$5)")
+        .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+        .bind(&owner).bind(policy.cursor as i64).fetch_one(db).await?;
+    Ok(!denied && policy.recent_d27_read(chrono::Utc::now().timestamp_millis()))
+}
+
+async fn legacy_owner(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    genesis: &str,
+    room: &str,
+    principal: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let session = session_id_for_room(room);
+    let row: (Option<String>,bool,Option<String>,bool,Option<String>,bool,Option<String>)=sqlx::query_as(
+        "SELECT r.account_subject,COALESCE(r.conflicted,false),direct_id.subject,direct.astation_id IS NOT NULL,
+            session_id.subject,s.session_id IS NOT NULL,root_owner.subject
+         FROM (SELECT 1) base
+         LEFT JOIN station_proved_room_owners r ON (r.issuer,r.station_origin,r.genesis_hash,r.room)=($1,$2,$3,$4)
+         LEFT JOIN astation_accounts direct ON direct.astation_id=$4
+         LEFT JOIN account_identities direct_id ON direct_id.issuer=$1 AND direct_id.principal=direct.agora_user
+         LEFT JOIN session_bindings s ON s.session_id=$5
+            AND s.last_used_at>floor(extract(epoch FROM statement_timestamp()))::bigint-$7
+         LEFT JOIN astation_accounts a ON a.astation_id=s.astation_id
+         LEFT JOIN account_identities session_id ON session_id.issuer=$1 AND session_id.principal=a.agora_user
+         LEFT JOIN account_identities root_owner ON root_owner.issuer=$1 AND root_owner.principal=$6")
+        .bind(&station.issuer).bind(&station.station_origin).bind(genesis).bind(room).bind(session)
+        .bind(principal).bind(BINDING_TTL_SECS).fetch_one(db).await?;
+    let (retained, conflicted, direct, registered, session_owner, has_session, root) = row;
+    if conflicted
+        || registered && direct.is_none()
+        || has_session && session_owner.is_none()
+        || session.is_some() && !has_session && retained.is_none()
+    {
+        return Ok(None);
+    }
+    let mut candidates = [retained, direct, session_owner].into_iter().flatten();
+    if let Some(owner) = candidates.next() {
+        return Ok((account_id(&owner) && candidates.all(|s| s == owner)).then_some(owner));
+    }
+    Ok(root.filter(|s| account_id(s)))
+}
+
+impl super::super::RecoveryStore {
+    pub(crate) async fn retired_binding_connections(
+        &self,
+        candidates: &[crate::cluster::ConnRef],
+    ) -> Result<Vec<crate::cluster::ConnRef>, sqlx::Error> {
+        let Some(station) = self.verifier_portal.get().filter(|station|
+            self.active_delegated_binding().is_some_and(|fence| fence.origin == station.station_origin)
+                && crate::account_identity::built_in_station(&station.station_origin)
+        ) else { return Ok(Vec::new()) };
+        let pool = self.pool.as_ref().ok_or_else(invalid_root)?;
+        let retired: Vec<sqlx::types::Json<crate::cluster::ConnRef>> = sqlx::query_scalar(
+            "SELECT c FROM jsonb_array_elements($4) c WHERE EXISTS (
+                SELECT 1 FROM station_native_binding_transitions t
+                WHERE (t.issuer,t.portal_origin,t.station_origin)=($1,$2,$3)
+                  AND t.retired_routes @> jsonb_build_array(c))",
+        )
+        .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+        .bind(sqlx::types::Json(candidates)).fetch_all(pool).await?;
+        Ok(retired.into_iter().map(|row| row.0).collect())
+    }
+}

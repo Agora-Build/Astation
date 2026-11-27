@@ -6,6 +6,39 @@ pub(crate) const OWNER: &str = "ab01234567890123456789012345";
 pub(crate) const PRINCIPAL: &str = "principal-12345678-1234-4567-89ab-123456789abc";
 pub(crate) const ID: &str = "i-01234567890123456789012345";
 
+// Transport fixtures use the same complete built-in Station policy a replica reads in production.
+pub(crate) async fn attach_test_room_owner(store: &RecoveryStore, station: &str) {
+    let pool = store.pool().unwrap();
+    let portal = FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: station.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    };
+    store.set_verifier_portal(&portal).unwrap();
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice') ON CONFLICT DO NOTHING")
+        .bind(&portal.issuer).bind(OWNER).execute(&pool).await.unwrap();
+    let policies = PolicyStore(pool);
+    let before = policies.load(&portal).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    if before.recent_d27_read(now) {
+        return;
+    }
+    let body = json!({"changes":[],"cursor":0,"checkpoint":{"at":"2026-11-24T10:00:00.000Z",
+        "integrations":[],"bindings":[],"pendingReleases":[],"accounts":{"complete":true,"disabled":[]}}});
+    let source = crate::integration_checkpoint::PortalCheckpoint::parse(
+        body.to_string().as_bytes(),
+        &portal,
+    )
+    .unwrap();
+    let page = serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[]})).unwrap();
+    let live = before.apply(0, page, now / 1000).unwrap();
+    policies.commit(&before, &live).await.unwrap();
+    let mut checkpoint = live.apply_checkpoint(source, now / 1000).unwrap();
+    checkpoint.record_completed_read(now, now);
+    policies.commit(&live, &checkpoint).await.unwrap();
+}
+
 pub(crate) async fn fixture() -> (
     crate::test_database::TestDatabase,
     Arc<StationIntegrations>,

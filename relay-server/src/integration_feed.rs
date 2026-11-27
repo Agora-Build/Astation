@@ -499,6 +499,11 @@ impl PolicyCheckpoint {
                  AND ($5::bigint IS NULL OR version > $5 OR (version=$5
                       AND binding_id=$4::jsonb->>'bindingId' AND account=$4::jsonb->>'account'))
              ) OR EXISTS (
+               SELECT 1 FROM station_native_binding_transitions n
+               WHERE (n.issuer,n.portal_origin,n.station_origin,n.account_id,n.genesis)=($6,$7,$8,$2,$3)
+                 AND ($5::bigint IS NULL OR n.version > $5 OR (n.version=$5 AND
+                    (n.report - 'state' - 'reportId') <> $4::jsonb))
+             ) OR EXISTS (
                SELECT 1 FROM station_applied_binding_releases a
                WHERE (a.issuer,a.portal_origin,a.station_origin)=($6,$7,$8)
                  AND (a.account_id,a.genesis)=($2,$3) AND ($5::bigint IS NULL OR a.version > $5
@@ -590,6 +595,25 @@ impl PolicyStore {
         .fetch_optional(connection)
         .await
         .map_err(|_| ())?;
+        Self::decode_checkpoint(binding, saved)
+    }
+
+    pub(crate) async fn lock_for_binding(
+        db: &mut sqlx::PgConnection,
+        binding: &FeedBinding,
+    ) -> Result<PolicyCheckpoint, ()> {
+        let saved: Option<String> = sqlx::query_scalar(
+            "SELECT checkpoint FROM station_integration_policy WHERE binding=$1 FOR SHARE NOWAIT",
+        )
+        .bind(binding.storage_key()?)
+        .fetch_optional(&mut *db)
+        .await
+        .map_err(|_| ())?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1,29))")
+            .bind(binding.report_control_binding())
+            .execute(db)
+            .await
+            .map_err(|_| ())?;
         Self::decode_checkpoint(binding, saved)
     }
 

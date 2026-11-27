@@ -33,6 +33,7 @@ impl RelayHub {
                     .values()
                     .cloned()
                     .collect();
+                hub.close_retired_binding_connections(store, &bindings).await;
                 let mut work = futures_util::stream::iter(bindings.into_iter().map(|binding| {
                     let hub = &hub;
                     async move {
@@ -59,6 +60,31 @@ impl RelayHub {
                 while work.next().await.is_some() {}
             }
         })
+    }
+
+    pub(crate) async fn close_retired_binding_connections(
+        &self,
+        store: &crate::remote_api::recovery::RecoveryStore,
+        bindings: &[HostBinding],
+    ) {
+        // A channel may be on a different replica than either the host or the
+        // ownership commit. Each replica reconciles only its live targets.
+        let mut targets = self.channels().host_connections();
+        targets.extend(bindings.iter().map(|binding| binding.connection.clone()));
+        targets.sort_unstable();
+        targets.dedup();
+        for batch in targets.chunks(128) {
+            let Ok(retired) = store.retired_binding_connections(batch).await else {
+                tracing::warn!("could not reconcile retired Station ownership connections");
+                return;
+            };
+            for target in retired {
+                self.channels().host_disconnected(&target);
+                if target.replica == self.replica_id() {
+                    self.local().close_with(&target.conn, CLOSE_TRY_AGAIN, "Station ownership changed");
+                }
+            }
+        }
     }
 
     pub(super) async fn delegated_peer_current(&self, binding: &HostBinding) -> bool {
@@ -179,6 +205,7 @@ mod tests {
         let database = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
         let store = RecoveryStore::postgres(database.pool.clone());
         store.configure_delegated(ORIGIN, 1).await.unwrap();
+        crate::station_integrations::tests::attach_test_room_owner(&store, ORIGIN).await;
         let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         f.publish(&store).await;
         let hub = RelayHub::new();

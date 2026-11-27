@@ -813,6 +813,9 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
     let (one, two) = tokio::join!(a.configure_delegated(ORIGIN, 1), b.configure_delegated(ORIGIN, 1));
     one.unwrap();
     two.unwrap();
+    for store in [&a, &b] {
+        crate::station_integrations::tests::attach_test_room_owner(store, ORIGIN).await;
+    }
     let f = fixture();
     f.publish(&a).await;
     let genesis = f.log.genesis_hash().to_hex();
@@ -864,6 +867,7 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
     drop(b);
     let restarted = RecoveryStore::postgres(database.reconnect(4).await);
     restarted.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&restarted, ORIGIN).await;
     let heads = restarted
         .with_delegated_response(&binding, None, read)
         .await
@@ -887,6 +891,7 @@ async fn postgres_failed_ack_commit_leaks_no_evidence_and_retry_settles_once() {
         crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let store = RecoveryStore::postgres(database.pool.clone());
     store.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&store, ORIGIN).await;
     let f = fixture();
     f.publish(&store).await;
     let binding = admit(&store, &f, "proved").await;

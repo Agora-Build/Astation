@@ -1,7 +1,58 @@
 //! Apply a Portal release to the binding the Station last recorded.
-use super::{FeedBinding, PolicyStore};
+use super::{FeedBinding, PolicyCheckpoint, PolicyStore};
 use crate::integration_checkpoint::PortalCheckpoint;
 use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
+
+impl PolicyCheckpoint {
+    /// A stale Portal mirror cannot undo a transition already committed by this Station.
+    pub(crate) async fn effective_binding(
+        &self,
+        db: &mut sqlx::PgConnection,
+        account: &str,
+        genesis: &str,
+    ) -> Result<Option<crate::integration_checkpoint::Binding>, sqlx::Error> {
+        use crate::integration_checkpoint::Binding;
+        let invalid = || sqlx::Error::Protocol("missing or inconsistent Station binding".into());
+        let rows = self
+            .portal_snapshot
+            .as_ref()
+            .and_then(|s| s.bindings.as_ref())
+            .ok_or_else(invalid)?;
+        let mut current = rows
+            .iter()
+            .find(|r| r.account_id == account && r.genesis_hash == genesis)
+            .cloned();
+        let local: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "(SELECT report - 'state' - 'reportId' FROM station_native_binding_transitions
+              WHERE (issuer,portal_origin,station_origin,account_id,genesis)=($1,$2,$3,$4,$5)
+              ORDER BY version DESC LIMIT 1)
+             UNION ALL
+             (SELECT report - 'state' - 'reportId' FROM station_applied_binding_releases
+              WHERE (issuer,portal_origin,station_origin,account_id,genesis)=($1,$2,$3,$4,$5)
+              ORDER BY version DESC LIMIT 1)",
+        )
+        .bind(&self.binding.issuer)
+        .bind(&self.binding.portal_origin)
+        .bind(&self.binding.station_origin)
+        .bind(account)
+        .bind(genesis)
+        .fetch_all(db)
+        .await?;
+        for (value,) in local {
+            let row: Binding = serde_json::from_value(value).map_err(|_| invalid())?;
+            if let Some(seen) = &current {
+                if row.version == seen.version && &row != seen {
+                    return Err(invalid());
+                }
+                if row.version <= seen.version {
+                    continue;
+                }
+            }
+            current = Some(row);
+        }
+        Ok(current)
+    }
+}
 
 impl PolicyStore {
     /// The Portal settles a release atomically with a higher binding version.

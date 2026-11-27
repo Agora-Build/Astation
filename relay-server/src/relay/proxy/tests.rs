@@ -630,7 +630,9 @@ async fn postgres_delegated_proxy_and_relay_bindings_survive_replica_reload_and_
     let first = RecoveryStore::postgres(database.pool.clone());
     let second = RecoveryStore::postgres(database.pool.clone());
     first.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&first, ORIGIN).await;
     second.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&second, ORIGIN).await;
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     f.publish(&first).await;
     let challenge = HostChallenge::new("phone");
