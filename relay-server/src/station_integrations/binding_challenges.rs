@@ -12,6 +12,7 @@ use atem_client::{
 };
 use sqlx::PgConnection;
 
+mod room_consents;
 mod transaction;
 
 struct Intent {
@@ -214,7 +215,8 @@ async fn issue(
     if claims.issuer != station.issuer || !PortalCheckpoint::built_in(station) {
         return Ok(None);
     }
-    let Some((log, policy)) = review_intent(db, station, genesis, &intent, &claims.subject).await?
+    let Some(ReviewedIntent { log, policy, rooms }) =
+        review_intent(db, station, genesis, &intent, &claims.subject).await?
     else {
         return Ok(None);
     };
@@ -259,12 +261,14 @@ async fn issue(
     }
     sqlx::query("DELETE FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2 AND expires_at<=$3")
         .bind(&station.issuer).bind(&station.station_origin).bind(now).execute(&mut *db).await?;
-    let active: Vec<String> = sqlx::query_scalar(
-        "SELECT challenge FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2 AND subject=$3 LIMIT 9")
+    let room_digest = rooms.as_ref().map(|review| review.digest.as_slice());
+    let active: Vec<(String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT challenge,room_digest FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2 AND subject=$3 LIMIT 9")
         .bind(&station.issuer).bind(&station.station_origin).bind(&claims.subject).fetch_all(&mut *db).await?;
-    for bytes in &active {
+    for (bytes, saved_digest) in &active {
         let old = StationBindingChallenge::parse(bytes.as_bytes()).map_err(|_| invalid())?;
-        if old.origin() == challenge.origin()
+        if saved_digest.as_deref() == room_digest
+            && old.origin() == challenge.origin()
             && old.claims() == &claims
             && old.action() == challenge.action()
             && old.account_id() == challenge.account_id()
@@ -289,12 +293,18 @@ async fn issue(
     if total >= 4096 || active.len() >= 8 {
         return Ok(None);
     }
-    sqlx::query("INSERT INTO station_binding_challenges(issuer,station_origin,subject,nonce,challenge,expires_at)
-        VALUES ($1,$2,$3,$4,$5,$6)")
+    sqlx::query("INSERT INTO station_binding_challenges(issuer,station_origin,subject,nonce,challenge,expires_at,room_digest)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)")
         .bind(&station.issuer).bind(&station.station_origin).bind(&claims.subject)
-        .bind(atem_client::encoding::b64u(challenge.nonce())).bind(challenge.jcs()).bind(until)
+        .bind(atem_client::encoding::b64u(challenge.nonce())).bind(challenge.jcs()).bind(until).bind(room_digest)
         .execute(db).await?;
     Ok(Some(challenge.to_json()))
+}
+
+struct ReviewedIntent {
+    log: Membership,
+    policy: crate::integration_feed::PolicyCheckpoint,
+    rooms: Option<room_consents::Review>,
 }
 
 // A consent and the later ownership change must review the same source of
@@ -305,7 +315,7 @@ async fn review_intent(
     genesis: Hash32,
     intent: &Intent,
     subject: &str,
-) -> Result<Option<(Membership, crate::integration_feed::PolicyCheckpoint)>, sqlx::Error> {
+) -> Result<Option<ReviewedIntent>, sqlx::Error> {
     let invalid = || sqlx::Error::Protocol("binding authority unavailable".into());
     let policy = PolicyStore::lock_for_binding(db, station)
         .await
@@ -364,12 +374,20 @@ async fn review_intent(
     let mut log =
         Membership::from_stored(&intent.account, &genesis, &membership).map_err(|_| invalid())?;
     log.advance(&crate::remote_api::recovery::now());
-    if log.head() != intent.head
-        || (current.is_none() && policy.retained_room_owner_denied(db, &genesis_hex).await?)
-    {
+    if log.head() != intent.head {
         return Ok(None);
     }
-    Ok(Some((log, policy)))
+    let rooms = if matches!(intent.expected, ExpectedBinding::NeverBound) {
+        let Some(review) =
+            room_consents::review(db, station, &policy, &genesis_hex, subject).await?
+        else {
+            return Ok(None);
+        };
+        Some(review)
+    } else {
+        None
+    };
+    Ok(Some(ReviewedIntent { log, policy, rooms }))
 }
 
 async fn record_consent(
@@ -379,18 +397,23 @@ async fn record_consent(
     genesis: Hash32,
     challenge: &StationBindingChallenge,
 ) -> Result<Option<Value>, sqlx::Error> {
-    let ExpectedBinding::Bound(previous) = challenge.expected_binding() else {
-        return Ok(None);
+    let eligible = match (challenge.action(), challenge.expected_binding()) {
+        (BindingAction::Transfer, ExpectedBinding::Bound(previous)) => {
+            previous.owner == token.identity.subject
+        }
+        (BindingAction::Bind, ExpectedBinding::NeverBound) => {
+            token.identity.subject != challenge.subject()
+        }
+        _ => false,
     };
     let Some(auth_time) = token.identity.authenticated_at else {
         return Ok(None);
     };
-    if challenge.action() != BindingAction::Transfer
+    if !eligible
         || genesis != challenge.genesis_hash()
         || challenge.origin() != station.station_origin
         || challenge.issuer() != station.issuer
         || token.identity.issuer != station.issuer
-        || previous.owner != token.identity.subject
     {
         return Ok(None);
     }
@@ -401,14 +424,14 @@ async fn record_consent(
         signer: challenge.signer().to_owned(),
         expected: challenge.expected_binding().clone(),
     };
-    let Some((log, policy)) =
+    let Some(ReviewedIntent { log, policy, rooms }) =
         review_intent(db, station, genesis, &intent, challenge.subject()).await?
     else {
         return Ok(None);
     };
     let nonce = atem_client::encoding::b64u(challenge.nonce());
-    let saved: Option<String> = sqlx::query_scalar(
-        "SELECT challenge FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2
+    let saved: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT challenge,room_digest FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2
             AND nonce=$3 AND subject=$4 FOR UPDATE",
     )
     .bind(&station.issuer)
@@ -417,7 +440,15 @@ async fn record_consent(
     .bind(challenge.subject())
     .fetch_optional(&mut *db)
     .await?;
-    if saved.as_deref() != Some(challenge.jcs()) {
+    let Some((saved, digest)) = saved else {
+        return Ok(None);
+    };
+    if saved != challenge.jcs()
+        || rooms.as_ref().is_some_and(|review| {
+            digest.as_deref() != Some(review.digest.as_slice())
+                || !review.owners.contains(&token.identity.subject)
+        })
+    {
         return Ok(None);
     }
     // Read time after all blocking locks. Consent ends at the earlier login or nonce deadline.
@@ -442,6 +473,19 @@ async fn record_consent(
         .is_err()
     {
         return Ok(None);
+    }
+    if rooms.is_some() {
+        room_consents::record(
+            db,
+            station,
+            &nonce,
+            &token.identity.subject,
+            auth_time,
+            expires,
+            now,
+        )
+        .await?;
+        return Ok(Some(json!({"consented":true})));
     }
     sqlx::query(
         "UPDATE station_binding_challenges SET consent_auth_time=$4,consent_expires_at=$5

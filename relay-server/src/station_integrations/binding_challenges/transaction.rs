@@ -140,18 +140,13 @@ async fn apply(
     let Some(retired) = retired else {
         return Ok(None);
     };
-    let Some((mut log, policy)) =
+    let Some(ReviewedIntent { mut log, policy, rooms }) =
         review_intent(db, station, genesis, &intent, challenge.subject()).await?
     else {
         return Ok(None);
     };
-    if matches!(challenge.expected_binding(), ExpectedBinding::NeverBound)
-        && first_bind_requires_room_consent(db, station, &genesis_hex, challenge.subject()).await?
-    {
-        return Ok(None);
-    }
-    let stored: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT challenge,consent_expires_at FROM station_binding_challenges
+    let stored: Option<(String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT challenge,consent_expires_at,room_digest FROM station_binding_challenges
         WHERE issuer=$1 AND station_origin=$2 AND nonce=$3 AND subject=$4 FOR UPDATE",
     )
     .bind(&station.issuer)
@@ -160,17 +155,27 @@ async fn apply(
     .bind(challenge.subject())
     .fetch_optional(&mut *db)
     .await?;
-    let Some((stored, consent_until)) = stored else {
+    let Some((stored, consent_until, digest)) = stored else {
         return Ok(None);
     };
     let saved = StationBindingChallenge::parse(stored.as_bytes())
         .map_err(|_| sqlx::Error::Protocol("invalid stored binding challenge".into()))?;
+    let consents_until = match rooms {
+        Some(review) => {
+            if digest.as_deref() != Some(review.digest.as_slice()) {
+                return Ok(None);
+            }
+            room_consents::deadline(db, station, nonce, &review.owners).await?
+        }
+        None => i64::MAX,
+    };
     let now_ms = binding_clock_ms(db).await?;
     let mut now = crate::remote_api::recovery::now();
     now.wall_ms = now_ms.max(0) as u64;
     log.advance(&now);
     if now_ms < 0
         || token.expires_at.saturating_mul(1000) <= now_ms
+        || now_ms >= consents_until
         || !policy.recent_d27_read(now_ms)
         || saved.issued_at() > now.wall_ms
         || (challenge.action() == BindingAction::Transfer
@@ -219,25 +224,6 @@ async fn apply(
     .execute(db)
     .await?;
     Ok(Some(receipt))
-}
-
-// Foreign room ownership needs its own authenticated consent. Never infer it
-// from the R9 manager proof or the identity of the new owner.
-async fn first_bind_requires_room_consent(
-    db: &mut PgConnection,
-    station: &FeedBinding,
-    genesis: &str,
-    subject: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(
-        SELECT 1 FROM station_proved_room_owners WHERE issuer=$1 AND station_origin=$2 AND genesis_hash=$3
-            AND (conflicted OR account_subject<>$4)
-        ) OR EXISTS (
-        SELECT 1 FROM remote_recovery_roots r JOIN account_identities i ON i.principal=r.account_subject AND i.issuer=$1
-        WHERE r.genesis_hash=$3 AND i.subject<>$4 AND (
-            COALESCE(r.state->'routes','{}'::jsonb)<>'{}'::jsonb OR COALESCE(r.state->'proxies','{}'::jsonb)<>'{}'::jsonb
-            OR EXISTS (SELECT 1 FROM station_room_proofs p WHERE p.genesis_hash=$3 AND p.issuer=$1 AND p.station_origin=$2)))")
-        .bind(&station.issuer).bind(&station.station_origin).bind(genesis).bind(subject).fetch_one(db).await
 }
 
 #[cfg(test)]
