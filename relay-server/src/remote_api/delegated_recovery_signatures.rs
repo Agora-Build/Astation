@@ -234,12 +234,13 @@ async fn retain_checked(
     let record_ids: Vec<_> = input.replacements.iter().map(|(_, record)| record.record_id().to_owned()).collect();
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = super::checkpoint_for_owner(&mut tx, binding, genesis, false, owner).await?;
-    let mut signed = super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    let mut source = super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    let signed = &mut source.records;
     if prepared.plan_id != plan_id || report["evidence_hash"] != input.evidence_hash {
         return Err(invalid());
     }
     let (rows, mut lower_bounds) =
-        load(&mut tx, &prepared, &log, binding, &mut signed, &report).await?;
+        load(&mut tx, &prepared, &log, binding, signed, &report).await?;
     for (principal, value) in report["known_history"]["observed_signing_lower_bounds"]
         .as_object()
         .ok_or_else(invalid)?
@@ -314,12 +315,14 @@ pub(super) async fn inspection(
     log: &Membership,
     binding: &Binding,
     report: &Value,
-    signed: &mut BTreeMap<String, Value>,
+    source: &mut super::SignedEvidence,
 ) -> Result<(Value, BTreeMap<String, ControlRecord>), sqlx::Error> {
+    let signed = &mut source.records;
     let (rows, lower_bounds) = load(connection, prepared, log, binding, signed, report).await?;
     let mut commitments = Vec::new();
     let mut summaries = Vec::new();
     let mut current_copies = BTreeMap::new();
+    let mut reported_copies = BTreeMap::new();
     for row in rows {
         let record = ControlRecord::parse(&serde_json::to_vec(&row.record).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
@@ -332,21 +335,24 @@ pub(super) async fn inspection(
         let issued_at = record.issued_at();
         let current_review =
             row.plan_id == prepared.plan_id && report["evidence_hash"] == row.evidence_hash;
-        if current_review
-            && verification == "valid"
-            && current_copies
-                .insert(row.original_record_id.clone(), record)
-                .is_some()
-        {
-            return Err(invalid());
+        let exported_at_cut = source.exported_at_cut.contains(&row.record_id);
+        if verification == "valid" && row.plan_id == prepared.plan_id {
+            if exported_at_cut {
+                // Already checked at this plan's head and against this
+                // original. Its author's current report revalidates the bytes.
+                reported_copies.entry(row.original_record_id.clone()).or_insert(record);
+            } else if current_review && current_copies.insert(row.original_record_id.clone(), record).is_some() {
+                return Err(invalid());
+            }
         }
         summaries.push(json!({"original_record_id":row.original_record_id,"record_id":row.record_id,
             "principal":principal,"issued_at":issued_at,"verification":verification,
-            "current_review":current_review,
+            "current_review":current_review,"exported_at_cut":exported_at_cut,
             "source_evidence_hash":row.evidence_hash,"plan_id":row.plan_id}));
         commitments.push(json!({"plan_id":row.plan_id,"record_id":row.record_id,
             "original_record_id":row.original_record_id,"evidence_hash":row.evidence_hash,"record":row.record}));
     }
+    current_copies.extend(reported_copies);
     let mut obligations = Vec::new();
     for value in signed.values() {
         let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
@@ -362,7 +368,7 @@ pub(super) async fn inspection(
             original["requirement"].as_str().ok_or_else(invalid)?
         };
         // Preserve each original independently. A newer stop for its principal,
-        // an old-review copy or unsigned intent cannot discharge this mapping.
+        // an unconfirmed prior review or unsigned intent cannot discharge this mapping.
         obligations
             .push(json!({"original":original,"copy_record_id":copy,"requirement":requirement}));
     }

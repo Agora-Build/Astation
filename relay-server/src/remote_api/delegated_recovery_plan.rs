@@ -7,7 +7,7 @@ use atem_client::{canonical::jcs, membership::Membership, Hash32};
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "delegated_portal_services.rs"]
 mod portal_services;
@@ -228,8 +228,8 @@ async fn review_evidence(
     report: &mut Value,
     operator_review: bool,
 ) -> Result<snapshot_stops::StopSources, sqlx::Error> {
-    let mut signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
-    let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &mut signed).await?;
+    let mut source = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
+    let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &mut source).await?;
     report["recovery_signatures"] = summary;
     let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
@@ -243,7 +243,12 @@ async fn review_evidence(
         reconstruction["includes_signed_copies"] = true.into();
     }
     report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
-    Ok(snapshot_stops::StopSources { signed, copies })
+    Ok(snapshot_stops::StopSources { signed: source.records, copies })
+}
+
+struct SignedEvidence {
+    records: BTreeMap<String, Value>,
+    exported_at_cut: BTreeSet<String>,
 }
 
 async fn review_source_evidence(
@@ -253,7 +258,7 @@ async fn review_source_evidence(
     binding: &Binding,
     report: &mut Value,
     operator_review: bool,
-) -> Result<BTreeMap<String, Value>, sqlx::Error> {
+) -> Result<SignedEvidence, sqlx::Error> {
     report["recovered_stops"] = stops::inspection(connection, prepared, log, binding).await?;
     let history = history::inspection(connection, prepared, log, binding, operator_review).await?;
     report["known_history"] = history.review;
@@ -273,8 +278,12 @@ async fn review_source_evidence(
     }
     let hashes = history.current_report_hashes;
     if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
-    report["evidence_hash"] = source_hash(&sources)?.into();
-    Ok(history.signed)
+    let evidence_hash = source_hash(&sources)?;
+    let exported_at_cut = history.latest_exports.into_iter()
+        .filter(|(base, _)| base.to_hex() == evidence_hash)
+        .flat_map(|(_, ids)| ids).collect();
+    report["evidence_hash"] = evidence_hash.into();
+    Ok(SignedEvidence { records: history.signed, exported_at_cut })
 }
 
 /// The fence and source stay locked until the caller commits all new evidence.

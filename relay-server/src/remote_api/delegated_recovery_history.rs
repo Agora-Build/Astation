@@ -6,6 +6,7 @@ use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepare
 use atem_client::{
     control::{principal_key_of, verify_control, ControlCheck, ControlRecord, RefusalReason},
     membership::{Action, MemberKind, Membership},
+    Hash32,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,6 +58,8 @@ pub(super) struct History {
     pub authors: Value,
     pub current_report_hashes: Vec<String>,
     pub confirmation_hashes: Vec<String>,
+    // One latest verified export per signer, slot and process, in this plan.
+    pub latest_exports: Vec<(Hash32, Vec<String>)>,
 }
 
 pub(super) async fn inspection(
@@ -108,6 +111,7 @@ pub(super) async fn inspection(
     let mut prior_authors = Vec::new();
     let mut current_report_hashes = Vec::new();
     let mut confirmation_hashes = Vec::new();
+    let mut latest_exports = BTreeMap::new();
     for Historical {
         generation,
         plan: checkpoint,
@@ -194,6 +198,10 @@ pub(super) async fn inspection(
         let current_plan = checkpoint.plan_id == prepared.plan_id;
         let mut latest_journals = BTreeMap::new();
         signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
+            if current_plan {
+                latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
+                    (verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
+            }
             for record in verified.records {
                 // Signing a journal export does not establish authority for its target.
                 // Keep the original verified clock across later membership changes.
@@ -295,5 +303,6 @@ pub(super) async fn inspection(
             "journal_gaps": journals.gaps(), "complete_history": false}),
         current_report_hashes,
         confirmation_hashes,
+        latest_exports: latest_exports.into_values().collect(),
     })
 }
