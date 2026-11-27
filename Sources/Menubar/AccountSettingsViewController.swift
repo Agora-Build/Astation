@@ -49,8 +49,8 @@ final class AccountSettingsViewController: NSViewController {
     @objc private func sessionChanged() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if self.busy, self.loginAuth !== self.auth {
-                self.loginTask?.cancel(); self.loginAuth = nil; self.busy = false
+            if let task = self.loginTask, self.loginAuth !== self.auth {
+                task.cancel(); self.loginTask = nil; self.loginAuth = nil; self.busy = false
             }
             self.refresh()
         }
@@ -98,6 +98,7 @@ final class AccountSettingsViewController: NSViewController {
                 signIn.isEnabled = auth?.configuration != nil
                 signOut.isEnabled = hub.signedInAccount != nil
                 stationOwnership.isEnabled = !hub.needsAccountSignIn
+                if !current() { refresh() }
             }
             do {
                 _ = try await authorization.accessToken(relayURL: origin)
@@ -155,11 +156,13 @@ final class AccountSettingsViewController: NSViewController {
                 if hub.signedInAccount != nil, !hub.accountSignInRequired, hub.stationAccountSignInRequired {
                     try await hub.prepareAccountSecurityAccess()
                 } else { try await hub.signInAccount() }
-                guard loginAuth === context else { return }
+                guard !Task.isCancelled, loginAuth === context else { return }
+                loginTask = nil; loginAuth = nil
                 busy = false; refresh()
             }
             catch {
-                guard loginAuth === context else { return }
+                guard !Task.isCancelled, loginAuth === context else { return }
+                loginTask = nil; loginAuth = nil
                 busy = false; status.stringValue = error.localizedDescription; status.textColor = .systemRed
                 signIn.isEnabled = true; signOut.isEnabled = true
             }
