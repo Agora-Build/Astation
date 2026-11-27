@@ -80,29 +80,24 @@ pub(super) async fn submit(
             Submission::Outstanding
         });
     }
-    Ok(
-        match apply(
-            db,
-            station,
-            token,
-            genesis,
-            bytes,
-            &challenge,
-            &nonce,
-            proof_hash.as_ref(),
-        )
-        .await?
-        {
-            Some(receipt) => Submission::Applied(receipt),
-            None => Submission::Refused,
-        },
+    apply(
+        db,
+        station,
+        token,
+        genesis,
+        &canonical,
+        &challenge,
+        &nonce,
+        proof_hash.as_ref(),
     )
+    .await
 }
 
 pub(super) enum Submission {
     Applied(Value),
     Confirmed(Value),
     Outstanding,
+    AwaitingConsent,
     Expired,
     Refused,
 }
@@ -112,19 +107,13 @@ async fn apply(
     station: &FeedBinding,
     token: &VerifiedAccessToken,
     genesis: Hash32,
-    bytes: &[u8],
+    proof: &str,
     challenge: &StationBindingChallenge,
     nonce: &str,
     proof_hash: &[u8],
-) -> Result<Option<Value>, sqlx::Error> {
+) -> Result<Submission, sqlx::Error> {
     let genesis_hex = genesis.to_hex();
-    let intent = Intent {
-        action: challenge.action(),
-        account: challenge.account_id().to_owned(),
-        head: challenge.head(),
-        signer: challenge.signer().to_owned(),
-        expected: challenge.expected_binding().clone(),
-    };
+    let intent = Intent::from_challenge(challenge);
     // Route writers lock the root before the policy. Keep the same order and
     // retain only the exact connections that a replica must retire.
     let retired: Option<Value> = sqlx::query_scalar(
@@ -138,15 +127,18 @@ async fn apply(
     .fetch_optional(&mut *db)
     .await?;
     let Some(retired) = retired else {
-        return Ok(None);
+        return Ok(Submission::Refused);
     };
-    let Some(ReviewedIntent { mut log, policy, rooms }) =
-        review_intent(db, station, genesis, &intent, challenge.subject()).await?
+    let Some(ReviewedIntent {
+        mut log,
+        policy,
+        rooms,
+    }) = review_intent(db, station, genesis, &intent, challenge.subject()).await?
     else {
-        return Ok(None);
+        return Ok(Submission::Refused);
     };
-    let stored: Option<(String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT challenge,consent_expires_at,room_digest FROM station_binding_challenges
+    let stored: Option<(String, Option<i64>, Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
+        "SELECT challenge,consent_expires_at,room_digest,consent_proof FROM station_binding_challenges
         WHERE issuer=$1 AND station_origin=$2 AND nonce=$3 AND subject=$4 FOR UPDATE",
     )
     .bind(&station.issuer)
@@ -155,15 +147,15 @@ async fn apply(
     .bind(challenge.subject())
     .fetch_optional(&mut *db)
     .await?;
-    let Some((stored, consent_until, digest)) = stored else {
-        return Ok(None);
+    let Some((stored, consent_until, digest, pending_proof)) = stored else {
+        return Ok(Submission::Refused);
     };
     let saved = StationBindingChallenge::parse(stored.as_bytes())
         .map_err(|_| sqlx::Error::Protocol("invalid stored binding challenge".into()))?;
-    let consents_until = match rooms {
+    let consents_until = match &rooms {
         Some(review) => {
             if digest.as_deref() != Some(review.digest.as_slice()) {
-                return Ok(None);
+                return Ok(Submission::Refused);
             }
             room_consents::deadline(db, station, nonce, &review.owners).await?
         }
@@ -175,20 +167,42 @@ async fn apply(
     log.advance(&now);
     if now_ms < 0
         || token.expires_at.saturating_mul(1000) <= now_ms
-        || now_ms >= consents_until
+        || pending_proof.as_deref().is_some_and(|old| old != proof)
         || !policy.recent_d27_read(now_ms)
         || saved.issued_at() > now.wall_ms
-        || (challenge.action() == BindingAction::Transfer
-            && !consent_until.is_some_and(|t| t > now_ms))
-        || !verify_station_binding(&log, bytes, &saved, now.wall_ms)
+        || !verify_station_binding(&log, proof.as_bytes(), &saved, now.wall_ms)
             .is_ok_and(|proof| proof.at_head)
     {
-        return Ok(None);
+        return Ok(Submission::Refused);
+    }
+    if now_ms >= consents_until
+        || (challenge.action() == BindingAction::Transfer
+            && !consent_until.is_some_and(|expiry| expiry > now_ms))
+    {
+        if pending_proof.is_none() {
+            let owners: Vec<String> = match (rooms, challenge.expected_binding()) {
+                (Some(rooms), _) => rooms.owners.into_iter().collect(),
+                (None, ExpectedBinding::Bound(previous)) => vec![previous.owner.clone()],
+                _ => return Ok(Submission::Refused),
+            };
+            sqlx::query(
+                "UPDATE station_binding_challenges SET consent_proof=$4,consent_owners=$5
+                WHERE issuer=$1 AND station_origin=$2 AND nonce=$3",
+            )
+            .bind(&station.issuer)
+            .bind(&station.station_origin)
+            .bind(nonce)
+            .bind(proof)
+            .bind(&owners)
+            .execute(&mut *db)
+            .await?;
+        }
+        return Ok(Submission::AwaitingConsent);
     }
     let previous = challenge.expected_binding().record();
     let version = previous.map_or(1, |r| r.version + 1);
     if version > 9_007_199_254_740_991 {
-        return Ok(None);
+        return Ok(Submission::Refused);
     }
     let id = previous
         .map(|r| r.binding_id.clone())
@@ -223,7 +237,7 @@ async fn apply(
     .bind(nonce)
     .execute(db)
     .await?;
-    Ok(Some(receipt))
+    Ok(Submission::Applied(receipt))
 }
 
 #[cfg(test)]

@@ -95,6 +95,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     let genesis = fixture.log.genesis_hash().to_hex();
     let account = fixture.log.account_id();
     let app = Router::new()
+        .route("/binding/consent-request", get(super::super::pending::next))
         .route("/logs/:genesis/binding/challenge", post(super::super::mint))
         .route(
             "/logs/:genesis/binding/consent",
@@ -116,6 +117,25 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 16_384).await.unwrap();
         (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    let discover = async |claims: &Value| {
+        let token = auth.token(auth.header(), claims.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/binding/consent-request")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 8192).await.unwrap())
+                .unwrap(),
+        )
     };
     let sign = |body: &Value| {
         let challenge = StationBindingChallenge::parse(body.to_string().as_bytes()).unwrap();
@@ -148,6 +168,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         send("commit", &json!({}), &owner).await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+    assert_eq!(discover(&owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
     if !cfg!(feature = "delegated-host-work") {
         db.cleanup().await;
         return;
@@ -238,31 +259,96 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     unrelated["sub"] = json!("ab00000000000000000000000007");
     assert_eq!(send("consent", &first_bind, &unrelated).await, refusal);
     let proof = sign(&first_bind);
+    let waiting = (StatusCode::ACCEPTED, json!({"awaiting_consent":true}));
+    let empty = (StatusCode::OK, json!({"request":null}));
+    assert_eq!(discover(&third).await, empty);
+    let mut damaged = proof.clone();
+    damaged["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
+    assert_eq!(send("commit", &damaged, &owner).await, refusal);
+    assert_eq!(discover(&third).await, empty);
+    sqlx::raw_sql(
+        "CREATE FUNCTION fail_pending() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'pending write failed'; END $$;
+        CREATE CONSTRAINT TRIGGER fail_pending AFTER UPDATE ON station_binding_challenges
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_pending()",
+    )
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(
+        send("commit", &proof, &owner).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(discover(&new_owner).await, empty);
+    sqlx::query("DROP TRIGGER fail_pending ON station_binding_challenges")
+        .execute(&replica)
+        .await
+        .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    assert_eq!(
+        discover(&new_owner).await,
+        (StatusCode::OK, json!({"request":first_bind}))
+    );
+    assert_eq!(discover(&unrelated).await, empty);
+    assert_eq!(discover(&owner).await, empty);
     let accepted = (StatusCode::OK, json!({"consented":true}));
     let mut short_login = new_owner.clone();
     short_login["exp"] = json!(chrono::Utc::now().timestamp() + 15);
     assert_eq!(send("consent", &first_bind, &short_login).await, accepted);
     assert_eq!(send("consent", &first_bind, &new_owner).await, accepted);
+    // A discovery query selected this nonce just before the peer consented.
+    let mut reader = replica.begin().await.unwrap();
+    assert!(super::super::pending::outstanding_proof(
+        &mut reader,
+        &runtime.binding,
+        first_bind["nonce"].as_str().unwrap(),
+        new_owner["sub"].as_str().unwrap()
+    )
+    .await
+    .unwrap()
+    .is_none());
+    reader.rollback().await.unwrap();
     let saved: i64 = sqlx::query_scalar("SELECT expires_at FROM station_binding_room_consents")
         .fetch_one(&replica)
         .await
         .unwrap();
     assert_eq!(saved, short_login["exp"].as_i64().unwrap() * 1000);
-    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(discover(&new_owner).await, empty);
+    assert_eq!(
+        discover(&third).await,
+        (StatusCode::OK, json!({"request":first_bind}))
+    );
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    // Another replica reassigns the outstanding owner's room after candidate selection.
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE room='offline-b'")
+        .bind(unrelated["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
+    assert_eq!(discover(&third).await, empty);
+    assert_eq!(discover(&unrelated).await, empty);
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE room='offline-b'")
+        .bind(third["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
     assert_eq!(send("consent", &first_bind, &third).await, accepted);
     // Adding another room of an owner who already consented requires a fresh review.
     sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
         VALUES ($1,$2,$3,'offline-c',$4)").bind(&auth.issuer).bind(origin).bind(&genesis)
         .bind(third["sub"].as_str().unwrap()).execute(&replica).await.unwrap();
+    assert_eq!(discover(&new_owner).await, empty);
+    assert_eq!(discover(&third).await, empty);
     assert_eq!(send("commit", &proof, &owner).await, refusal);
     assert_eq!(send("consent", &first_bind, &third).await, refusal);
+    assert_eq!(discover(&third).await, empty);
     let (status, final_bind) = send("challenge", &intent, &owner).await;
     assert_eq!(status, StatusCode::OK);
     assert_ne!(final_bind["nonce"], first_bind["nonce"]);
     let proof = sign(&final_bind);
     let mut broken = proof.clone();
     broken["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
-    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
     let (one, two) = tokio::join!(
         send("consent", &final_bind, &new_owner),
         send("consent", &final_bind, &third)
@@ -278,7 +364,11 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     .execute(&replica)
     .await
     .unwrap();
-    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    assert_eq!(
+        discover(&third).await,
+        (StatusCode::OK, json!({"request":final_bind}))
+    );
     assert_eq!(send("consent", &final_bind, &third).await, accepted);
     // A peer's more recent disable wins even after both owners consent.
     sqlx::query(
@@ -447,12 +537,19 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     let (status, transfer) = send("challenge", &intent, &new_owner).await;
     assert_eq!(status, StatusCode::OK, "{transfer}");
     let signed_transfer = sign(&transfer);
-    assert_eq!(send("commit", &signed_transfer, &new_owner).await, refusal);
+    assert_eq!(discover(&owner).await, empty);
+    assert_eq!(send("commit", &signed_transfer, &new_owner).await, waiting);
+    assert_eq!(
+        discover(&owner).await,
+        (StatusCode::OK, json!({"request":transfer}))
+    );
     assert_eq!(send("consent", &transfer, &owner).await.0, StatusCode::OK);
     let moved = send("commit", &signed_transfer, &new_owner).await;
     assert_eq!(moved.0, StatusCode::OK, "{}", moved.1);
     assert_eq!(moved.1["version"], 2);
     assert_eq!(moved.1["account"], new_owner["sub"]);
+    assert_eq!(discover(&owner).await, empty);
+    assert_eq!(send("receipt", &signed_transfer, &new_owner).await, moved);
     assert_eq!(counts().await, (2, 2));
     assert!(!peer.prepare_delegated(&owner_route).await);
     let moved_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();

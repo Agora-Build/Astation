@@ -242,6 +242,18 @@ challenge to PostgreSQL. Replicas can return the same outstanding challenge
 after a lost response. The lease ends within 30 seconds and by token expiry.
 The request and response use the delegated gate.
 
+When an independent owner's consent is outstanding, the manager's first
+signed `POST /agora-build/v1/logs/{genesis}/binding/commit` returns HTTP 202
+with `{"awaiting_consent":true}` after Station stores the proof. The other
+owner uses their own Station-audience native login to call
+`GET /agora-build/v1/binding/consent-request`. The private response has one
+field, `request`, containing the next eligible SDK challenge or `null`.
+Station rechecks current room ownership, the manager signature and the
+request deadline on discovery. Each owner sees only the challenge they can
+consent to. The manager retries the saved proof during the original login
+and deadline. After expiry, the receipt endpoint distinguishes a committed
+ownership change from an expired request.
+
 For a transfer, the current owner sends the reviewed challenge as the body of
 `POST /agora-build/v1/logs/{genesis}/binding/transfer-consent` using their
 own Station-audience native login. Station compares the full challenge with

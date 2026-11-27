@@ -380,6 +380,7 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
     Router::new()
         .route("/agora-build/v1/changes", post(nudge))
         .route("/agora-build/v1/details", get(details))
+        .route("/agora-build/v1/binding/consent-request", get(binding_challenges::pending::next))
         .route("/agora-build/v1/logs/:genesis/binding/challenge", post(binding_challenges::mint))
         .route("/agora-build/v1/logs/:genesis/binding/receipt", post(binding_challenges::receipt))
         .route("/agora-build/v1/logs/:genesis/binding/commit", post(binding_challenges::commit))
