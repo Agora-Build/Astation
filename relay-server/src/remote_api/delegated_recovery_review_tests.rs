@@ -586,6 +586,18 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let other_app = make_app(other_store);
     let base = format!("/api/remote/v1/logs/{genesis}/control/recovery");
     let report_path = format!("{base}/signer-reports");
+    let former = "member:phone";
+    let active = "member:replacement-manager";
+    let original = ControlRecord::parse(root["delegated"][ORIGIN]["records"][1].to_string().as_bytes()).unwrap();
+    let mut replacement = original.body().clone();
+    replacement.signer = ControlSigner::Member("replacement-manager".into());
+    replacement.record_id = uuid::Uuid::new_v4().to_string();
+    replacement.issued_at = f.created + 1000;
+    let copy = build_control(&f.keys, &KeyId::new("replacement-manager"), &replacement).unwrap().to_json();
+    let copies = json!({"evidence_hash":initial["evidence_hash"],
+        "replacements":[{"original_record_id":original.record_id(),"record":copy}]});
+    let plan_id = initial["plan_id"].as_str().unwrap();
+    assert_eq!(retain_http(&app, &genesis, plan_id, Some("alice"), copies.to_string().into_bytes()).await.0, StatusCode::OK);
     let make_submission = async |signer: &str, key: &str, revision: u64, drafts: Vec<String>, source: &Value| {
         let slot = "native";
         let mint = json!({"signer":signer,"slot":slot,"expected":f.log.head().to_json(),
@@ -595,13 +607,13 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
             mint.to_string().into_bytes()).await;
         assert_eq!(status, StatusCode::OK, "{challenge}");
         let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
-        let journal = JournalView { id: [1; 16], since: 1, revision, records: vec![], drafts };
+        let records = if signer == active { vec![&copy] } else { vec![] };
+        let journal = JournalView { id: [1; 16], since: 1, revision,
+            records: records.iter().map(|record| record["body"].to_string()).collect(), drafts };
         let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
         let report = sign_signer_report(&f.keys, &KeyId::new(key), &body).unwrap();
-        json!({"report":report.to_json(),"records":[]}).to_string().into_bytes()
+        json!({"report":report.to_json(),"records":records}).to_string().into_bytes()
     };
-    let former = "member:phone";
-    let active = "member:replacement-manager";
     let initial_submission = make_submission(former, "manager", 1, vec![], &initial["evidence_hash"]).await;
     let original_receipt = post_recovery(&app, &report_path, Some("alice"), initial_submission.clone()).await;
     assert_eq!(original_receipt.0, StatusCode::OK);
@@ -611,6 +623,9 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
 
     let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(cut["evidence_hash"], first["evidence_hash"]);
+    assert_eq!(cut["recovery_signatures"]["records"][0]["exported_at_cut"], false);
+    assert!(plan::snapshot_stops::stage(&replica, &binding, &genesis,
+        cut["reconstruction_hash"].as_str().unwrap()).await.is_err());
     let hash = &cut["evidence_hash"];
     let a = make_submission(former, "manager", 1, vec![], hash).await;
     let b = make_submission(active, "replacement-manager", 1, vec![], hash).await;
@@ -621,6 +636,15 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let confirmed = plan::prepare(&resumed, &binding, &genesis).await.unwrap();
     assert_eq!(&confirmed["evidence_hash"], hash);
     assert_ne!(confirmed["reconstruction_hash"], cut["reconstruction_hash"]);
+    let mapped = &confirmed["recovery_signatures"]["records"][0];
+    assert_eq!(mapped["current_review"], false);
+    assert_eq!(mapped["exported_at_cut"], true);
+    let staged = plan::snapshot_stops::stage(&resumed, &binding, &genesis,
+        confirmed["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], 1);
+    let bytes: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops WHERE plan_id=$1")
+        .bind(plan_id).fetch_one(&replica).await.unwrap();
+    assert_eq!(bytes, json!([copy]));
     let mut roster = http(&app, &genesis, Some("alice")).await.1;
     for flag in ["retained_history_only", "complete_history", "signing_clock_complete", "snapshot_complete", "recovery_ready"] {
         roster.as_object_mut().unwrap().remove(flag);
@@ -664,6 +688,9 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     assert!(compare_files(&[phone, manager]).await.is_err());
     let latest = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(&latest["evidence_hash"], hash);
+    assert_eq!(latest["recovery_signatures"]["records"][0]["exported_at_cut"], false);
+    assert!(plan::snapshot_stops::stage(&resumed, &binding, &genesis,
+        latest["reconstruction_hash"].as_str().unwrap()).await.is_err());
     roster["evidence_hash"] = latest["evidence_hash"].clone();
     roster["reconstruction_hash"] = latest["reconstruction_hash"].clone();
     let result = compare(&roster).await.unwrap();

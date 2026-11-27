@@ -74,7 +74,7 @@ pub(crate) async fn submit(
     .ok_or(SubmitError::Changed)?;
     let challenge = SignerReportChallenge::parse(challenge_json.to_string().as_bytes())
         .map_err(|_| invalid())?;
-    let mut known =
+    let mut source =
         review_source_evidence(&mut tx, &plan, &log, binding, &mut evidence, false).await?;
     let recovery = challenge.recovery();
     if challenge.connection() != connection as u64
@@ -117,6 +117,7 @@ pub(crate) async fn submit(
     if !verified.at_head {
         return Err(SubmitError::Changed);
     }
+    let known = &mut source.records;
     let old_count = known.len();
     for record in verified.records {
         let value = record.object().to_json();
@@ -132,8 +133,8 @@ pub(crate) async fn submit(
     if known.len() > old_count {
         // A new source can also collide with an archived draft or retained recovery copy.
         // Check those before committing a receipt that would make the next review unusable.
-        super::native::inspection(&mut tx, &plan, &log, binding, &known).await?;
-        super::signatures::inspection(&mut tx, &plan, &log, binding, &evidence, &mut known).await?;
+        super::native::inspection(&mut tx, &plan, &log, binding, known).await?;
+        super::signatures::inspection(&mut tx, &plan, &log, binding, &evidence, &mut source).await?;
     }
     sqlx::query("INSERT INTO station_delegated_signer_reports(plan_id,connection,challenge,submission,submission_hash,accepted_at)
         VALUES ($1,$2,$3,$4,$5,$6)")
