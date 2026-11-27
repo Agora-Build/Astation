@@ -11,6 +11,8 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public let expiresAt: String
     public let role: String
     public let interruptRunning: Bool?
+    public let pendingHostRevocation: Bool?
+    public let stationRemoved: Bool?
 
     func validate() throws {
         guard Self.validID(id), !name.isEmpty, name.utf8.count <= 320,
@@ -163,7 +165,7 @@ public struct PortalIntegrationHTTP: Sendable {
         try result.validate()
         guard result.id == mirror.integrationID, result.stationOrigin == mirror.stationOrigin,
               result.role == "owner", ["revoking", "revoked"].contains(result.state),
-              result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
+              result.pendingHostRevocation != true, result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
             throw AccountLoginError.changed
         }
         return .confirmed(result)
