@@ -630,11 +630,14 @@ async fn postgres_delegated_recovery_signatures_refuse_partial_batches_and_keep_
     assert_eq!(host_copy["body"]["revoke_seq"], f.log.head().seq);
     let staged = stage(&database.pool, &binding, &genesis,
         accepted["reconstruction_hash"].as_str().unwrap()).await.unwrap();
-    assert_eq!(staged["stop_count"], 2);
+    assert_eq!(staged["stop_count"], 4);
     let records: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops")
         .fetch_one(&database.pool).await.unwrap();
     assert!(records.as_array().unwrap().contains(&host.object().to_json()));
     assert!(records.as_array().unwrap().contains(&source.object().to_json()));
+    for replacement in batch["replacements"].as_array().unwrap() {
+        assert!(records.as_array().unwrap().contains(&replacement["record"]));
+    }
     drop(store);
     database.cleanup().await;
 }
@@ -651,6 +654,7 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
     let initial = saved(&database.pool).await;
     let source = original(&initial);
     let copy = fresh(&f, &plan, &source, 1000);
+    let prior_copy = ControlRecord::parse(copy.to_string().as_bytes()).unwrap();
     submit(
         &database.pool,
         &binding,
@@ -791,12 +795,26 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
             .count(),
         1
     );
-    let staged = stage(&database.pool, &next_binding, &genesis,
-        result["reconstruction_hash"].as_str().unwrap()).await.unwrap();
-    assert_eq!(staged["stop_count"], 1);
+    assert_eq!(obligation(&result, prior_copy.record_id())["requirement"], "fresh_manager_signature");
+    assert!(stage(&database.pool, &next_binding, &genesis,
+        result["reconstruction_hash"].as_str().unwrap()).await.is_err());
+    let mut body = prior_copy.body().clone();
+    body.record_id = uuid::Uuid::new_v4().to_string();
+    body.signer = ControlSigner::Member("replacement-manager".into());
+    body.issued_at = f.created + 1002;
+    let second_copy = build_control(&f.keys, &replacement_key, &body).unwrap().to_json();
+    let request = input(&next_plan, &prior_copy, second_copy.clone());
+    let replica = database.reconnect(2).await;
+    let complete = submit(&replica, &next_binding, &genesis, &next_plan, &request).await.unwrap();
+    assert_eq!(submit(&database.pool, &next_binding, &genesis, &next_plan, &request).await.unwrap(), complete);
+    let staged = stage(&replica, &next_binding, &genesis,
+        complete["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], 2);
     let records: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops WHERE plan_id=$1")
         .bind(next_plan["plan_id"].as_str().unwrap()).fetch_one(&database.pool).await.unwrap();
-    assert_eq!(records, json!([fresh_copy]));
+    assert!(records.as_array().unwrap().contains(&fresh_copy));
+    assert!(records.as_array().unwrap().contains(&second_copy));
+    replica.close().await;
     assert_eq!(result["recovery_ready"], false);
     drop(store);
     database.cleanup().await;
@@ -836,8 +854,9 @@ async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and
     assert_eq!(stage(&second, &binding, &genesis, review).await.unwrap(), receipt);
 
     // A fresh copy for a still-authorized signer leaves the exact original usable.
+    let copy = fresh(&f, &plan, &source, 1000);
     let updated = submit(&second, &binding, &genesis, &plan,
-        &input(&plan, &source, fresh(&f, &plan, &source, 1000))).await.unwrap();
+        &input(&plan, &source, copy.clone())).await.unwrap();
     let next = updated["reconstruction_hash"].as_str().unwrap();
     assert_ne!(next, review);
     assert!(stage(&database.pool, &binding, &genesis, review).await.is_err());
@@ -849,8 +868,12 @@ async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and
     assert_eq!(retained, review);
     sqlx::query("DROP TRIGGER reject_staging ON station_delegated_snapshot_stops")
         .execute(&second).await.unwrap();
-    assert_eq!(stage(&second, &binding, &genesis, next).await.unwrap()["records_hash"], receipt["records_hash"]);
-    assert_eq!(sqlx::query_scalar::<_,Value>(read).fetch_one(&second).await.unwrap(), staged);
+    let restaged = stage(&second, &binding, &genesis, next).await.unwrap();
+    assert_ne!(restaged["records_hash"], receipt["records_hash"]);
+    assert_eq!(restaged["stop_count"], 2);
+    let records: Value = sqlx::query_scalar(read).fetch_one(&second).await.unwrap();
+    assert!(records.as_array().unwrap().contains(&source.object().to_json()));
+    assert!(records.as_array().unwrap().contains(&copy));
     // A contradictory existing row cannot be reported as an exact retry.
     sqlx::query("UPDATE station_delegated_snapshot_stops SET records='[]'::jsonb")
         .execute(&second).await.unwrap();

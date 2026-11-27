@@ -24,7 +24,7 @@ impl StopSources {
         plan: &Prepared,
     ) -> Result<Vec<ControlRecord>, sqlx::Error> {
         let mut originals = Vec::new();
-        let mut snapshot = Vec::new();
+        let mut selected_records = BTreeMap::new();
         for (id, value) in self.signed {
             let original =
                 ControlRecord::parse(&serde_json::to_vec(&value).map_err(|_| invalid())?)
@@ -45,8 +45,11 @@ impl StopSources {
                 _ => return Err(invalid()),
             };
             originals.push(original);
-            snapshot.push(selected);
+            // The same signed copy can be both a replacement and a retained
+            // original in its own right. Publish its bytes once.
+            selected_records.insert(selected.record_id().to_owned(), selected);
         }
+        let snapshot: Vec<_> = selected_records.into_values().collect();
         let input = SnapshotInput {
             list: log,
             origin,

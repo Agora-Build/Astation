@@ -133,7 +133,7 @@ pub(crate) async fn submit(
         // A new source can also collide with an archived draft or retained recovery copy.
         // Check those before committing a receipt that would make the next review unusable.
         super::native::inspection(&mut tx, &plan, &log, binding, &known).await?;
-        super::signatures::inspection(&mut tx, &plan, &log, binding, &evidence, &known).await?;
+        super::signatures::inspection(&mut tx, &plan, &log, binding, &evidence, &mut known).await?;
     }
     sqlx::query("INSERT INTO station_delegated_signer_reports(plan_id,connection,challenge,submission,submission_hash,accepted_at)
         VALUES ($1,$2,$3,$4,$5,$6)")

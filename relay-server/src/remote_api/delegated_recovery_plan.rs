@@ -228,8 +228,8 @@ async fn review_evidence(
     report: &mut Value,
     operator_review: bool,
 ) -> Result<snapshot_stops::StopSources, sqlx::Error> {
-    let signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
-    let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &signed).await?;
+    let mut signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
+    let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &mut signed).await?;
     report["recovery_signatures"] = summary;
     let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
@@ -237,6 +237,10 @@ async fn review_evidence(
     });
     if let Some(confirmations) = report.get("author_confirmation_hash") {
         reconstruction["author_confirmation_hash"] = confirmations.clone();
+    }
+    // Invalidate components staged before retained copies were counted as stops.
+    if report["recovery_signatures"]["records"].as_array().is_some_and(|rows| !rows.is_empty()) {
+        reconstruction["includes_signed_copies"] = true.into();
     }
     report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
     Ok(snapshot_stops::StopSources { signed, copies })
