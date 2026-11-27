@@ -1,8 +1,9 @@
 # Delegated Station implementation (#79)
 
 This is implementation status against the agreed Atem Step 4 contract, pinned
-to `1952ec8ad03fe6c613ce60a8d5b620b93712f8bf` (published SDK
-`atem-client-sdk-1952ec8ad03f`, including the #207 recovery signer report).
+to `ee3352e1c05eee4de97359809d57e0be4fed86f4` (published SDK
+`atem-client-sdk-ee3352e1c05e`). It includes the recovery signer-report
+predicate and the native manager's Station binding proof.
 The feature is **not ready for activation**. This change does not enable
 delegated execution or new native membership/control signing.
 
@@ -123,7 +124,7 @@ and [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7089
   No extra reporter-wall-clock future-`issued_at` bound is requested. Native
   authorization requires its own exact single-use challenge and ContinuousClock
   deadline, captured before token work, with sleep/delay consuming at most 30 s.
-- Apple, Android and Station now consume Atem #207 at `1952ec8ad03f`.
+- Atem #207 introduced the shared recovery signer report.
   Its immutable signer-report request binds the confirmed signature to the
   reviewed recovery plan and journal contents. Its verifier checks the signed
   report against the challenge and exported records.
@@ -805,7 +806,7 @@ the opt-in flag through LaunchServices. For an already provisioned bundle, use
 after quitting that app. The Station still needs its separate build/runtime
 gates and healthy recovery generation; this native flag changes none of them.
 Station and Apple consume the reviewed shared core at
-`1952ec8ad03fe6c613ce60a8d5b620b93712f8bf`; native forwards the proof opaquely
+`ee3352e1c05eee4de97359809d57e0be4fed86f4`; native forwards the proof opaquely
 and uses the shared control readers/correlation helper. This
 does not satisfy the separate all-verifier signing compatibility gate.
 

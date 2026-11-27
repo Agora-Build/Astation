@@ -50,6 +50,7 @@ public final class RemoteControlSigningJournal {
     private let read: () throws -> Data?
     private let persist: (Data) throws -> Void
     private let key: PublicKeyData
+    private let log: MembershipLog
     private var saved: Checkpoint
     private var expected: Data?
     private var operating = false
@@ -88,6 +89,7 @@ public final class RemoteControlSigningJournal {
         guard log.frozen() == nil, let member = log.member(deviceId: memberID), member.kind == "native" else {
             throw RemoteControlPublicationError.requiresReview
         }
+        self.log = log
         self.read = read
         self.persist = persist
         key = member.authKey
@@ -163,7 +165,7 @@ public final class RemoteControlSigningJournal {
             var seen = Set<String>()
             for json in group {
                 let body = try checkedBody(json)
-                guard body.origin == origin || (body.origin == nil && body.principal.hasPrefix("host:")),
+                guard try signerReportPlanRecord(log: log, bodyJson: json, member: "member:" + saved.member, origin: origin) == .inPlan,
                       seen.insert(body.recordId).inserted, bodies[body.recordId].map({ $0 == json }) ?? true else {
                     throw RemoteControlPublicationError.invalidCheckpoint
                 }
@@ -223,8 +225,8 @@ public final class RemoteControlSigningJournal {
         guard !operating else { throw RemoteControlPublicationError.busy }
         guard PortalIntegrationRecord.validOrigin(stationOrigin) else { throw RemoteControlPublicationError.invalidRecord }
         try checkStorage()
-        var result = RemoteControlAuthorInventory(origin: stationOrigin, account: saved.account,
-            genesis: saved.genesis, member: saved.member, key: key)
+        var result = RemoteControlAuthorInventory(origin: stationOrigin, log: log,
+            member: saved.member, key: key)
         for entry in saved.entries.values {
             try result.retain(body: checkedBody(entry.body), json: entry.body, key: key,
                 record: entry.record, possiblySigned: true)
@@ -471,15 +473,28 @@ public final class RemoteControlSigningJournal {
 
     /// Holds the interprocess lock through draft creation or cancellation.
     /// A service stop names one Station. A host interrupt may reach any of them.
-    func withPermittedStopChange<T>(origin: String?, _ change: () throws -> T) throws -> T {
-        try requireStopChange(origin: origin)
+    func withPermittedStopChange<T>(bodyJSON: String, _ change: () throws -> T) throws -> T {
+        try requireStopChange(bodyJSON: bodyJSON)
         operating = true
         defer { operating = false }
         return try change()
     }
 
     public func requireStopChange(bodyJSON: String) throws {
-        try requireStopChange(origin: checkedBody(bodyJSON).origin)
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        try checkStorage()
+        _ = try checkedBody(bodyJSON)
+        try requirePermitted(bodyJSON: bodyJSON)
+    }
+
+    private func requirePermitted(bodyJSON: String) throws {
+        guard let barriers = saved.barriers else { return }
+        for origin in barriers.keys.sorted() {
+            guard let barrier = barriers[origin], barrier.isHeld else { continue }
+            if try signerReportPlanRecord(log: log, bodyJson: bodyJSON, member: "member:" + saved.member, origin: origin) == .inPlan {
+                throw RemoteControlRecoveryHold(context: barrier.context)
+            }
+        }
     }
 
     public func requireStopChange(origin: String?) throws {
@@ -528,7 +543,7 @@ public final class RemoteControlSigningJournal {
             guard entry.body == bodyJSON else { throw RemoteControlPublicationError.requiresReview }
             if let record = entry.record { return record }
         }
-        try requirePermitted(origin: body.origin)
+        try requirePermitted(bodyJSON: bodyJSON)
         // Commit each attempt before invoking the key, including an exact retry.
         try append(id: body.recordId, entry: Entry(body: bodyJSON))
         let record = try makeRecord()

@@ -221,7 +221,7 @@ public final class RemoteControlRecoveryPublication {
             (try? parseControlRecord(recordJson: $0.originalRecordJSON).recordId) == body.recordId ||
             (try? Self.body($0.bodyJSON).recordId) == old.recordId
         }), saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
-        try draftJournal(log, managerID).withPermittedStopChange(origin: body.origin) {
+        try draftJournal(log, managerID).withPermittedStopChange(bodyJSON: operation.bodyJSON) {
             try commit { $0.operations.append(operation) }
         }
         return review
@@ -263,7 +263,7 @@ public final class RemoteControlRecoveryPublication {
             confirmedAt: confirmedAt, now: now)
         guard current() else { throw RemoteChannelError.staleLink }
         let journal = try authorJournal(log, manager)
-        try journal.requireStopChange(origin: review.body.origin)
+        try journal.requireStopChange(bodyJSON: operation.bodyJSON)
         if operation.attempted != true {
             try commit { $0.operations[index].attempted = true }
         }
