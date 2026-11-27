@@ -716,9 +716,25 @@ async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
     let peer = PolicyStore(db.reconnect(2).await);
     save_release_checkpoint(&peer, &rotated, rows.clone(), Some(pending)).await;
     // Failure at the write leaves the journal retryable and no partial new version.
+    let genesis = "b".repeat(64);
+    let host = json!({"conn":"relay","replica":"one"});
+    let proxy = json!({"conn":"proxy","replica":"two"});
+    let root = json!({"account":"acct-1","routes":{"host":{"connection":host}},
+        "proxies":{"host":{"connection":proxy}},"other":"preserved"});
+    sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'principal',$2)")
+        .bind(&genesis).bind(&root).execute(&db.pool).await.unwrap();
+    let mut writer = peer.0.begin().await.unwrap();
+    sqlx::query("SELECT genesis_hash FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE")
+        .bind(&genesis).execute(&mut *writer).await.unwrap();
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), store.apply_binding_releases(&station, &fence))
+        .await.unwrap(), Ok(0), "busy host root is retried without blocking its writer");
+    writer.rollback().await.unwrap();
     sqlx::query("ALTER TABLE station_applied_binding_releases ADD CONSTRAINT reject_write CHECK(false)")
         .execute(&db.pool).await.unwrap();
     assert!(store.apply_binding_releases(&station, &fence).await.is_err());
+    let saved: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(&genesis).fetch_one(&peer.0).await.unwrap();
+    assert_eq!(saved, root, "a failed release preserves its live connections");
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_applied_binding_releases")
         .fetch_one(&db.pool).await.unwrap();
     assert_eq!(count, 0);
@@ -731,7 +747,14 @@ async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
     assert_eq!(a.unwrap() + b.unwrap(), 1);
     peer.0.close().await;
     let restarted = PolicyStore(db.reconnect(2).await);
-    let genesis = "b".repeat(64);
+    let saved: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(&genesis).fetch_one(&restarted.0).await.unwrap();
+    assert_eq!(saved, json!({"account":"acct-1","routes":{},"proxies":{},"other":"preserved"}));
+    let retired: Vec<Value> = sqlx::query_scalar::<_, sqlx::types::Json<Vec<Value>>>(
+        "SELECT retired_routes FROM station_applied_binding_releases WHERE release_id='release-3'")
+        .fetch_one(&restarted.0).await.unwrap().0;
+    assert_eq!(retired.len(), 2);
+    assert!(retired.contains(&host) && retired.contains(&proxy));
     let report_id = "binding_changed:7dfbbee91cf11a9b4d23acfaca028c777bf50cfca7e84291a21b43b6323bef1f";
     let expected = json!({"reportId":report_id,"state":"binding_changed","bindingState":"released",
         "account":OWNER,"genesisHash":genesis,"accountId":"acct-1","bindingId":"bind-1","version":4});
