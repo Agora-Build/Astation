@@ -724,7 +724,9 @@ bounded protected journal. `AstationRecoveryCoordinator` persists it alongside
 the account checkpoint, independently of ordinary control deliveries. A recovery
 copy can use the same current manager or a replacement manager for an original
 whose signer lost manage. The shared builders/readers verify every original,
-draft and signature. Service copies name the exact prepared candidate feed;
+draft and signature. Service copies preserve the original origin and may name
+the original or candidate feed. The Mac keeps the original feed on new copies
+and can retry an existing signed candidate-feed copy byte for byte;
 host interruptions keep their original revoke sequence and no feed binding.
 All other intent and audit fields remain identical. Originals, their delivery
 destinations and independently approved Portal mirrors stay intact.

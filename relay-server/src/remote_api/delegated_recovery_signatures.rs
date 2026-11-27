@@ -5,7 +5,7 @@ use super::{invalid, source_hash, Prepared};
 use atem_client::{
     canonical::StrictValue,
     control::{
-        verify_control, ControlAction, ControlCheck, ControlFeed, ControlRecord, ControlSigner, RefusalReason,
+        verify_control, ControlAction, ControlCheck, ControlRecord, ControlSigner, RefusalReason,
     },
     membership::Membership,
     Hash32,
@@ -89,10 +89,11 @@ fn check_copy(
         return Err(invalid());
     }
     let mut expected = original.body().clone();
-    expected.feed = original.feed().map(|_| ControlFeed {
-        origin: origin.into(),
-        feed_id: candidate.into(),
-    });
+    if let Some(feed) = &mut expected.feed {
+        if record.feed().is_some_and(|(_, id)| id == candidate) {
+            feed.feed_id = candidate.into();
+        }
+    }
     expected.record_id = record.record_id().into();
     expected.issued_at = record.issued_at();
     expected.signer = record.signer().clone();

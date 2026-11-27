@@ -28,10 +28,11 @@ public struct RemoteControlRecoveryRetention: Equatable, Sendable {
                   RemoteControlRecoveryContext.validUUID(original), originals.insert(original).inserted,
                   let record = row["record"] as? [String: Any] else { throw RemoteChannelError.invalidInput }
             let body = try parseControlRecord(recordJson: String(decoding: JSONSerialization.data(withJSONObject: record), as: UTF8.self))
+            // The request names the original by ID. The journal and Station,
+            // which also hold the original, check its feed against the signed copy.
             guard body.accountId == context.accountID, body.genesisHash == context.genesisHash,
                   body.signer.hasPrefix("member:"), ["revoke", "interrupt_running"].contains(body.action),
                   body.origin == nil || body.origin == context.stationOrigin,
-                  body.feedId == nil || body.feedId == context.candidateFeedID,
                   RemoteControlRecoveryContext.validUUID(body.recordId), body.recordId != original,
                   ids.insert(body.recordId).inserted else { throw RemoteChannelError.invalidInput }
             result.append(body.recordId)
