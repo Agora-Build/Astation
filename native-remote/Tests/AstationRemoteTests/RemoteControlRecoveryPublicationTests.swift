@@ -241,7 +241,8 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let deliveryIDs = try f.source.journal.pendingDeliveryIDs()
         let review = try f.prepare()
         XCTAssertFalse(review.signed)
-        XCTAssertEqual(review.body.feedId, f.context.candidateFeedID)
+        XCTAssertEqual(review.body.feedId, try parseControlRecord(recordJson: f.original).feedId)
+        XCTAssertNotEqual(review.body.feedId, f.context.candidateFeedID)
         XCTAssertEqual(review.body.signer, "member:manager")
         XCTAssertTrue(review.body.interruptRunning == true)
         XCTAssertThrowsError(try f.journal.export(context: f.context, recordIDs: [review.body.recordId]))
@@ -251,6 +252,8 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         }
         let exported = try f.journal.export(context: f.context, recordIDs: [review.body.recordId])
         XCTAssertTrue(exported.contains(record))
+        XCTAssertEqual(try RemoteControlRecoveryRetention.requestIDs(context: f.context, json: exported),
+                       [review.body.recordId])
         let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
         XCTAssertEqual(Set(value.keys), ["evidence_hash", "replacements"])
         XCTAssertEqual(value["evidence_hash"] as? String, f.context.evidenceHash)
