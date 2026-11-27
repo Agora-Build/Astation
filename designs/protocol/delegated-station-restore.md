@@ -697,9 +697,11 @@ hash for plans with copies so that an older staged snapshot can be rebuilt.
 
 The source `evidence_hash` remains the commitment to checkpoints/imports. A new
 `reconstruction_hash` additionally commits to the retained manager copies.
-Later source evidence marks earlier copies as belonging to an earlier review;
-they never silently satisfy the changed review. A new review retains a new copy
-with a fresh ID and higher timestamp. Outputs contain only metadata, verification
+Later source evidence marks earlier copies as belonging to an earlier review.
+The latest verified report for a signer, slot and process can confirm the exact
+signed copy against the new evidence hash within the same plan. Station can
+then stage that copy without another stop signature. A later cut requires
+another report. Outputs contain only metadata, verification
 and commitments, not signatures or keys. `snapshot_complete`,
 `signing_clock_complete` and `recovery_ready` remain false. This is retention for
 reconstruction, not snapshot publication, a completed native recovery ceremony
@@ -710,8 +712,9 @@ from every retained original signed native stop. Each item preserves the origina
 review and identifies a matching current copy by record ID, or explicitly says
 `retain_service_stop`, `retain_host_record`, `fresh_manager_signature` or
 `authority_review`. A copy is
-`signed_copy_retained` only when it matches that exact original, the current plan
-and source evidence, and passes the shared verifier under current membership.
+`signed_copy_retained` when it matches that exact original and plan, passes
+the shared verifier under current membership and either belongs to the current
+review or was exported by its author against the current evidence hash.
 Another stop for the same principal cannot replace it. Changing evidence or the
 recovery generation makes earlier copies require review again; removing a manager
 preserves their original verdict and all earlier copies and clock obligations.
