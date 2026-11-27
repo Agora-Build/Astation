@@ -152,12 +152,29 @@ impl SigningCeilings {
         }).collect();
         let mut missing = BTreeSet::new();
         let mut uncovered = BTreeMap::<&str, u64>::new();
+        let mut blocked: BTreeSet<&str> =
+            shortfalls.iter().map(|row| row.service_id.as_str()).collect();
+        let mut signed_keys = BTreeMap::new();
+        // A registration with a zero ceiling has never signed. It can be
+        // left over when the primary database rolls back key provisioning.
+        for row in reservations.iter().chain(observed_reservations).filter(|r| r.highest_ms > 0) {
+            let service = row.service_id.as_str();
+            if signed_keys.insert(service, row.key_hash.as_str()).is_some_and(|prior| prior != row.key_hash) {
+                blocked.insert(service);
+            }
+        }
+        let mut member_keys = BTreeMap::new();
         for observed in plan["known_history"]["observed_service_keys"]
             .as_array()
             .ok_or(())?
         {
             let service = observed["service_id"].as_str().ok_or(())?;
             let key = observed["key_fingerprint"].as_str().ok_or(())?;
+            if member_keys.insert(service, key).is_some_and(|prior| prior != key)
+                || signed_keys.get(service).is_some_and(|signed| *signed != key)
+            {
+                blocked.insert(service);
+            }
             let ceiling = ceilings.get(&(service, key));
             if ceiling.is_none() {
                 missing.insert((service, key));
@@ -171,13 +188,30 @@ impl SigningCeilings {
                 }
             }
         }
+        let retained = plan["known_history"]["observed_signing_lower_bounds"].as_object().ok_or(())?;
+        let copies = plan["recovery_signatures"]["observed_signing_lower_bounds"].as_object().ok_or(())?;
+        let mut marks = BTreeMap::new();
+        for (service, key) in member_keys {
+            let Some(ceiling) = ceilings.get(&(service, key)) else { continue };
+            if blocked.contains(service) || uncovered.contains_key(service) {
+                continue;
+            }
+            let principal = format!("service:{service}");
+            let mut mark = u64::try_from(*ceiling).map_err(|_| ())?;
+            for value in [retained.get(&principal), copies.get(&principal)].into_iter().flatten() {
+                mark = mark.max(value.as_u64().ok_or(())?);
+            }
+            marks.insert(principal, serde_json::json!({"key_fingerprint":key,
+                "highest_reserved_ms":ceiling, "sign_above_ms":mark}));
+        }
         // Preserve even registrations absent from restored membership. The
         // publisher must reread these observations under the recovery fence.
         Ok(
             serde_json::json!({"plan_id": plan["plan_id"], "source_hash": plan["source_hash"],
             "reconstruction_hash": plan["reconstruction_hash"], "reservations": reservations,
             "reservation_shortfalls": shortfalls,
-            "unregistered_membership_keys": missing, "uncovered_service_signatures": uncovered}),
+            "unregistered_membership_keys": missing, "uncovered_service_signatures": uncovered,
+            "snapshot_signing_marks": marks}),
         )
     }
 
@@ -200,5 +234,38 @@ impl SigningCeilings {
             return Err(());
         }
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recovery_marks_require_one_membership_key_and_its_own_durable_ceiling() {
+        let registration = |service: &str, key: &str, highest_ms| Reservation {
+            service_id: service.into(), key_hash: key.into(), highest_ms,
+        };
+        let member = |service: &str, key: &str| json!({
+            "service_id":service,"key_fingerprint":key,"highest_signed_ms":null
+        });
+        let plan = json!({
+            "known_history":{"observed_service_keys":[member("a","current"),member("b","current"),
+                member("c","old"),member("c","current")],
+                "observed_signing_lower_bounds":{"service:a":123,"service:orphan":321}},
+            "recovery_signatures":{"observed_signing_lower_bounds":{}}
+        });
+        let rows = [registration("a","current",0),registration("a","unused",0),
+            registration("b","current",0),registration("b","other",10),
+            registration("c","old",0),registration("c","current",0),
+            registration("orphan","unknown",99)];
+        let evidence = SigningCeilings::recovery_evidence(&rows, &[], &plan).unwrap();
+        assert_eq!(evidence["snapshot_signing_marks"], json!({"service:a":{
+            "key_fingerprint":"current","highest_reserved_ms":0,"sign_above_ms":123
+        }}));
+        let lost = [registration("a","current",1)];
+        let regressed = SigningCeilings::recovery_evidence(&rows, &lost, &plan).unwrap();
+        assert_eq!(regressed["snapshot_signing_marks"], json!({}));
     }
 }

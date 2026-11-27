@@ -173,6 +173,17 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         review["service_clock_evidence"]["reservations"][0]["highest_ms"],
         future
     );
+    let principal = format!("service:{service}");
+    let mark = &review["service_clock_evidence"]["snapshot_signing_marks"][&principal];
+    assert_eq!(mark, &json!({"key_fingerprint":key,"highest_reserved_ms":future,"sign_above_ms":future}));
+    // An authenticated native stop can raise the host floor above the service
+    // key's external ceiling. A replacement cover must clear both.
+    let mut higher_anchor = review.clone();
+    higher_anchor["recovery_signatures"]["observed_signing_lower_bounds"][&principal] = (future + 10).into();
+    higher_anchor["known_history"]["observed_signing_lower_bounds"][&principal] = (future + 1).into();
+    let registrations = replica.reservations(account, &genesis).await.unwrap();
+    let adjusted = SigningCeilings::recovery_evidence(&registrations, &[], &higher_anchor).unwrap();
+    assert_eq!(adjusted["snapshot_signing_marks"][&principal]["sign_above_ms"], future + 10);
     assert_eq!(review["recovery_ready"], false);
     assert!(replica
         .reservations("other-account", &genesis)
@@ -245,6 +256,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
     let lower = plan::prepare_with_sources(&restarted, &next, &genesis, Some(&replica), None, None)
         .await.unwrap();
     assert_eq!(lower["service_clock_evidence"]["reservation_shortfalls"], json!([observed_floor]));
+    assert_eq!(lower["service_clock_evidence"]["snapshot_signing_marks"], json!({}));
     let offline = plan::prepare_with_sources(&restarted, &next, &genesis, None, None, None)
         .await.unwrap();
     assert_eq!(offline["service_clock_evidence"]["status"], "signing_store_unconfigured");
@@ -390,6 +402,7 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     let wrong_key = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(store), None, None)
         .await
         .unwrap();
+    assert_eq!(wrong_key["service_clock_evidence"]["snapshot_signing_marks"], json!({}));
     assert_eq!(
         wrong_key["service_clock_evidence"]["uncovered_service_signatures"][&service],
         last
