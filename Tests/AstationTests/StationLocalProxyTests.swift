@@ -121,6 +121,27 @@ final class StationLocalProxyTests: XCTestCase {
         f.proxy.close()
     }
 
+    func testLostStationSocketDeliversThePendingNoticeAfterItsSubmittedChannelClose() async throws {
+        let f = Fixture()
+        await f.ready()
+        let open = Data(#"{"type":"channel","event":"open","channel":"station_1","transport":"relay"}"#.utf8)
+        f.proxy.receiveStation(open)
+        await drain()
+        let close = Data(#"{"type":"channel","event":"close","channel":"station_1","reason":"service_suspended"}"#.utf8)
+        let notice = Data(#"{"type":"relay","op":"service_suspended","v":1,"text":"service suspended: no Agora.Build owner at this Station"}"#.utf8)
+        f.holdLocalWrites = true
+        let initial = f.local.count
+        f.proxy.receiveStation(close)
+        f.proxy.receiveStation(notice)
+        f.socket.reader?(.failure(URLError(.networkConnectionLost)))
+        await drain()
+        XCTAssertEqual(Array(f.local.dropFirst(initial)), [close, notice])
+        for done in f.localCompletions { done(nil) }
+        await drain()
+        XCTAssertEqual(Array(f.local.dropFirst(initial)), [close, notice])
+        f.proxy.close()
+    }
+
     func testMalformedSuspensionNoticeDoesNotReachLocalHost() async throws {
         let f = Fixture()
         await f.ready()
@@ -275,5 +296,8 @@ private final class ProxySocket: IdentityRelaySocket, @unchecked Sendable {
         if case .string(let text) = message { sent.append(Data(text.utf8)) }
         if !holdWrites { completionHandler(nil) }
     }
-    func receive(completionHandler: @escaping @Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void) {}
+    var reader: (@Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
+    func receive(completionHandler: @escaping @Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void) {
+        reader = completionHandler
+    }
 }

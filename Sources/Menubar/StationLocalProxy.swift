@@ -38,6 +38,7 @@ final class StationLocalProxy {
     private var localQueue: [Data] = []
     private var localBytes = 0
     private var localSending = false
+    private var queuedSuspension: Data?
     private var attempt = UUID()
     private var retryCount = 0
     private var timer: Task<Void, Never>?
@@ -134,6 +135,7 @@ final class StationLocalProxy {
                 // Station calls and forward the original notice on this link.
                 pending = nil
                 timer?.cancel()
+                queuedSuspension = bytes
                 forwardLocal(bytes)
                 return
             }
@@ -232,6 +234,7 @@ final class StationLocalProxy {
     private func flushLocal() {
         guard !localSending, let bytes = localQueue.first, current() else { return }
         localSending = true; let generation = attempt
+        if bytes == queuedSuspension { queuedSuspension = nil }
         writeLocal(bytes) { [weak self] error in
             Task { @MainActor in
                 guard let self, self.attempt == generation else { return }
@@ -247,7 +250,13 @@ final class StationLocalProxy {
         }
     }
 
-    private func clearTransport() {
+    private func clearTransport(suspension: Data? = nil) {
+        var submittedClose: String?
+        if suspension != nil, localSending, let bytes = localQueue.first,
+           case .close(let handle, "service_suspended") = try? RemoteChannelEnvelope.readHost(bytes) {
+            submittedClose = handle
+        }
+        queuedSuspension = nil
         timer?.cancel(); timer = nil
         socket?.cancel(with: .goingAway, reason: nil); socket = nil
         pending = nil; feeds.removeAll(); challengeForwarded = false
@@ -255,12 +264,15 @@ final class StationLocalProxy {
         localQueue.removeAll(); localBytes = 0; localSending = false
         // Closing old channels remains necessary after account/Station authority
         // changes. The close-only writer still fences the local socket generation.
-        for handle in channels {
+        for handle in channels where handle != submittedClose {
             if let route = try? RemoteChannelRoute(linkGeneration: UUID(), handle: handle) {
-                closeLocal(RemoteChannelEnvelope.close(route: route))
+                closeLocal(RemoteChannelEnvelope.close(route: route, reason: suspension == nil ? .closed : .serviceSuspended))
             }
         }
         channels.removeAll()
+        // The Station socket can end before the last local write completes.
+        // The local socket serializes these terminal writes in submission order.
+        if let suspension, current() { writeLocal(suspension) { _ in } }
     }
 
     private func refuse(finalLocal: Data? = nil) {
@@ -271,7 +283,7 @@ final class StationLocalProxy {
 
     private func failed() {
         guard phase != .closed, phase != .refused else { return }
-        attempt = UUID(); clearTransport(); phase = .connecting
+        attempt = UUID(); clearTransport(suspension: current() ? queuedSuspension : nil); phase = .connecting
         guard current() else { close(); return }
         retryCount = min(retryCount + 1, 6)
         let delay = min(pow(2, Double(retryCount)), 30)
