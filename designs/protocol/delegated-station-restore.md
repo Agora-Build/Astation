@@ -860,6 +860,16 @@ A missing historical registration appears even when its signatures were never
 published. A missing checkpoint is reported as pending.
 Publication must recheck current authority.
 
+The built-in Station journals an authenticated D27 release from either the
+ordinary feed or the checkpoint's `pendingReleases`. It commits the release
+identity and the feed cursor or checkpoint in one PostgreSQL transaction.
+All report credentials for the same issuer, Portal and Station share that
+journal. Receiving the same release ID with a different target rejects the
+transaction. Delegated service signing and ownership review consult the
+journal until the binding advances beyond the released version. D27 settlement
+requires the binding transition, its durable outbound report and route
+closures in addition to this observation.
+
 During `prepare`, the primary recovery database retains the highest reservation
 it has seen for each Station, account, genesis, service and key. This includes
 ranges burned by a failed publication and registrations still at zero. A later

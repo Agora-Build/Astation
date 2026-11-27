@@ -584,3 +584,83 @@ async fn postgres_delegated_rotated_report_client_cannot_release_from_an_older_b
     replica.close().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_binding_release_survives_page_replay_credential_rotation_and_restart() {
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = PolicyStore(db.pool.clone());
+    let station = binding(true);
+    let release = json!({"releaseId":"rel-1","account":OWNER,"accountId":"acct-1","genesisHash":"b".repeat(64),
+        "bindingId":"bind-1","version":3,"requestedAt":"2026-11-23T00:00:00.000Z"});
+    let change = json!({"id":12,"at":release["requestedAt"],"kind":"binding_released","integrationId":null,
+        "state":null,"reason":"agora_build","account":OWNER,"releaseId":"rel-1",
+        "binding":{"accountId":"acct-1","genesisHash":"b".repeat(64),"bindingId":"bind-1","version":3}});
+    let initial_page = json!({"changes":[change],"cursor":12,"integrations":[]});
+    let prior = store.load(&station).await.unwrap();
+    let next = prior.apply(0, serde_json::from_value(initial_page.clone()).unwrap(), 100).unwrap();
+    store.commit(&prior,&next).await.unwrap();
+
+    let mut rotated = station.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let replica = db.reconnect(2).await;
+    let peer = PolicyStore(replica.clone());
+    let fresh = peer.load(&rotated).await.unwrap();
+    let polled = fresh.apply(0, serde_json::from_value(json!({"changes":[{"id":12,"kind":"noop"}],
+        "cursor":12,"integrations":[]})).unwrap(), 100).unwrap();
+    peer.commit(&fresh,&polled).await.unwrap();
+    let mut cut = source(true);
+    cut["checkpoint"]["pendingReleases"] = json!([release]);
+    let snapshot = parse(&cut,&rotated).unwrap();
+    let observed = polled.apply_checkpoint(snapshot, 101).unwrap();
+    peer.commit(&polled,&observed).await.unwrap();
+    let mut connection = db.pool.acquire().await.unwrap();
+    let recovered = store.load(&rotated).await.unwrap();
+    assert!(!recovered.allows_list_release_in(&mut connection,OWNER,"acct-1",&"b".repeat(64)).await.unwrap());
+    assert!(recovered.allows_list_release_in(&mut connection,OWNER,"acct-1",&"c".repeat(64)).await.unwrap());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_binding_release_requests")
+        .fetch_one(&mut *connection).await.unwrap();
+    assert_eq!(count,1);
+    // A release ID cannot be reassigned, even by a second authenticated checkpoint.
+    cut["checkpoint"]["pendingReleases"][0]["account"] = json!(OTHER);
+    let conflict = recovered.apply_checkpoint(parse(&cut,&rotated).unwrap(),102).unwrap();
+    assert!(peer.commit(&recovered,&conflict).await.is_err());
+    assert_eq!(peer.load(&rotated).await.unwrap(), recovered);
+    cut["checkpoint"]["pendingReleases"] = json!([]);
+    let omitted = recovered.apply_checkpoint(parse(&cut,&rotated).unwrap(),103).unwrap();
+    peer.commit(&recovered,&omitted).await.unwrap();
+    assert!(!omitted.allows_list_release_in(&mut connection,OWNER,"acct-1",&"b".repeat(64)).await.unwrap());
+    cut["checkpoint"]["bindings"][0]["version"] = json!(4);
+    let newer = omitted.apply_checkpoint(parse(&cut,&rotated).unwrap(),104).unwrap();
+    peer.commit(&omitted,&newer).await.unwrap();
+    assert!(newer.allows_list_release_in(&mut connection,OWNER,"acct-1",&"b".repeat(64)).await.unwrap());
+    drop(connection);
+    replica.close().await;
+    db.cleanup().await;
+}
+
+#[test]
+fn binding_release_requires_the_builtin_station_and_exact_target() {
+    let release = json!({"releaseId":"rel-1","account":OWNER,"accountId":"acct-1","genesisHash":"b".repeat(64),
+        "bindingId":"bind-1","version":3,"requestedAt":"2026-11-23T00:00:00.000Z"});
+    let mut value = source(true);
+    value["checkpoint"]["pendingReleases"] = json!([release.clone(),release.clone()]);
+    assert!(parse(&value,&binding(true)).is_err());
+    value["checkpoint"]["pendingReleases"] = Value::Null;
+    assert!(parse(&value,&binding(true)).is_err());
+    let mut custom = source(false);
+    custom["checkpoint"]["pendingReleases"] = json!([]);
+    assert!(parse(&custom,&binding(false)).is_err());
+    let mut event = json!({"id":1,"kind":"binding_released","integrationId":null,"state":null,
+        "at":release["requestedAt"],"reason":"agora_build","account":OWNER,"releaseId":"rel-1",
+        "binding":{"accountId":"acct-1","genesisHash":"b".repeat(64),"bindingId":"bind-1","version":3}});
+    let apply = |builtin, event: &Value| PolicyCheckpoint::empty(binding(builtin)).unwrap().apply(0,
+        serde_json::from_value(json!({"integrations":[],"cursor":1,"changes":[event]})).unwrap(), 100);
+    assert!(apply(true,&event).is_ok());
+    assert!(apply(false,&event).is_err());
+    let duplicate = json!({"integrations":[],"cursor":1,"changes":[event.clone()]}).to_string()
+        .replace(r#""version":3"#, r#""version":3,"ver\u0073ion":4"#);
+    assert!(crate::integration_feed::FeedPage::parse(duplicate.as_bytes()).is_err());
+    event["binding"]["version"] = json!(0);
+    assert!(apply(true,&event).is_err());
+}

@@ -257,7 +257,8 @@ impl PortalReportClient {
             .send()
             .await
             .map_err(|_| PortalError::Unavailable)?;
-        let result = Self::response(response, 4_194_304).await;
+        let result = Self::response_bytes(response, crate::integration_checkpoint::MAX_CHECKPOINT_BYTES)
+            .await.and_then(|bytes| FeedPage::parse(&bytes).map_err(|_| PortalError::Contract));
         if matches!(result, Err(PortalError::Denied)) {
             *self.token.lock().await = None;
         }

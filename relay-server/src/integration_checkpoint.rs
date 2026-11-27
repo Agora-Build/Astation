@@ -40,6 +40,62 @@ pub(crate) struct Binding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PendingRelease {
+    pub release_id: String,
+    pub account: String,
+    pub account_id: String,
+    pub genesis_hash: String,
+    pub binding_id: String,
+    pub version: u64,
+    pub requested_at: String,
+}
+
+impl PendingRelease {
+    pub(super) async fn retain(
+        tx: &mut sqlx::PgConnection,
+        station: &FeedBinding,
+        releases: &[Self],
+    ) -> Result<(), ()> {
+        if releases.is_empty() { return Ok(()); }
+        for release in releases { release.validate()?; }
+        let rows = sqlx::types::Json(releases);
+        const ROWS: &str = r#"jsonb_to_recordset($4::jsonb) AS r(
+            "releaseId" text, account text, "accountId" text, "genesisHash" text, "bindingId" text, version bigint)"#;
+        sqlx::query(&format!(r#"
+            INSERT INTO station_binding_release_requests
+                (issuer,portal_origin,station_origin,release_id,account,account_id,genesis,binding_id,version)
+            SELECT $1,$2,$3,"releaseId",account,"accountId","genesisHash","bindingId",version
+            FROM {ROWS} ORDER BY "releaseId" ON CONFLICT DO NOTHING"#))
+            .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+            .bind(&rows).execute(&mut *tx).await.map_err(|_| ())?;
+        // Both deliveries name the same release. A reused ID with a different
+        // target invalidates the entire page, including its cursor advance.
+        let changed: bool = sqlx::query_scalar(&format!(r#"
+            SELECT EXISTS (SELECT FROM {ROWS}
+            JOIN station_binding_release_requests j ON
+                (j.issuer,j.portal_origin,j.station_origin,j.release_id)=($1,$2,$3,r."releaseId")
+            WHERE (j.account,j.account_id,j.genesis,j.binding_id,j.version)
+               <> (r.account,r."accountId",r."genesisHash",r."bindingId",r.version))"#))
+            .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+            .bind(&rows).fetch_one(tx).await.map_err(|_| ())?;
+        if changed { return Err(()); }
+        Ok(())
+    }
+
+    pub(super) fn validate(&self) -> Result<(), ()> {
+        if !opaque(&self.release_id) || !account_id(&self.account)
+            || !opaque(&self.account_id) || !opaque(&self.binding_id)
+            || !crate::remote_api::recovery::delegated_recovery::canonical_genesis(&self.genesis_hash)
+            || !(1..=MAX_SAFE_INTEGER).contains(&self.version) || !timestamp(&self.requested_at)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PortalCheckpoint {
     pub binding: FeedBinding,
@@ -48,6 +104,8 @@ pub(crate) struct PortalCheckpoint {
     pub integrations: BTreeMap<String, CheckpointIntegration>,
     pub accounts: Option<Accounts>,
     pub bindings: Option<Vec<Binding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_releases: Option<Vec<PendingRelease>>,
 }
 
 pub(crate) fn account_id(value: &str) -> bool {
@@ -101,7 +159,9 @@ impl PortalCheckpoint {
         let built_in = Self::built_in(binding);
         exact_keys(
             source,
-            if built_in {
+            if built_in && source.get("pendingReleases").is_some() {
+                &["at", "integrations", "accounts", "bindings", "pendingReleases"]
+            } else if built_in {
                 &["at", "integrations", "accounts", "bindings"]
             } else {
                 &["at", "integrations"]
@@ -162,6 +222,8 @@ impl PortalCheckpoint {
             } else {
                 None
             },
+            pending_releases: source.get("pendingReleases")
+                .map(|rows| serde_json::from_value(rows.clone()).map_err(|_| ())).transpose()?,
             bindings: if built_in {
                 Some(serde_json::from_value(source["bindings"].clone()).map_err(|_| ())?)
             } else {
@@ -196,6 +258,14 @@ impl PortalCheckpoint {
                     .is_some_and(|at| !stopped || !timestamp(at))
             {
                 return Err(());
+            }
+        }
+        if let Some(releases) = &self.pending_releases {
+            let mut ids = BTreeSet::new();
+            if !Self::built_in(binding) { return Err(()); }
+            for row in releases {
+                row.validate()?;
+                if !ids.insert(&row.release_id) { return Err(()); }
             }
         }
         if let Some(accounts) = &self.accounts {
