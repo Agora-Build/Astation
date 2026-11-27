@@ -83,6 +83,30 @@ fn obligation<'a>(report: &'a Value, original_id: &str) -> &'a Value {
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_recovery_original_feed_copy_survives_reload() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let source = original(&saved(&database.pool).await);
+    let mut body = source.body().clone();
+    assert_ne!(body.feed.as_ref().unwrap().feed_id, plan["candidate_feed_id"]);
+    body.record_id = uuid::Uuid::new_v4().to_string();
+    body.issued_at = f.created + 1000;
+    let copy = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap().to_json();
+    let request = input(&plan, &source, copy);
+    let first = submit(&database.pool, &binding, &genesis, &plan, &request).await.unwrap();
+    let replica = database.reconnect(2).await;
+    assert_eq!(prepare(&replica, &binding, &genesis).await.unwrap(), first);
+    assert_eq!(submit(&replica, &binding, &genesis, &plan, &request).await.unwrap(), first);
+    assert_eq!(obligation(&first, source.record_id())["copy_record_id"], body.record_id);
+    replica.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_publishing_or_opening(
 ) {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
