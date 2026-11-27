@@ -277,16 +277,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
-    async fn postgres_delegated_native_binding_challenge_is_private_durable_and_matches_the_review() {
+    async fn postgres_delegated_native_binding_challenge_is_private_durable_and_matches_the_review()
+    {
         let auth = crate::account_identity::tests::Fixture::new().await;
         let origin = "https://station-dev.agora.build";
         let (db, runtime, fixture) = fixture_at_station(&auth.issuer, None, origin).await;
-        runtime
-            .app
-            .recovery
-            .configure_delegated(origin, 1)
-            .await
-            .unwrap();
         let station = &runtime.binding;
         let previous = runtime.policies.load(station).await.unwrap();
         let portal = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
@@ -334,6 +329,25 @@ mod tests {
             (status, serde_json::from_slice::<Value>(&bytes).unwrap())
         };
         let text = intent.to_string();
+        assert_eq!(
+            post(&text, &claims).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        if !cfg!(feature = "delegated-host-work") {
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_binding_challenges")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+            db.cleanup().await;
+            return;
+        }
+        runtime
+            .app
+            .recovery
+            .configure_delegated(origin, 1)
+            .await
+            .unwrap();
         let (first, retry) = tokio::join!(post(&text, &claims), post(&text, &claims));
         assert_eq!(first.0, StatusCode::OK, "{}", first.1);
         assert_eq!(first, retry);
