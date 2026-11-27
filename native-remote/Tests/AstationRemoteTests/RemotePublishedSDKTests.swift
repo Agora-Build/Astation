@@ -149,6 +149,31 @@ final class RemotePublishedSDKTests: XCTestCase {
         }
     }
 
+    func testPublishedSignerReportPlanPredicate() throws {
+        let source = try fixture("r9-vectors-signer-report")
+        let cases = try rows(source["plan_predicate"])
+        XCTAssertEqual(cases.count, 32)
+        for vector in cases {
+            let label = try XCTUnwrap(vector["label"] as? String)
+            let membership = try log(vector, reports: source)
+            let body = try XCTUnwrap(vector["body"] as? String)
+            let member = try XCTUnwrap(vector["member"] as? String)
+            let origin = try XCTUnwrap(vector["origin"] as? String)
+            let classify = { try signerReportPlanRecord(log: membership, bodyJson: body, member: member, origin: origin) }
+            if let code = vector["code"] as? String {
+                XCTAssertThrowsError(try classify(), label) { error in
+                    guard case let AtemError.Report(actual, _) = error else { return XCTFail("\(label): \(error)") }
+                    XCTAssertEqual(actual, code, label)
+                }
+            } else if try XCTUnwrap(vector["in_plan"] as? Bool) {
+                XCTAssertEqual(try classify(), .inPlan, label)
+            } else {
+                let reason = try XCTUnwrap(vector["reason"] as? String)
+                XCTAssertEqual(try classify(), .notInPlan(reason: reason), label)
+            }
+        }
+    }
+
     func testPublishedStationBindingProofsUseThePackagedVerifier() throws {
         let source = try fixture("r9-vectors-station-binding")
         let valid = try rows(source["valid"])

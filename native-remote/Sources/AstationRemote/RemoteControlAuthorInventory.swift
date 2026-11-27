@@ -12,17 +12,17 @@ public struct RemoteControlAuthorInventory {
     }
 
     let origin: String
-    let account: String
-    let genesis: String
+    let log: MembershipLog
+    var account: String { log.accountId() }
+    var genesis: String { log.genesisHash() }
     let member: String
     let key: PublicKeyData
     private var rows: [String: Row] = [:]
     private var otherOriginIDs = Set<String>()
 
-    init(origin: String, account: String, genesis: String, member: String, key: PublicKeyData) {
+    init(origin: String, log: MembershipLog, member: String, key: PublicKeyData) {
         self.origin = origin
-        self.account = account
-        self.genesis = genesis
+        self.log = log
         self.member = member
         self.key = key
     }
@@ -69,20 +69,15 @@ public struct RemoteControlAuthorInventory {
         guard body.accountId == account, body.genesisHash == genesis else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
-        guard body.signer == "member:" + member else { return }
-        if body.principal.hasPrefix("host:") {
-            guard body.action == "interrupt_running", body.origin == nil else {
-                throw RemoteControlPublicationError.invalidRecord
-            }
-        } else {
-            guard body.principal.hasPrefix("service:"), ["revoke", "interrupt_running"].contains(body.action) else {
-                throw RemoteControlPublicationError.invalidRecord
-            }
-            guard body.origin == origin else {
+        switch try signerReportPlanRecord(log: log, bodyJson: json, member: "member:" + member, origin: origin) {
+        case .inPlan:
+            break
+        case .notInPlan(let reason):
+            if reason == "another_origin" {
                 guard rows[body.recordId] == nil else { throw RemoteControlPublicationError.requiresReview }
                 otherOriginIDs.insert(body.recordId)
-                return
             }
+            return
         }
         let prior = rows[body.recordId]
         guard sourceKey == key, !otherOriginIDs.contains(body.recordId) else { throw RemoteControlPublicationError.requiresReview }
