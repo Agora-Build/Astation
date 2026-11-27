@@ -47,6 +47,7 @@ pub(crate) mod tests;
 mod revocation;
 mod delegated;
 mod verifier_inventory;
+mod binding_challenges;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationState(pub Option<Arc<StationIntegrations>>);
@@ -376,6 +377,7 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
     Router::new()
         .route("/agora-build/v1/changes", post(nudge))
         .route("/agora-build/v1/details", get(details))
+        .route("/agora-build/v1/logs/:genesis/binding/challenge", post(binding_challenges::mint))
         .route("/agora-build/v1/logs/:genesis/verifiers/services", post(verifier_inventory::services))
         .route(
             "/agora-build/v1/integrations/:id/provision",

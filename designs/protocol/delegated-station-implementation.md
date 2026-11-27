@@ -222,6 +222,31 @@ comparison remain required. No provider, signing, publication or reopening is
 enabled by a successful collection. D27 pending releases/admin actions are not
 inferred. The normal hosted policy polling path remains in use.
 
+## Requesting a native ownership challenge
+
+On the built-in Station, a signed-in Mac manager requests a challenge immediately
+before the owner confirmation. The request goes to
+`POST /agora-build/v1/logs/{genesis}/binding/challenge` with its Station-audience
+`astation.remote` bearer. It supplies the chosen action, R9 account, locally
+verified membership head, signer and expected ownership record:
+
+```json
+{"action":"bind","account_id":"acct-example","head":{"seq":1,"hash":"<64 lowercase hex>"},"signer":"member:mac","expected_binding":{"state":"never_bound"}}
+```
+
+The issuer, subject and authentication time come from the validated login.
+A transfer uses the new owner's login and names the old owner in the expected
+record. An unbind uses the current owner's login. Station checks the Portal
+binding, account availability and current manager before committing the SDK
+challenge to PostgreSQL. Replicas can return the same outstanding challenge
+after a lost response. The lease ends within 30 seconds and by token expiry.
+The request and response use the delegated gate.
+
+Issuance prepares the confirmation. Applying the signed proof requires an
+atomic nonce consumption and ownership transition, fresh policy and room
+checks, separate current-owner consent for a transfer, route invalidation
+and a durable Portal report.
+
 ## Native client HTTP carriage
 
 All endpoints are under `/api/remote/v1/logs/{genesis}/control`, require the
