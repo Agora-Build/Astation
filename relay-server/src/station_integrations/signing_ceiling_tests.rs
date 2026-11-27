@@ -513,6 +513,8 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     assert_eq!(observed["highest_signed_ms"], last);
     assert_eq!(observed["portal_observation"]["interrupt_running"], true);
     assert_eq!(portal["portal_service_evidence"]["services"],json!([]));
+    assert_eq!(portal["service_drafts"], json!({"status":"membership_history_unresolved"}));
+    assert_eq!(portal["known_history"]["membership_gaps"][0]["reason"], "restored_head_behind");
     replica.close().await;
     drop(runtime);
     primary.cleanup().await;

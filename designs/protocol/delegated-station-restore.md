@@ -233,6 +233,15 @@ membership determines whether to carry the stop unchanged, obtain a fresh
 signature or review its authority. Independent evidence of complete history and participant coverage is
 still required before publication.
 
+`known_history.membership_gaps` identifies earlier verified membership heads
+missing from the restored list. `restored_head_behind` means the retained
+checkpoint has a signed extension of the restored list. `divergent_history`
+means their entries disagree at an overlapping sequence. The operator can
+inspect both heads and retain evidence while the fence is closed. Station
+withholds native signing reviews, fresh signer challenges, new replacement
+signatures, service drafts and stop staging until the restored list covers
+every retained head. A later generation alone cannot resolve a fork.
+
 ## Ending a prepared plan
 
 To permanently abandon a candidate, a Station operator runs

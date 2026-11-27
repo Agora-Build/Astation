@@ -136,10 +136,15 @@ pub(crate) async fn prepare_with_sources(
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
-        let revokes = snapshot_stops::staged_service_revokes(
-            &mut tx, stops, &prepared, &log, &binding.origin,
-            report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
-        ).await?;
+        let covered = covers_retained_membership(&report);
+        let revokes = if covered {
+            snapshot_stops::staged_service_revokes(
+                &mut tx, stops, &prepared, &log, &binding.origin,
+                report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
+            ).await?
+        } else {
+            BTreeMap::new()
+        };
         let source = portal_services::observe(&mut tx, binding, portal, vault, subject, &log,
             reservations.as_deref(), &observed, &report, &revokes).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
@@ -148,7 +153,11 @@ pub(crate) async fn prepare_with_sources(
         }))?.into();
         report["portal_service_evidence"] = source;
         if vault.is_some() && ceilings.is_some() {
-            report["service_drafts"] = service_drafts::prepare(&mut tx, &prepared, &log, binding, &report).await?;
+            report["service_drafts"] = if covered {
+                service_drafts::prepare(&mut tx, &prepared, &log, binding, &report).await?
+            } else {
+                json!({"status":"membership_history_unresolved"})
+            };
         }
         report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
     }
@@ -199,6 +208,9 @@ pub(crate) async fn review_for_owner(
     let (prepared, log, mut report) =
         checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
     review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    if !covers_retained_membership(&report) {
+        return Err(invalid());
+    }
     let summary = json!({
         "version": 1,
         "account_id": log.account_id(),
@@ -223,6 +235,10 @@ pub(crate) async fn review_for_owner(
     }
     tx.commit().await?;
     Ok(summary)
+}
+
+fn covers_retained_membership(report: &Value) -> bool {
+    report["known_history"]["membership_gaps"].as_array().is_some_and(Vec::is_empty)
 }
 
 async fn review_evidence(

@@ -4,6 +4,7 @@ use super::super::super::{delegated::Stored, MAX_STATE};
 use super::super::Binding;
 use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepared};
 use atem_client::{
+    channel::HeadRelation,
     control::{principal_key_of, verify_control, ControlCheck, ControlRecord, RefusalReason},
     membership::{Action, MemberKind, Membership},
     Hash32,
@@ -98,6 +99,7 @@ pub(super) async fn inspection(
         .as_str()
         .ok_or_else(invalid)?;
     let mut summaries = Vec::new();
+    let mut membership_gaps = Vec::new();
     let mut records = BTreeMap::new();
     // Keep a key's authenticated signatures even if the restored list predates
     // its enrollment. Record IDs and today's authority are reviewed separately.
@@ -134,6 +136,19 @@ pub(super) async fn inspection(
                 .map_err(|_| invalid())?;
         if old_log.frozen().is_some() {
             return Err(invalid());
+        }
+        // Both logs have been verified. When the retained log is longer, compare
+        // the overlapping entry too: length alone cannot distinguish a fork.
+        let gap = match HeadRelation::of(log, old_log.head()) {
+            HeadRelation::Same | HeadRelation::HostBehind => None,
+            HeadRelation::HostAhead if HeadRelation::of(&old_log, log.head()) == HeadRelation::HostBehind => {
+                Some("restored_head_behind")
+            }
+            _ => Some("divergent_history"),
+        };
+        if let Some(reason) = gap {
+            membership_gaps.push(json!({"generation":generation,"plan_id":checkpoint.plan_id,
+                "membership_head":old_log.head().to_json(),"reason":reason}));
         }
         // Validate the historical checkpoint, then classify every obligation
         // under current authority. Removed managers never regain authority.
@@ -283,6 +298,7 @@ pub(super) async fn inspection(
     }
     let report = json!({
         "checkpoints": summaries,
+        "membership_gaps": membership_gaps,
         "observed_service_keys": service_keys.into_iter().map(|((service, key), highest)| json!({
             "service_id":service, "key_fingerprint":key, "highest_signed_ms":highest
         })).collect::<Vec<_>>(),
