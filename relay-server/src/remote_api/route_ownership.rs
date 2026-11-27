@@ -532,7 +532,11 @@ impl super::super::RecoveryStore {
             "SELECT c FROM jsonb_array_elements($4) c WHERE EXISTS (
                 SELECT 1 FROM station_native_binding_transitions t
                 WHERE (t.issuer,t.portal_origin,t.station_origin)=($1,$2,$3)
-                  AND t.retired_routes @> jsonb_build_array(c))",
+                  AND t.retired_routes @> jsonb_build_array(c)
+                UNION ALL
+                SELECT 1 FROM station_applied_binding_releases r
+                WHERE (r.issuer,r.portal_origin,r.station_origin)=($1,$2,$3)
+                  AND r.retired_routes @> jsonb_build_array(c))",
         )
         .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
         .bind(sqlx::types::Json(candidates)).fetch_all(pool).await?;

@@ -219,10 +219,12 @@ impl StationIntegrations {
             self.collect_portal_checkpoint_if_due().await;
         }
         if let Some(fence) = self.app.recovery.active_delegated_binding() {
-            if caught_up && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
-                && self.policies.apply_binding_releases(&self.binding, fence).await.is_err()
-            {
-                tracing::warn!("could not apply pending Portal binding releases");
+            if caught_up && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+                match self.policies.apply_binding_releases(&self.binding, fence).await {
+                    Ok(0) => {}
+                    Ok(_) => self.app.recovery.notify_delegated_change(),
+                    Err(()) => tracing::warn!("could not apply pending Portal binding releases"),
+                }
             }
             self.reconcile_delegated_services().await;
         }
