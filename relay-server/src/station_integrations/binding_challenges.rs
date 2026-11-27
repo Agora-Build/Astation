@@ -172,7 +172,12 @@ async fn handle(
     };
     match result {
         Ok(Some(body)) => match tx.commit().await {
-            Ok(()) => Json(body).into_response(),
+            Ok(()) => {
+                if matches!(operation, Operation::Commit) {
+                    runtime.app.recovery.notify_delegated_change();
+                }
+                Json(body).into_response()
+            }
             Err(_) => unavailable(),
         },
         Ok(None) => error(StatusCode::CONFLICT, "binding_unavailable"),

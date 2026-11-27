@@ -1,5 +1,5 @@
 use super::*;
-use crate::cluster::ConnRef;
+use crate::cluster::{local::SocketRole, ConnRef, SINGLE_REPLICA_ID};
 use crate::remote_api::push_ingress::tests::Fixture;
 use crate::remote_api::recovery::{HostBinding, HostRouteError, ProxyBinding, RecoveryStore};
 use crate::station_integrations::tests::{fixture_at_station, ID, OWNER, PRINCIPAL};
@@ -27,7 +27,7 @@ async fn admit(
         .unwrap(),
     )
     .to_string();
-    let connection = ConnRef::new(&uuid::Uuid::new_v4().to_string(), "replica");
+    let connection = ConnRef::new(&uuid::Uuid::new_v4().to_string(), SINGLE_REPLICA_ID);
     match kind {
         RouteKind::Relay => {
             store
@@ -220,6 +220,28 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     peer.configure_delegated(origin, 1).await.unwrap();
     let old_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
     let old_proxy = admit(&peer, &fixture, RouteKind::Proxy).await.unwrap();
+    let hub = &runtime.app.relay;
+    let relay_socket = hub.local().register(
+        &old_relay.connection.conn,
+        "phone",
+        SocketRole::Atem {
+            atem_id: "host-a".into(),
+        },
+    );
+    let proxy_socket =
+        hub.local()
+            .register(&old_proxy.connection.conn, "phone", SocketRole::NativeProxy);
+    let consumer = crate::relay::RelayHub::new();
+    let (_, _frames, host_closed) = consumer
+        .channels()
+        .register("consumer", "alice", old_relay.connection.clone(), "one")
+        .unwrap();
+    let other = ConnRef::new(&old_relay.connection.conn, "different-replica");
+    let (_, _other_frames, other_closed) = consumer
+        .channels()
+        .register("consumer", "alice", other, "two")
+        .unwrap();
+    let old_routes = [old_relay.clone(), old_proxy.clone()];
     sqlx::raw_sql("CREATE FUNCTION reject_bind_commit() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN RAISE EXCEPTION 'commit fault'; END $$;
         CREATE CONSTRAINT TRIGGER reject_bind_commit AFTER INSERT ON station_native_binding_transitions
@@ -234,6 +256,11 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         .fetch_one(&replica).await.unwrap()
     };
     assert_eq!(counts().await, (0, 1));
+    hub.close_retired_binding_connections(&peer, &old_routes)
+        .await;
+    consumer.close_retired_binding_connections(&peer, &[]).await;
+    assert!(relay_socket.close.borrow().is_none() && proxy_socket.close.borrow().is_none());
+    assert!(!*host_closed.borrow());
     for route in [&old_relay, &old_proxy] {
         assert!(peer.prepare_delegated(route).await);
         assert_eq!(ack(&peer, &fixture, route, origin).await, StatusCode::OK);
@@ -264,6 +291,17 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     assert_eq!(retired.len(), 2);
     assert!(retired.contains(&old_relay.connection));
     assert!(retired.contains(&old_proxy.connection));
+    hub.close_retired_binding_connections(&peer, &old_routes)
+        .await;
+    consumer.close_retired_binding_connections(&peer, &[]).await;
+    for outbox in [&relay_socket, &proxy_socket] {
+        assert_eq!(
+            outbox.close.borrow().as_ref().map(|v| v.0),
+            Some(crate::relay::CLOSE_TRY_AGAIN)
+        );
+    }
+    assert!(*host_closed.borrow());
+    assert!(!*other_closed.borrow());
     for route in [&old_relay, &old_proxy] {
         assert!(peer
             .with_host_route(route, || std::future::ready(()))

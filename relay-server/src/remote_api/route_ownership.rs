@@ -517,3 +517,25 @@ async fn legacy_owner(
     }
     Ok(root.filter(|s| account_id(s)))
 }
+
+impl super::super::RecoveryStore {
+    pub(crate) async fn retired_binding_connections(
+        &self,
+        candidates: &[crate::cluster::ConnRef],
+    ) -> Result<Vec<crate::cluster::ConnRef>, sqlx::Error> {
+        let Some(station) = self.verifier_portal.get().filter(|station|
+            self.active_delegated_binding().is_some_and(|fence| fence.origin == station.station_origin)
+                && crate::account_identity::built_in_station(&station.station_origin)
+        ) else { return Ok(Vec::new()) };
+        let pool = self.pool.as_ref().ok_or_else(invalid_root)?;
+        let retired: Vec<sqlx::types::Json<crate::cluster::ConnRef>> = sqlx::query_scalar(
+            "SELECT c FROM jsonb_array_elements($4) c WHERE EXISTS (
+                SELECT 1 FROM station_native_binding_transitions t
+                WHERE (t.issuer,t.portal_origin,t.station_origin)=($1,$2,$3)
+                  AND t.retired_routes @> jsonb_build_array(c))",
+        )
+        .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+        .bind(sqlx::types::Json(candidates)).fetch_all(pool).await?;
+        Ok(retired.into_iter().map(|row| row.0).collect())
+    }
+}

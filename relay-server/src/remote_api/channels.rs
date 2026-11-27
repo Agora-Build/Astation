@@ -206,6 +206,11 @@ impl ChannelBroker {
             .remove(handle);
     }
 
+    pub(crate) fn host_connections(&self) -> Vec<ConnRef> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.values()
+            .map(|route| route.target.clone()).collect()
+    }
+
     pub(crate) fn host_disconnected(&self, target: &ConnRef) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.retain(|_, route| {
             if &route.target == target {
