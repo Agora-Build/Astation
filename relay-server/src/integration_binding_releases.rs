@@ -4,6 +4,38 @@ use crate::integration_checkpoint::PortalCheckpoint;
 use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
 
 impl PolicyStore {
+    /// The Portal settles a release atomically with a higher binding version.
+    /// Its checkpoint proves the outbound report is redundant after a lost
+    /// response. This evidence says nothing about a replica's local sockets.
+    pub(super) async fn confirm_binding_releases(
+        tx: &mut sqlx::PgConnection,
+        snapshot: &PortalCheckpoint,
+    ) -> Result<(), ()> {
+        let (Some(bindings), Some(pending)) = (&snapshot.bindings, &snapshot.pending_releases) else {
+            return Ok(());
+        };
+        sqlx::query(
+            r#"UPDATE station_applied_binding_releases a SET portal_version=b.version
+               FROM jsonb_to_recordset($4::jsonb) AS b(
+                   "accountId" text,"genesisHash" text,"bindingId" text,account text,
+                   "bindingState" text,version bigint)
+               WHERE (a.issuer,a.portal_origin,a.station_origin)=($1,$2,$3)
+                 AND a.portal_version IS NULL AND (a.account_id,a.genesis)=(b."accountId",b."genesisHash")
+                 AND (b.version > a.version OR (b.version=a.version AND b."bindingState"='released'
+                   AND b."bindingId"=a.report->>'bindingId' AND b.account=a.report->>'account'))
+                 AND NOT (a.release_id=ANY($5))"#,
+        )
+        .bind(&snapshot.binding.issuer)
+        .bind(&snapshot.binding.portal_origin)
+        .bind(&snapshot.binding.station_origin)
+        .bind(sqlx::types::Json(bindings))
+        .bind(pending.iter().map(|r| r.release_id.as_str()).collect::<Vec<_>>())
+        .execute(tx)
+        .await
+        .map_err(|_| ())?;
+        Ok(())
+    }
+
     pub(crate) async fn apply_binding_releases(
         &self,
         station: &FeedBinding,
