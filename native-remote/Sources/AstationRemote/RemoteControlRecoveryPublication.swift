@@ -205,7 +205,7 @@ public final class RemoteControlRecoveryPublication {
             }
         }
         let body = ControlRecordBody(accountId: old.accountId, genesisHash: old.genesisHash,
-            origin: old.origin, feedId: old.principal.hasPrefix("service:") ? context.candidateFeedID : nil,
+            origin: old.origin, feedId: old.feedId,
             principal: old.principal, principalKey: old.principalKey, signer: "member:" + managerID,
             action: old.action, interruptRunning: old.interruptRunning, revokeSeq: old.revokeSeq,
             recordId: UUID().uuidString.lowercased(), issuedAt: issuedAt, integrationId: old.integrationId, by: old.by)
@@ -370,7 +370,7 @@ public final class RemoteControlRecoveryPublication {
               body.action == old.action, body.interruptRunning == old.interruptRunning, body.revokeSeq == old.revokeSeq,
               body.integrationId == old.integrationId, body.by == old.by, body.recordId != old.recordId,
               body.issuedAt > old.issuedAt,
-              (body.principal.hasPrefix("service:") ? body.feedId == context.candidateFeedID && body.feedId != old.feedId : body.feedId == nil),
+              body.feedId == old.feedId || (old.feedId != nil && body.feedId == context.candidateFeedID),
               try canonicalJson(json: operation.bodyJSON) == operation.bodyJSON else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
