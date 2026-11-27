@@ -526,12 +526,13 @@ impl PolicyCheckpoint {
         .fetch_one(tx).await.map_err(|_| ())
     }
 
+    pub(crate) fn policy_current(&self, now: i64) -> bool {
+        !self.denied && self.revision != 0
+            && now.checked_sub(self.received_at).is_some_and(|age| (0..MAX_POLICY_AGE_SECS).contains(&age))
+    }
+
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
-        if self.denied
-            || self.revision == 0
-            || now < self.received_at
-            || now - self.received_at >= MAX_POLICY_AGE_SECS
-        {
+        if !self.policy_current(now) {
             return Err(());
         }
         let policy = self.integrations.get(id).ok_or(())?;
