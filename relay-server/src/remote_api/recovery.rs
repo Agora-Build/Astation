@@ -951,7 +951,7 @@ pub(super) enum Operation {
     Delegated { origin: String, binding: Option<HostBinding>, command: delegated::Command },
 }
 
-fn now() -> HostNow {
+pub(crate) fn now() -> HostNow {
     static CLOCK: OnceLock<(Instant, String)> = OnceLock::new();
     let (start, boot_id) = CLOCK.get_or_init(|| (Instant::now(), uuid::Uuid::new_v4().to_string()));
     let wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
