@@ -59,6 +59,8 @@ final class AstationRecoveryCoordinator {
         var verifierRosters: [String: AcceptedVerifierRoster]?
         var processRosters: [String: [String: AstationProcessRoster]]?
         var verifierHistoryRoots: [String: String]?
+        var stationBindingProofs: [String: String]?
+        var stationBindingReceipts: [String: RemoteStationBindingReceipt]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -218,7 +220,8 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard (2...9).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard (2...10).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 10 || (saved.stationBindingProofs == nil && saved.stationBindingReceipts == nil),
                   saved.version >= 9 || saved.verifierHistoryRoots == nil,
                   (saved.verifierHistoryRoots ?? [:]).count <= 64,
                   (saved.verifierHistoryRoots ?? [:]).allSatisfy({ PortalIntegrationRecord.validOrigin($0.key) && RemoteRecoveryKit.validHash($0.value) }),
@@ -1123,6 +1126,59 @@ final class AstationRecoveryCoordinator {
                     DeviceOwnerAuth.authenticate(reason: review.confirmation) { continuation.resume(returning: $0) }
                 }
             }, sign: { try self.identity.signStationBinding($0, expectedKey: $1) })
+    }
+
+    var lastStationBindingReceipt: RemoteStationBindingReceipt? { saved.stationBindingReceipts?[relayURL] }
+    var hasPendingStationBinding: Bool { saved.stationBindingProofs?[relayURL] != nil }
+
+    enum StationBindingSubmission {
+        case retry
+        case change(BindingAction, ExpectedBinding)
+    }
+
+    func submitStationBinding(_ submission: StationBindingSubmission, session: AccountLoginSession,
+                              current: () -> Bool) async throws -> RemoteStationBindingReceipt {
+        try begin()
+        defer { busy = false }
+        try requireDurableRecoveryCheckpoint()
+        guard let kit = try currentKit(), current() else { throw RemoteRecoveryError.notCommitted }
+        let client = try RemoteStationBindingApproval(origin: relayURL)
+        let proof: String
+        switch submission {
+        case .retry:
+            guard let pending = saved.stationBindingProofs?[relayURL] else { throw AccountLoginError.changed }
+            proof = pending
+        case let .change(action, previous):
+            guard !hasPendingStationBinding, (lastStationBindingReceipt?.ownership ?? .neverBound) == previous else {
+                throw AccountLoginError.changed
+            }
+            proof = try await approveStationBinding(action: action, previous: previous, session: session, current: current)
+            guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
+            try requireDurableRecoveryCheckpoint()
+            try persist {
+                $0.version = max($0.version, 10)
+                $0.stationBindingProofs = ($0.stationBindingProofs ?? [:]).merging([relayURL: proof]) { _, new in new }
+            }
+        }
+        let retry: Bool
+        switch submission { case .retry: retry = true; case .change: retry = false }
+        let result: RemoteStationBindingReceipt
+        do {
+            result = try await client.submit(proof: proof, session: session, accountID: accountID,
+                genesisHash: kit.genesisHash, retry: retry, now: { self.now().wallMs }, current: current)
+        } catch RemoteStationBindingError.expiredWithoutCommit {
+            try requireDurableRecoveryCheckpoint()
+            guard current(), saved.stationBindingProofs?[relayURL] == proof else { throw AccountLoginError.changed }
+            try persist { $0.stationBindingProofs?.removeValue(forKey: relayURL) }
+            throw RemoteStationBindingError.expiredWithoutCommit
+        }
+        try requireDurableRecoveryCheckpoint()
+        guard saved.stationBindingProofs?[relayURL] == proof else { throw AccountLoginError.changed }
+        try persist {
+            $0.stationBindingReceipts = ($0.stationBindingReceipts ?? [:]).merging([relayURL: result]) { _, new in new }
+            $0.stationBindingProofs?.removeValue(forKey: relayURL)
+        }
+        return result
     }
 
     private func refreshedLog(genesis: String, transport: RemoteRecoveryTransport? = nil) async throws -> MembershipLog {

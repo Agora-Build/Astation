@@ -269,6 +269,48 @@ final class RemotePublishedSDKTests: XCTestCase {
         XCTAssertEqual(signatures, 1)
     }
 
+    @MainActor
+    func testStationBindingReceiptRetryUsesTheSavedProofAndChecksTheAccountAndVersion() async throws {
+        let source = try fixture("r9-vectors-station-binding")
+        let vector = try XCTUnwrap(rows(source["valid"]).first { $0["label"] as? String == "transfer_p256" })
+        let proof = try XCTUnwrap(vector["proof"] as? String)
+        let challenge = try parseStationBindingChallenge(challengeJson: json(XCTUnwrap(vector["challenge"])))
+        guard case let .bound(id, version, _) = challenge.expectedBinding else { return XCTFail("transfer predecessor") }
+        let config = try AccountOIDCConfiguration(issuer: challenge.issuer, clientID: "astation",
+            resource: challenge.origin, requiredScope: "astation.remote")
+        func login(_ authTime: UInt64) -> AccountLoginSession {
+            AccountLoginSession(configuration: config, subject: challenge.subject, accessToken: "test-bearer",
+                refreshToken: "", expiresAt: Date(timeIntervalSince1970: Double(challenge.expiresAt) / 1000 + 60),
+                authenticatedAt: Int64(authTime))
+        }
+        var receipt: [String: Any] = ["account": challenge.subject, "accountId": challenge.accountId,
+            "genesisHash": challenge.genesisHash, "bindingId": id, "version": version + 1, "bindingState": "bound"]
+        let ok = try JSONSerialization.data(withJSONObject: receipt)
+        let pending = Data(#"{"pending":true}"#.utf8)
+        let expired = Data(#"{"error":{"code":"binding_proof_expired"}}"#.utf8)
+        receipt["version"] = version
+        let wrongVersion = try JSONSerialization.data(withJSONObject: receipt)
+        let http = BindingReceiptHTTP([(pending, 202), (ok, 200), (ok, 200), (pending, 202), (expired, 410), (wrongVersion, 200)])
+        let client = try RemoteStationBindingApproval(origin: challenge.origin, http: http)
+        func retry(_ authenticatedAt: UInt64) async throws -> RemoteStationBindingReceipt {
+            try await client.submit(proof: proof, session: login(authenticatedAt), accountID: challenge.accountId,
+                genesisHash: challenge.genesisHash, retry: true, now: { challenge.issuedAt }, current: { true })
+        }
+        let first = try await retry(challenge.authTime)
+        let replay = try await retry(challenge.authTime + 1)
+        XCTAssertEqual(first, replay)
+        XCTAssertEqual(first.ownership, .bound(bindingId: id, version: version + 1, owner: challenge.subject))
+        do { _ = try await retry(challenge.authTime + 1); XCTFail("another login must never submit a pending proof") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        do { _ = try await retry(challenge.authTime); XCTFail("expired proof") }
+        catch RemoteStationBindingError.expiredWithoutCommit { }
+        do { _ = try await retry(challenge.authTime); XCTFail("stale receipt") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .invalidResponse) }
+        let requests = await http.requests
+        XCTAssertEqual(requests.map { $0.url?.lastPathComponent }, ["receipt","commit","receipt","receipt","receipt","receipt"])
+        XCTAssertTrue(requests.allSatisfy { $0.httpBody == Data(proof.utf8) && $0.value(forHTTPHeaderField: "Authorization") == "Bearer test-bearer" })
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {
@@ -306,6 +348,17 @@ final class RemotePublishedSDKTests: XCTestCase {
     }
 }
 
+
+private actor BindingReceiptHTTP: AccountOIDCHTTP {
+    private var replies: [(Data, Int)]
+    private(set) var requests: [URLRequest] = []
+    init(_ replies: [(Data, Int)]) { self.replies = replies }
+    func send(_ request: URLRequest) async throws -> (Data, Int) {
+        requests.append(request)
+        guard !replies.isEmpty else { throw AccountLoginError.unavailable }
+        return replies.removeFirst()
+    }
+}
 
 private actor BindingChallengeHTTP: AccountOIDCHTTP {
     let challenge: Data
