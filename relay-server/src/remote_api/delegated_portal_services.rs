@@ -61,20 +61,20 @@ pub(super) async fn observe(
     }
 
     let genesis = log.genesis_hash().to_hex();
-    let can_release = snapshot
+    let owner_allows_release = snapshot
         .accounts
         .as_ref()
         .is_none_or(|accounts| accounts.enabled(owner))
         && policy.allows_list_release_in(connection, owner, log.account_id(), &genesis)
             .await.map_err(|_| invalid())?;
-    let policy = |id: &str, key: &str| {
+    let integration = |id: &str, key: &str| {
         id.strip_prefix("svc-")
             .and_then(|id| snapshot.integrations.get(id))
             .filter(|row| {
                 row.policy.owner_account == *owner && row.policy.r9_svc.as_deref() == Some(key)
             })
     };
-    let observation = |id: &str, key: &str| match policy(id, key) {
+    let observation = |id: &str, key: &str| match integration(id, key) {
         Some(row) => {
             json!({"state":row.policy.state, "interrupt_running":row.policy.interrupt_running,
             "revoked_at":row.revoked_at, "expires_at":row.policy.expires_at})
@@ -210,6 +210,8 @@ pub(super) async fn observe(
         .cloned()
         .collect();
     let stops = ServiceStops::from_review(review)?;
+    let can_release = owner_allows_release
+        && policy.binding_feed_current(log.account_id(), &genesis, chrono::Utc::now().timestamp_millis());
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
         let known = stops.get(&(id.as_str(), key.as_str())).copied().unwrap_or_default();
@@ -223,7 +225,7 @@ pub(super) async fn observe(
         let mut reconstruction = known.reconstruct(
             *active,
             managed_keys.contains(identity),
-            policy(id, key),
+            integration(id, key),
             can_release,
             coverage_end.is_some(),
         );
