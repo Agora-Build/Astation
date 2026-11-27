@@ -888,9 +888,16 @@ preserves the effect of a former manager's revoke. Portal revocation separately
 requires the service's own revoke for reporting, and a later interrupt request
 requires an interrupt if the own-key stop did not already include one. After
 a Portal or native revoke, `fresh_stop_actions` lists only the missing stops,
-even when membership already removed the service. Current coverage stays
-unresolved. If this Station still covers the principal, its replacement feed
-must start that principal's records with a fresh cover.
+even when membership already removed the service.
+
+A signed membership removal ends the cover requirement. A verified revoke for
+the service and its key also ends it once Station stages that revoke in the
+replacement snapshot. The review reports the reason in `coverage_end` and
+includes the selected record ID for a revoke. Every replica checks the staged
+records against the current reconstruction, including required interrupts.
+A Portal revoke alone leaves coverage unresolved. A missing key, signing
+reservation, expired grant or stale staged component cannot end coverage.
+These observations contribute to the review while publication remains fenced.
 
 Missing ownership, an unresolved stop, or expiry that hides the previous hold
 keeps the corresponding state unresolved. Earlier membership keys appear in

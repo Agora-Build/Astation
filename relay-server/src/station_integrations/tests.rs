@@ -578,7 +578,8 @@ async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_close
     assert_eq!(action["state"], "revoked");
     assert_eq!(action["interrupt_running"], true);
     assert_eq!(evidence["services"][0]["snapshot_review"],
-        json!({"status":"coverage_unresolved","fresh_stop_actions":[{"action":"revoke","interrupt_running":true}]}));
+        json!({"status":"coverage_ended","coverage_end":{"reason":"membership_removed"},
+            "fresh_stop_actions":[{"action":"revoke","interrupt_running":true}]}));
     assert!(action["revoked_at"].is_null());
     assert_ne!(before["portal_service_evidence_hash"],observed["portal_service_evidence_hash"]);
     assert_eq!(observed["recovery_ready"],false);

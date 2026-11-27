@@ -22,6 +22,7 @@ pub(super) async fn observe(
     registrations: Option<&[Reservation]>,
     observed_registrations: &[Reservation],
     review: &Value,
+    staged_revokes: &BTreeMap<(String, String), String>,
 ) -> Result<Value, sqlx::Error> {
     if portal.station_origin != fence.origin {
         return Err(invalid());
@@ -211,13 +212,24 @@ pub(super) async fn observe(
     let stops = ServiceStops::from_review(review)?;
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
-        let known = stops.get(id.as_str()).copied().unwrap_or_default();
-        let reconstruction = known.reconstruct(
+        let known = stops.get(&(id.as_str(), key.as_str())).copied().unwrap_or_default();
+        let coverage_end = if let Some(record_id) = staged_revokes.get(identity) {
+            Some(json!({"reason":"snapshot_revoke","record_id":record_id}))
+        } else if log.member(id).is_some_and(|m| m.status == MemberStatus::Removed) {
+            Some(json!({"reason":"membership_removed"}))
+        } else {
+            None
+        };
+        let mut reconstruction = known.reconstruct(
             *active,
             managed_keys.contains(identity),
             policy(id, key),
             can_release,
+            coverage_end.is_some(),
         );
+        if let Some(end) = coverage_end {
+            reconstruction["coverage_end"] = end;
+        }
         rows.push(
             json!({"service_id":id,"key_fingerprint":key,"observation":observation(id,key),
             "snapshot_review":reconstruction}),
@@ -324,7 +336,7 @@ struct ServiceStops {
 }
 
 impl ServiceStops {
-    fn from_review(review: &Value) -> Result<BTreeMap<&str, Self>, sqlx::Error> {
+    fn from_review(review: &Value) -> Result<BTreeMap<(&str, &str), Self>, sqlx::Error> {
         let mut replaced = BTreeSet::new();
         for row in review["recovery_signatures"]["known_native_obligations"]
             .as_array()
@@ -334,7 +346,7 @@ impl ServiceStops {
                 replaced.insert(row["original"]["record_id"].as_str().ok_or_else(invalid)?);
             }
         }
-        let mut stops = BTreeMap::<&str, Self>::new();
+        let mut stops = BTreeMap::<(&str, &str), Self>::new();
         for record in review["known_history"]["records"]
             .as_array()
             .ok_or_else(invalid)?
@@ -347,7 +359,8 @@ impl ServiceStops {
             if !revoke && record["action"] != "interrupt_running" {
                 continue;
             }
-            let facts = stops.entry(service).or_default();
+            let key = record["principal_key"].as_str().ok_or_else(invalid)?;
+            let facts = stops.entry((service, key)).or_default();
             if record["verification"] != "valid"
                 && !(record["verification"] == "removed_manager"
                     && replaced.contains(record["record_id"].as_str().ok_or_else(invalid)?))
@@ -370,6 +383,7 @@ impl ServiceStops {
         provisioned: bool,
         row: Option<&CheckpointIntegration>,
         can_release: bool,
+        coverage_ended: bool,
     ) -> Value {
         if !provisioned {
             return json!({"status":"provisioning_unresolved"});
@@ -381,9 +395,8 @@ impl ServiceStops {
             return json!({"status":"stop_authority_review"});
         }
         let desired = ServiceDesired::from_policy(&row.policy);
-        if self.revoked || matches!(desired, Some(ServiceDesired::Revoked { .. })) {
-            // A terminal stop applies even after membership removal. Neither
-            // that stop nor the provisioned key decides current coverage.
+        if coverage_ended || self.revoked || matches!(desired, Some(ServiceDesired::Revoked { .. })) {
+            // Reporting still requires the service's own stop and any later interrupt.
             let stops = match desired {
                 Some(ServiceDesired::Revoked { interrupt_running }) if !self.own_revoke => {
                     json!([{"action":"revoke","interrupt_running":interrupt_running}])
@@ -395,7 +408,8 @@ impl ServiceStops {
                 }
                 _ => json!([]),
             };
-            return json!({"status":"coverage_unresolved","fresh_stop_actions":stops});
+            let status = if coverage_ended { "coverage_ended" } else { "coverage_unresolved" };
+            return json!({"status":status,"fresh_stop_actions":stops});
         }
         if !active {
             return json!({"status":"membership_inactive"});
@@ -425,7 +439,7 @@ mod tests {
     #[test]
     fn portal_resume_does_not_release_a_retained_or_replaced_manager_revoke() {
         let mut review = json!({
-            "known_history":{"records":[{"principal":"service:svc-a","record_id":"original",
+            "known_history":{"records":[{"principal":"service:svc-a","principal_key":"key-a","record_id":"original",
                 "verification":"valid","signer":"member:manager","action":"revoke","interrupt_running":false}]},
             "recovery_signatures":{"known_native_obligations":[]}
         });
@@ -435,11 +449,12 @@ mod tests {
             "revoked_at":null}))
         .unwrap();
         let actions = |review: &Value, row: &CheckpointIntegration| {
-            ServiceStops::from_review(review).unwrap()["svc-a"].reconstruct(
+            ServiceStops::from_review(review).unwrap()[&("svc-a", "key-a")].reconstruct(
                 true,
                 true,
                 Some(row),
                 true,
+                false,
             )
         };
         assert_eq!(actions(&review, &row)["fresh_stop_actions"], json!([]));
@@ -470,7 +485,7 @@ mod tests {
 
         row.policy.state = "ready".into();
         assert_eq!(
-            ServiceStops::default().reconstruct(true, true, Some(&row), false)["status"],
+            ServiceStops::default().reconstruct(true, true, Some(&row), false, false)["status"],
             "owner_availability_unresolved"
         );
     }
