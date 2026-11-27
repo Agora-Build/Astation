@@ -29,6 +29,8 @@ pub enum InboxMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_route: Option<crate::remote_api::recovery::OwnerRoute> },
     ChannelDelivered { delivery: String, accepted: bool },
+    /// A host socket closed these exact channel handles while suspended.
+    RetireChannels { source: super::ConnRef, handles: Vec<String> },
     ChannelReply { handle: String, source: super::ConnRef, frame: String, reply_to: String, delivery: String },
     /// Queue `frame` on each listed local connection (one publish per
     /// target replica, fanned out there).
@@ -68,7 +70,7 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
     let targets: Vec<String> = match message {
         InboxMessage::ChannelDeliver { connection_id, .. }
         | InboxMessage::VerificationDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
-        InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } => vec![],
+        InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::RetireChannels { .. } => vec![],
         InboxMessage::Deliver { connection_ids, .. } => {
             connection_ids.iter().map(|id| crate::relay::mask_code(id)).collect()
         }
@@ -90,7 +92,7 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
-        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::CloseUnproved { .. }
+        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::RetireChannels { .. } | InboxMessage::CloseUnproved { .. }
         | InboxMessage::VerificationDeliver { .. } => {
             // Requires the hub's r9 broker; dispatched before this legacy socket handler.
         }

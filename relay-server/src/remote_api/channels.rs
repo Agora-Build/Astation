@@ -224,6 +224,15 @@ impl ChannelBroker {
         });
     }
 
+    pub(crate) fn retire_channels(&self, source: &ConnRef, handles: &[String]) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for handle in handles {
+            if inner.routes.get(handle).is_some_and(|route| &route.target == source) {
+                if let Some(route) = inner.routes.remove(handle) { let _ = route.close.send(true); }
+            }
+        }
+    }
+
     pub(crate) fn delivery(&self) -> Option<(String, oneshot::Receiver<bool>)> {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
         inner.deliveries.retain(|_, sender| !sender.is_closed());

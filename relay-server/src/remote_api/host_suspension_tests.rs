@@ -289,11 +289,7 @@ async fn postgres_delegated_suspension_closes_cross_replica_channels_before_the_
             .to_json()
     );
     crate::relay::tests::assert_closed(&mut host).await;
-    send_json(
-        &mut second,
-        json!({"type":"channel","event":"frame","channel":"client_2","frame":{"probe":true}}),
-    )
-    .await;
+    // The idle client's broker receives retirement from the host replica.
     assert_eq!(
         next_client_json(&mut second).await["reason"],
         "service_suspended"

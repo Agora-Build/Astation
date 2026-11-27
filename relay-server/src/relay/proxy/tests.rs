@@ -32,8 +32,12 @@ impl Drop for Test {
 
 impl Test {
     async fn new() -> Self {
+        Self::with_store(RecoveryStore::memory()).await
+    }
+
+    async fn with_store(store: Arc<RecoveryStore>) -> Self {
         let mut state = crate::tests::test_state();
-        state.recovery = RecoveryStore::memory();
+        state.recovery = store;
         state.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
         let fixture = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         fixture.publish(&state.recovery).await;
@@ -119,6 +123,136 @@ impl Test {
         send_json(&mut socket, host_route_message(&object)).await;
         socket
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_proxy_resumes_on_its_current_local_authentication() {
+    use crate::integration_feed::{FeedBinding, PolicyStore};
+    use crate::station_integrations::tests::{attach_test_room_owner, OWNER};
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let store = RecoveryStore::postgres(db.pool.clone());
+    attach_test_room_owner(&store, ORIGIN).await;
+    let t = Test::with_store(store).await;
+    let mut proxy = t.proxy(RouteKind::Proxy).await;
+    assert_eq!(next_client_json(&mut proxy).await["op"], "host_route_ok");
+    let heads = next_client_json(&mut proxy).await;
+    let ToHost::Heads(heads) = ToHost::decode(heads.to_string().as_bytes()).unwrap() else {
+        panic!("heads")
+    };
+    let call = ControlSync {
+        request_id: Uuid::new_v4().to_string(),
+        origin: ORIGIN.into(),
+        feed_id: Some(heads.feeds[0].feed_id.clone()),
+        after: 0,
+    };
+    let binding = t
+        .state
+        .relay
+        .inner
+        .host_routes
+        .lock()
+        .unwrap()
+        .values()
+        .find(|b| b.proxy.is_some())
+        .unwrap()
+        .clone();
+    let policy = PolicyStore(db.reconnect(2).await);
+    let portal = FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: ORIGIN.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    };
+    let mut previous = policy.load(&portal).await.unwrap();
+    for (cursor, kind) in [
+        (1, "account_disabled"),
+        (2, "account_enabled"),
+        (3, "account_disabled"),
+    ] {
+        let channel = if kind == "account_disabled" {
+            let (channel, _frames, closed) = t
+                .state
+                .relay
+                .channels()
+                .register(
+                    t.state.relay.replica_id(),
+                    "alice",
+                    binding.connection.clone(),
+                    "mobile",
+                )
+                .unwrap();
+            t.state
+                .relay
+                .channels()
+                .bind_host(&channel, binding.clone());
+            let open =
+                json!({"type":"channel","event":"open","transport":"relay","channel":channel});
+            assert!(
+                t.state
+                    .relay
+                    .deliver_channel(&binding.connection, open.to_string())
+                    .await
+            );
+            assert_eq!(next_client_json(&mut proxy).await, open);
+            Some((channel, closed))
+        } else {
+            None
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut page = json!({"changes":[{"id":cursor,"kind":kind,"integrationId":null,"state":null,"reason":"agora_build","account":OWNER}],
+                            "cursor":cursor});
+        if previous.cursor == 0 {
+            page["integrations"] = json!([]);
+        }
+        let mut next = previous
+            .apply(
+                previous.cursor,
+                serde_json::from_value(page).unwrap(),
+                now / 1000,
+            )
+            .unwrap();
+        next.record_completed_read(now, now);
+        policy.commit(&previous, &next).await.unwrap();
+        previous = next;
+        assert!(t.state.relay.delegated_heads(&binding).await);
+        if let Some((channel, mut closed)) = channel {
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                json!({"type":"channel","event":"close","channel":channel,"reason":"service_suspended"})
+            );
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                atem_client::station_notice::ServiceSuspended::new(
+                    "service suspended: account disabled at Agora.Build"
+                )
+                .unwrap()
+                .to_json()
+            );
+            tokio::time::timeout(Duration::from_secs(2), closed.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(*closed.borrow());
+            t.state.relay.cleanup_expired().await;
+            send_json(&mut proxy, call.to_json().unwrap()).await;
+            assert_eq!(
+                next_client_json(&mut proxy).await,
+                json!({"type":"relay","op":"control_sync_refused","code":"forbidden"})
+            );
+        } else {
+            assert_eq!(next_client_json(&mut proxy).await["op"], "heads");
+            send_json(&mut proxy, call.to_json().unwrap()).await;
+            assert_eq!(
+                next_client_json(&mut proxy).await["op"],
+                "control_sync_result"
+            );
+        }
+    }
+    proxy.close(None).await.unwrap();
+    drop(t);
+    policy.0.close().await;
+    db.cleanup().await;
 }
 
 #[tokio::test]
