@@ -56,7 +56,7 @@ pub(super) struct History {
     pub review: Value,
     pub signed: BTreeMap<String, Value>,
     pub authors: Value,
-    pub current_report_hashes: Vec<String>,
+    pub new_export_digests: BTreeMap<String, String>,
     pub confirmation_hashes: Vec<String>,
     // One latest verified export per signer, slot and process, in this plan.
     pub latest_exports: Vec<(Hash32, Vec<String>)>,
@@ -109,7 +109,7 @@ pub(super) async fn inspection(
     let mut journals = super::author_history::JournalHistory::default();
     let mut current_authors = None;
     let mut prior_authors = Vec::new();
-    let mut current_report_hashes = Vec::new();
+    let mut new_export_digests = BTreeMap::new();
     let mut confirmation_hashes = Vec::new();
     let mut latest_exports = BTreeMap::new();
     for Historical {
@@ -196,13 +196,16 @@ pub(super) async fn inspection(
         let mut authors = operator_review.then(|| super::author_history::inventory(&old_log));
         let mut hashes = Vec::new();
         let current_plan = checkpoint.plan_id == prepared.plan_id;
-        let mut latest_journals = BTreeMap::new();
         signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
             if current_plan {
                 latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
                     (verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
             }
             for record in verified.records {
+                // Checkpoint records and older plans already contribute to the base.
+                if current_plan && !records.contains_key(record.record_id()) {
+                    new_export_digests.insert(record.record_id().to_owned(), source_hash(&record.object().to_json())?);
+                }
                 // Signing a journal export does not establish authority for its target.
                 // Keep the original verified clock across later membership changes.
                 if matches!(verify_control(&record, &old_log),
@@ -224,18 +227,11 @@ pub(super) async fn inspection(
                     "signed_evidence_hash": verified.recovery.evidence_hash().to_hex(),
                 }));
             }
-            // The first observation of each change commits the exact submission.
-            // Re-attesting a frozen journal must let other authors sign the same
-            // evidence hash. All receipts remain in storage and are reverified.
             if current_plan {
-                let process = (verified.signer, verified.slot, verified.process);
-                if latest_journals.get(&process) == Some(&verified.journal) {
-                    confirmation_hashes.push(hash);
-                    return Ok(());
-                }
-                latest_journals.insert(process, verified.journal);
+                confirmation_hashes.push(hash);
+            } else {
+                hashes.push(hash);
             }
-            hashes.push(hash);
             Ok(())
         }).await?;
         let mut commitment = json!({
@@ -243,8 +239,6 @@ pub(super) async fn inspection(
             "candidate_feed_id": checkpoint.candidate_feed_id, "source_hash": checkpoint.source_hash,
         });
         if checkpoint.plan_id == prepared.plan_id {
-            // Existing active challenges already commit to these hashes at the outer level.
-            current_report_hashes = hashes;
             current_authors = authors;
         } else {
             if !hashes.is_empty() {
@@ -267,6 +261,8 @@ pub(super) async fn inspection(
     }
     let imports = stops::load(connection, binding, &log.genesis_hash().to_hex()).await?;
     for (id, value) in &imports {
+        // Imported records have their own commitment, regardless of discovery order.
+        new_export_digests.remove(id);
         let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
         if id != record.record_id() {
@@ -301,7 +297,7 @@ pub(super) async fn inspection(
             .collect(),
         authors: json!({"members": current_authors, "prior_plans": prior_authors,
             "journal_gaps": journals.gaps(), "complete_history": false}),
-        current_report_hashes,
+        new_export_digests,
         confirmation_hashes,
         latest_exports: latest_exports.into_values().collect(),
     })

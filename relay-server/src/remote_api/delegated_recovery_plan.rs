@@ -276,8 +276,9 @@ async fn review_source_evidence(
     if !history.confirmation_hashes.is_empty() {
         report["author_confirmation_hash"] = source_hash(&json!(history.confirmation_hashes))?.into();
     }
-    let hashes = history.current_report_hashes;
-    if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
+    if !history.new_export_digests.is_empty() {
+        sources["exported_records"] = json!(history.new_export_digests);
+    }
     let evidence_hash = source_hash(&sources)?;
     let exported_at_cut = history.latest_exports.into_iter()
         .filter(|(base, _)| base.to_hex() == evidence_hash)
