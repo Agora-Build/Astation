@@ -907,6 +907,14 @@ another key of the same service also blocks signing. Only the independent
 signing database can reserve timestamps. If both databases
 lose a reservation, this comparison cannot recover it.
 
+The operator review derives `service_clock_evidence.snapshot_signing_marks` for service keys identified
+by signed membership history. Each entry names the exact fingerprint, the
+independent reservation ceiling and the minimum time a new signature must
+exceed. The latter includes retained principal watermarks and native recovery
+copies. A missing registration, a reservation shortfall, conflicting signed
+keys or an own-key signature above its ceiling withholds the mark for that
+principal. An unused registration by itself establishes no membership.
+
 For each service, `snapshot_review` lists the fresh lifecycle actions required
 by the observed checkpoint. Station matches the signed active member and key
 to the stored provisioning context for this issuer, Station, owner, and genesis.
