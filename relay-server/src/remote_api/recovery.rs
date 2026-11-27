@@ -128,7 +128,26 @@ impl Root {
 #[derive(Debug)]
 pub(crate) enum HostRouteError {
     Refused(Value),
+    Suspended(Value),
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteService {
+    Allowed,
+    Unavailable,
+    Disabled,
+    NoOwner,
+}
+
+impl RouteService {
+    fn suspension_text(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => Some("service suspended: account disabled at Agora.Build"),
+            Self::NoOwner => Some("service suspended: no Agora.Build owner at this Station"),
+            Self::Allowed | Self::Unavailable => None,
+        }
+    }
 }
 
 /// Carrier A has no route proof; it is usable only while this exact room owner
@@ -451,7 +470,9 @@ impl RecoveryStore {
             )
             .await;
         if reply.0 != StatusCode::OK {
-            return Err(if reply.0 == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(if reply.0 == StatusCode::FORBIDDEN && reply.1.0["code"] == "service_suspended" {
+                HostRouteError::Suspended(reply.1.0)
+            } else if reply.0 == StatusCode::SERVICE_UNAVAILABLE {
                 HostRouteError::Unavailable
             } else {
                 HostRouteError::Refused(if reply.1 .0["type"] == "relay" {
@@ -664,36 +685,36 @@ impl RecoveryStore {
         let (principal,state) = saved?;
         let root: Root = serde_json::from_value(state).ok()?;
         let log = valid(&root)?;
-        if !self.route_service_allowed(&mut tx,&principal,&root.account,genesis,room).await.ok()? {
+        if self.route_service(&mut tx,&principal,&root.account,genesis,room).await.ok()? != RouteService::Allowed {
             return None;
         }
         // No state changes: dropping the read transaction releases its locks.
         Some(action(&root, &log).await)
     }
 
-    async fn route_service_allowed(
+    async fn route_service(
         &self,
         db: &mut sqlx::PgConnection,
         principal: &str,
         account: &str,
         genesis: &str,
         room: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<RouteService, sqlx::Error> {
         let Some(origin) = self
             .delegated_origin
             .get()
             .filter(|s| crate::account_identity::built_in_station(s))
         else {
-            return Ok(true);
+            return Ok(RouteService::Allowed);
         };
         let Some(station) = self
             .verifier_portal
             .get()
             .filter(|s| &s.station_origin == origin)
         else {
-            return Ok(false);
+            return Ok(RouteService::Unavailable);
         };
-        delegated_recovery::route_ownership::may_serve(
+        delegated_recovery::route_ownership::route_service(
             db, station, principal, account, genesis, room,
         )
         .await
@@ -907,6 +928,7 @@ impl RecoveryStore {
                 }
             }
         }
+        let admitting_proof = matches!(&operation, Operation::HostRoute { .. });
         let admitted_room = match &operation {
             Operation::HostRoute { room, .. } => Some(room.clone()),
             Operation::Delegated { binding: Some(binding), .. } => Some(binding.room.clone()),
@@ -921,8 +943,14 @@ impl RecoveryStore {
             Err(reply) => return Ok(reply),
         };
         if let Some(room) = admitted_room {
-            if !self.route_service_allowed(connection,&owner,&root.account,genesis,&room).await? {
-                return Ok(error(StatusCode::SERVICE_UNAVAILABLE, "service_suspended"));
+            let service = self.route_service(connection, &owner, &root.account, genesis, &room).await?;
+            if service != RouteService::Allowed {
+                // apply verified the exact route proof before the owner lookup.
+                if let Some(text) = service.suspension_text().filter(|_| admitting_proof) {
+                    let refusal = RelayReply::suspended(text).map_err(|_| sqlx::Error::Protocol("invalid suspension text".into()))?;
+                    return Ok((StatusCode::FORBIDDEN, Json(refusal.to_json())));
+                }
+                return Ok(unavailable());
             }
         }
         if let Some(((origin, issuer), room, proxy)) = proved_room {

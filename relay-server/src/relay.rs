@@ -3029,6 +3029,11 @@ async fn handle_ws(
                                     break;
                                 }
                             }
+                            Ok(Err(crate::remote_api::recovery::HostRouteError::Suspended(frame))) => {
+                                local.send_required(&connection_id, frame.to_string());
+                                flush_writer = true;
+                                break;
+                            }
                             Ok(Err(crate::remote_api::recovery::HostRouteError::Refused(refusal))) => {
                                 if !carrier_a {
                                     local.send(&connection_id, refusal.to_string());
