@@ -872,7 +872,8 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     )
     .await
     .unwrap();
-    root["membership"] = super::recovery_plan::demote_manager(&mut f).to_stored();
+    let demoted = super::recovery_plan::demote_manager(&mut f);
+    root["membership"] = demoted.to_stored();
     sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
         .bind(&genesis)
         .bind(&root)
@@ -923,6 +924,36 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
             .await
             .unwrap()
     );
+    // The new report is correctly signed, has a larger revision and still
+    // exports three stops. One of the original three has nevertheless vanished.
+    let store = RecoveryStore::postgres(replica.clone());
+    store.configure_recovery_review(ORIGIN, 2).await.unwrap();
+    let peer = make_app(store);
+    let mint = json!({"signer":signer,"slot":slot,"expected":demoted.head().to_json(),
+        "recovery":{"generation":"2","plan_id":later["plan_id"],"candidate_feed_id":later["candidate_feed_id"],
+            "source_hash":later["source_hash"],"evidence_hash":later["evidence_hash"]}});
+    let (status, raw) = post_recovery(&peer, &format!("{base}/signer-challenges"), Some("alice"),
+        mint.to_string().into_bytes()).await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = SignerReportChallenge::parse(raw.to_string().as_bytes()).unwrap();
+    let mut other = body.clone();
+    other.record_id = uuid::Uuid::new_v4().to_string();
+    let other = build_control(&f.keys, &KeyId::new("manager"), &other).unwrap().to_json();
+    let records = [&root["delegated"][ORIGIN]["records"][1], &unresolved, &other];
+    let journal = JournalView {id:[1;16], since:1, revision:3,
+        records:records.iter().map(|r| r["body"].to_string()).collect(), drafts:vec![]};
+    let author_report = signer_report_body(&demoted, &challenge, signer, slot, ORIGIN,
+        &journal, challenge.issued_at()).unwrap();
+    let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &author_report).unwrap();
+    let payload = json!({"report":signed.to_json(),"records":records});
+    assert_eq!(post_recovery(&peer, &path, Some("alice"), payload.to_string().into_bytes()).await.0,
+        StatusCode::OK);
+    let checked = plan::prepare(&database.pool, &next, &genesis).await.unwrap();
+    let gap = &checked["known_authors"]["journal_gaps"][0];
+    assert_eq!(gap["reasons"], json!(["previous_export_missing"]));
+    assert_eq!(gap["missing_record_ids"], json!([body.record_id]));
+    assert!(checked["known_history"]["records"].as_array().unwrap().iter()
+        .any(|row| row["record_id"] == body.record_id));
     sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0")
         .execute(&database.pool)
         .await

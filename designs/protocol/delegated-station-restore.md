@@ -186,6 +186,11 @@ falls below a prior plan's observation, or its signed creation sequence
 changes. The review also flags different signed record or draft sets at the
 same journal revision, and changes to either frozen set within one plan. These
 conflicts survive later confirmations, process replacement and plan abandonment.
+A later plan's report from the same journal must still export every previously
+reported signed stop for this origin. If any are missing, `previous_export_missing`
+lists their IDs in `missing_record_ids`, even when the newer report has a higher
+revision and the same record count. The Station retains the earlier signed
+stops. Unsigned drafts may be cancelled after their plan ends.
 A new process can report the same durable journal. A new journal
 cannot account for the missing old one. An empty list describes only the
 journals observed at this Station. Participant coverage still requires the
