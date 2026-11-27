@@ -109,6 +109,41 @@ async fn exercise_inbox(origin: &str) {
     if PortalCheckpoint::built_in(binding) {
         apply_cut(true, false).await;
     }
+    let mut state = runtime.app.clone();
+    let verifier =
+        crate::account_identity::OidcVerifier::new(&issuer.issuer, origin, "astation.remote")
+            .unwrap();
+    state.accounts = std::sync::Arc::new(crate::account_store::PgAccountStore::with_verifier(
+        db.pool.clone(),
+        std::sync::Arc::new(verifier),
+    ));
+    let router = crate::station_integrations::routes_with_runtime(Some(runtime.clone()))
+        .nest("/api/remote/v1", crate::remote_api::routes())
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let call = async |method, path: &str, bearer: &str, body: Option<Value>| {
+        let mut request = client
+            .request(method, format!("{local}{path}"))
+            .bearer_auth(bearer);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let reply = request.send().await.unwrap();
+        assert_eq!(reply.headers()["cache-control"], "no-store");
+        (reply.status(), reply.json::<Value>().await.unwrap())
+    };
+    let mut native_claims = issuer.claims();
+    native_claims["aud"] = json!(origin);
+    native_claims["scope"] = json!("astation.remote");
+    let native = issuer.token(issuer.header(), native_claims);
+    let native_path = format!("/api/remote/v1/logs/{genesis}/verifier-reports");
     let make = async |number| {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let challenge = ReportChallenge::new(
@@ -120,20 +155,9 @@ async fn exercise_inbox(origin: &str) {
             now + 30_000,
         )
         .unwrap();
-        let command = Command::Create {
-            challenge: challenge.clone(),
-            expected: log.head(),
-        };
+        let body = json!({"challenge":challenge.to_json(),"expected":log.head().to_json()});
         assert_eq!(
-            store
-                .perform(
-                    &genesis,
-                    PRINCIPAL,
-                    Operation::VerifierReport {
-                        origin: binding.station_origin.clone(),
-                        command
-                    }
-                )
+            call(reqwest::Method::POST, &native_path, &native, Some(body))
                 .await
                 .0,
             StatusCode::OK
@@ -150,24 +174,15 @@ async fn exercise_inbox(origin: &str) {
     claims["exp"] = json!(claims["iat"].as_i64().unwrap() + 300);
     let raw = issuer.token(issuer.header(), claims.clone());
     let token = runtime.verifier.verify_verifier_token(&raw).await.unwrap();
-    let app = crate::station_integrations::routes_with_runtime(Some(runtime.clone()))
-        .with_state(runtime.app.clone());
+    let inbox_path = format!("/agora-build/v1/logs/{genesis}/verifier-requests");
     let http = async |bearer: &str| {
-        use tower::ServiceExt;
-        let req =
-            axum::http::Request::post(format!("/agora-build/v1/logs/{genesis}/verifier-requests"))
-                .header("Authorization", format!("Bearer {bearer}"))
-                .body(axum::body::Body::from(
-                    json!({"slot":"sdk","expected":log.head().to_json()}).to_string(),
-                ))
-                .unwrap();
-        let response = app.clone().oneshot(req).await.unwrap();
-        let status = response.status();
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        let bytes = axum::body::to_bytes(response.into_body(), 16_384)
-            .await
-            .unwrap();
-        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        call(
+            reqwest::Method::POST,
+            &inbox_path,
+            bearer,
+            Some(json!({"slot":"sdk","expected":log.head().to_json()})),
+        )
+        .await
     };
     let mut wrong_audience = claims.clone();
     wrong_audience["aud"] = json!("https://station.example");
@@ -262,36 +277,22 @@ async fn exercise_inbox(origin: &str) {
             .unwrap()
             .to_json()
     };
+    let answer_path = format!("/agora-build/v1/logs/{genesis}/verifier-reports/{answer_nonce}");
     let submit = async |report: &Value| {
-        use tower::ServiceExt;
-        let request = axum::http::Request::post(format!(
-            "/agora-build/v1/logs/{genesis}/verifier-reports/{answer_nonce}"
-        ))
-        .header("authorization", format!("Bearer {raw}"))
-        .body(axum::body::Body::from(json!({"report":report}).to_string()))
-        .unwrap();
-        let reply = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(reply.headers()["cache-control"], "no-store");
-        let status = reply.status();
-        let bytes = axum::body::to_bytes(reply.into_body(), 16384)
-            .await
-            .unwrap();
-        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        call(
+            reqwest::Method::POST,
+            &answer_path,
+            &raw,
+            Some(json!({"report":report})),
+        )
+        .await
     };
-    let native_read = async || {
-        store
-            .perform(
-                &genesis,
-                PRINCIPAL,
-                Operation::VerifierReport {
-                    origin: origin.into(),
-                    command: Command::Read {
-                        nonce: answer_nonce.clone(),
-                    },
-                },
-            )
-            .await
-    };
+    let read_path = format!("{native_path}/{answer_nonce}");
+    let native_read = async || call(reqwest::Method::GET, &read_path, &native, None).await;
+    assert_eq!(
+        call(reqwest::Method::GET, &read_path, &raw, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     let one = signed(1);
     let two = signed(2);
     assert_eq!(submit(&one).await.0, StatusCode::NOT_FOUND);
@@ -311,18 +312,15 @@ async fn exercise_inbox(origin: &str) {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert_eq!(native_read().await.1 .0["reports"], json!([]));
+    assert_eq!(native_read().await.1["reports"], json!([]));
     let accepted = (StatusCode::OK, json!({"accepted":true}));
     assert_eq!(submit(&one).await, accepted);
     assert_eq!(submit(&one).await, accepted);
-    assert_eq!(native_read().await.1 .0["reports"], json!([one]));
+    assert_eq!(native_read().await.1["reports"], json!([one]));
     assert_eq!(http(&raw).await.1["challenges"], json!([first.to_json()]));
     assert_eq!(submit(&two).await.0, StatusCode::CONFLICT);
     assert_eq!(submit(&one).await.0, StatusCode::CONFLICT);
-    let reports = native_read().await.1 .0["reports"]
-        .as_array()
-        .unwrap()
-        .clone();
+    let reports = native_read().await.1["reports"].as_array().unwrap().clone();
     assert_eq!(reports.len(), 2);
     assert!(reports.contains(&one) && reports.contains(&two));
     // Another replica can observe a pause using a rotated report credential first.
@@ -406,7 +404,8 @@ async fn exercise_inbox(origin: &str) {
         assert_eq!(http(&raw).await.0, StatusCode::NOT_FOUND);
     }
     drop(peer);
-    drop(app);
+    server.abort();
+    let _ = server.await;
     drop(runtime);
     db.cleanup().await;
 }
