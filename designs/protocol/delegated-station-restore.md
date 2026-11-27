@@ -999,8 +999,14 @@ has elapsed.
 Station retains the bodies with the review commitments. Retrying the same
 review on another replica returns the same record IDs and times. A changed
 review prepares new drafts, and a failed commit preserves the preceding ones.
-Preparation produces no signatures or reservations. Unresolved services remain
-listed in the recovery review. Final signing must recheck participant coverage,
+If Station can draft only some of the reviewed services, `service_drafts.status`
+is `partial`. The response keeps the available bodies and lists each affected
+service, key fingerprint and reason in `unresolved_services`. A service with
+a carried revoke and no outstanding action needs no new signing key. A
+`prepared` batch accounts for the actions of the membership services in this
+review. Unattributed Portal keys and evidence outside that membership still
+need reconciliation. Preparation produces no signatures or reservations.
+Final signing must recheck participant coverage,
 policy, membership and signing floors before publishing the snapshot.
 
 ### Staging revocations and interrupts
