@@ -220,6 +220,85 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     peer.configure_delegated(origin, 1).await.unwrap();
     let old_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
     let old_proxy = admit(&peer, &fixture, RouteKind::Proxy).await.unwrap();
+    // A proved room appeared after review. The old proof must be refused even
+    // when it belongs to the same owner. Add two offline rooms on a peer.
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    let mut third = owner.clone();
+    third["sub"] = json!("ab00000000000000000000000009");
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'offline-a',$4),($1,$2,$3,'offline-b',$5)")
+        .bind(&auth.issuer).bind(origin).bind(&genesis)
+        .bind(new_owner["sub"].as_str().unwrap()).bind(third["sub"].as_str().unwrap())
+        .execute(&replica).await.unwrap();
+    let (status, first_bind) = send("challenge", &intent, &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(first_bind["nonce"], issued["nonce"]);
+    assert_eq!(send("consent", &first_bind, &owner).await, refusal);
+    let mut unrelated = third.clone();
+    unrelated["sub"] = json!("ab00000000000000000000000007");
+    assert_eq!(send("consent", &first_bind, &unrelated).await, refusal);
+    let proof = sign(&first_bind);
+    let accepted = (StatusCode::OK, json!({"consented":true}));
+    let mut short_login = new_owner.clone();
+    short_login["exp"] = json!(chrono::Utc::now().timestamp() + 15);
+    assert_eq!(send("consent", &first_bind, &short_login).await, accepted);
+    assert_eq!(send("consent", &first_bind, &new_owner).await, accepted);
+    let saved: i64 = sqlx::query_scalar("SELECT expires_at FROM station_binding_room_consents")
+        .fetch_one(&replica)
+        .await
+        .unwrap();
+    assert_eq!(saved, short_login["exp"].as_i64().unwrap() * 1000);
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("consent", &first_bind, &third).await, accepted);
+    // Adding another room of an owner who already consented requires a fresh review.
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'offline-c',$4)").bind(&auth.issuer).bind(origin).bind(&genesis)
+        .bind(third["sub"].as_str().unwrap()).execute(&replica).await.unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("consent", &first_bind, &third).await, refusal);
+    let (status, final_bind) = send("challenge", &intent, &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(final_bind["nonce"], first_bind["nonce"]);
+    let proof = sign(&final_bind);
+    let mut broken = proof.clone();
+    broken["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    let (one, two) = tokio::join!(
+        send("consent", &final_bind, &new_owner),
+        send("consent", &final_bind, &third)
+    );
+    assert_eq!(one, accepted);
+    assert_eq!(two, accepted);
+    sqlx::query(
+        "UPDATE station_binding_room_consents SET expires_at=auth_time*1000
+        WHERE owner_subject=$1 AND nonce=$2",
+    )
+    .bind(third["sub"].as_str().unwrap())
+    .bind(final_bind["nonce"].as_str().unwrap())
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("consent", &final_bind, &third).await, accepted);
+    // A peer's more recent disable wins even after both owners consent.
+    sqlx::query(
+        "INSERT INTO station_delegated_availability_fences
+        (issuer,portal_origin,station_origin,account,minimum_cursor) VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(&auth.issuer)
+    .bind(&runtime.binding.portal_origin)
+    .bind(origin)
+    .bind(third["sub"].as_str().unwrap())
+    .bind(checkpoint.cursor as i64 + 1)
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    sqlx::query("DELETE FROM station_delegated_availability_fences WHERE account=$1")
+        .bind(third["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
     let hub = &runtime.app.relay;
     let relay_socket = hub.local().register(
         &old_relay.connection.conn,
@@ -257,7 +336,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         (SELECT count(*) FROM station_native_binding_transitions), (SELECT count(*) FROM station_binding_challenges)")
         .fetch_one(&replica).await.unwrap()
     };
-    assert_eq!(counts().await, (0, 1));
+    assert_eq!(counts().await, (0, 3));
     assert_eq!(*updates.borrow(), before_commit);
     hub.close_retired_binding_connections(&peer, &old_routes)
         .await;
@@ -283,8 +362,12 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     assert_eq!(send("receipt", &broken, &owner).await, refusal);
     assert_eq!(a.1["version"], 1);
     assert_eq!(a.1["account"], OWNER);
-    assert_eq!(counts().await, (1, 0));
-    assert_eq!(*updates.borrow(), before_commit + 1, "receipt retries do not fan out replica notifications");
+    assert_eq!(counts().await, (1, 2));
+    assert_eq!(
+        *updates.borrow(),
+        before_commit + 1,
+        "receipt retries do not fan out replica notifications"
+    );
     let retired: Vec<ConnRef> = sqlx::query_scalar::<_, sqlx::types::Json<Vec<ConnRef>>>(
         "SELECT retired_routes FROM station_native_binding_transitions WHERE version=1",
     )
@@ -333,7 +416,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     assert_eq!(moved.0, StatusCode::OK, "{}", moved.1);
     assert_eq!(moved.1["version"], 2);
     assert_eq!(moved.1["account"], new_owner["sub"]);
-    assert_eq!(counts().await, (2, 0));
+    assert_eq!(counts().await, (2, 2));
     assert!(!peer.prepare_delegated(&owner_route).await);
     let moved_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
     let moved_proxy = admit(&peer, &fixture, RouteKind::Proxy).await.unwrap();
@@ -405,7 +488,7 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     assert_eq!(stopped.0, StatusCode::OK, "{}", stopped.1);
     assert_eq!(stopped.1["version"], 3);
     assert_eq!(stopped.1["bindingState"], "unbound");
-    assert_eq!(counts().await, (3, 0));
+    assert_eq!(counts().await, (3, 2));
     for route in [&moved_relay, &moved_proxy] {
         assert!(!peer.prepare_delegated(route).await);
         assert_eq!(

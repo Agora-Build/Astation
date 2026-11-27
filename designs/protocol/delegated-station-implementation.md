@@ -252,9 +252,21 @@ token expiry and the challenge expiry ends that consent. A retry during that
 period preserves the original deadline. A different recipient or binding
 version requires a new review.
 
-The ownership transition still requires the new owner's manager proof (the
-current owner's for unbind), atomic nonce consumption, fresh policy and room
-checks, route invalidation and a durable Portal report.
+For the first binding of a list, the manager reviews `bind` with
+`expected_binding.state` set to `never_bound`. Station keeps a private
+digest of the rooms and their resolved owners on that nonce. Each foreign
+room owner submits the same challenge to the existing consent endpoint from
+their own native login. Consent covers that owner's rooms in the review and
+expires with the earlier of their token and the challenge. The response
+contains only `{"consented":true}`.
+
+At commit, Station locks the root and reads the room lookup again, including
+retained offline rooms. A change of room or owner requires a fresh challenge.
+Every resolved owner must still be enabled, and every required consent must
+still be valid. Conflicting ownership or an unmapped registration prevents the
+binding. The transition, nonce consumption, route retirement and Portal report
+share one transaction. The exact manager proof retrieves its original receipt
+after a lost response.
 
 ## Native client HTTP carriage
 

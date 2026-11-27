@@ -23,23 +23,6 @@ impl super::PolicyCheckpoint {
         }
         Some(owner.is_some_and(|id| view.disabled.contains(id)))
     }
-
-    /// A never-bound list still has room owners, including rooms whose last
-    /// connection has since closed. A live presence scan cannot replace them.
-    pub(crate) async fn retained_room_owner_denied(
-        &self, db: &mut sqlx::PgConnection, genesis: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let Some(view) = &self.availability else { return Ok(true) };
-        let disabled: Vec<_> = view.disabled.iter().map(String::as_str).collect();
-        sqlx::query_scalar("SELECT EXISTS (
-            SELECT 1 FROM station_proved_room_owners r
-            LEFT JOIN station_delegated_availability_fences f ON
-                (f.issuer,f.portal_origin,f.station_origin,f.account)=($1,$2,$3,r.account_subject)
-            WHERE (r.issuer,r.station_origin,r.genesis_hash)=($1,$3,$4)
-              AND (r.account_subject=ANY($5) OR f.minimum_cursor>$6))")
-            .bind(&self.binding.issuer).bind(&self.binding.portal_origin).bind(&self.binding.station_origin)
-            .bind(genesis).bind(&disabled).bind(self.cursor as i64).fetch_one(db).await
-    }
 }
 
 impl Availability {
