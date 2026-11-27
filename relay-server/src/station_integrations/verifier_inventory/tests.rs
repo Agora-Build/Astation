@@ -476,7 +476,27 @@ async fn postgres_builtin_verifier_inventories_recheck_policy_before_delivery() 
     rotated.report_client_id = "s-11234567890123456789012345".into();
     let empty = peer.load(&rotated).await.unwrap();
     let released = empty.apply(0, serde_json::from_value(release).unwrap(), now / 1000).unwrap();
-    peer.commit(&empty, &released).await.unwrap();
+    // Hold the root after each inventory transaction has taken its repeatable-read snapshot.
+    let mut root_lock = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE")
+        .bind(&genesis).execute(&mut *root_lock).await.unwrap();
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *root_lock).await.unwrap();
+    let release_during_reads = async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let readers: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))"
+                ).bind(blocker).fetch_one(&peer.0).await.unwrap();
+                if readers >= 2 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        peer.commit(&empty, &released).await.unwrap();
+        root_lock.commit().await.unwrap();
+    };
+    let (replica_read, service_read, ()) = tokio::join!(replicas(), services(), release_during_reads);
+    assert_eq!(replica_read, Err(InventoryError::Suspended));
+    assert_eq!(service_read, Err(InventoryError::Suspended));
     assert_eq!(peer.load(binding).await.unwrap(), current);
     assert_eq!(replicas().await, Err(InventoryError::Suspended));
     assert_eq!(services().await, Err(InventoryError::Suspended));
