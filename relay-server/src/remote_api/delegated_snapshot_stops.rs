@@ -119,7 +119,7 @@ pub(crate) async fn stage(
     let mut tx = pool.begin().await?;
     let (plan, log, mut review) = checkpoint(&mut tx, binding, genesis, false).await?;
     let sources = review_evidence(&mut tx, &plan, &log, binding, &mut review, false).await?;
-    if review["reconstruction_hash"] != expected {
+    if review["reconstruction_hash"] != expected || !super::covers_retained_membership(&review) {
         return Err(invalid());
     }
     let records = records_json(&sources.assemble(&log, &binding.origin, &plan)?);

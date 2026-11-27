@@ -280,7 +280,9 @@ async fn retain_checked(
             }
             continue;
         }
-        if signed.contains_key(record.record_id()) { return Err(invalid()); }
+        if !super::covers_retained_membership(&report) || signed.contains_key(record.record_id()) {
+            return Err(invalid());
+        }
         let lower = lower_bounds.entry(record.principal().name()).or_default();
         if record.issued_at() <= *lower {
             return Err(invalid());

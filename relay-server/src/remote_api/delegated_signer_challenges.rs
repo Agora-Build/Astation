@@ -86,7 +86,7 @@ pub(crate) async fn mint(
         "evidence_hash": evidence["evidence_hash"],
     }))
     .map_err(|_| invalid())?;
-    if request.recovery != recovery {
+    if request.recovery != recovery || !super::covers_retained_membership(&evidence) {
         return Err(MintError::ContextChanged);
     }
     let now: i64 =

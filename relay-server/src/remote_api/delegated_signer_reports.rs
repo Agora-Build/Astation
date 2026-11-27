@@ -89,6 +89,7 @@ pub(crate) async fn submit(
         || (evidence["evidence_hash"] != recovery.evidence_hash().to_hex()
             && external_source_hash.as_ref() != Some(&source.external_source_hash))
         || head != log.head().to_json()
+        || !super::covers_retained_membership(&evidence)
     {
         return Err(SubmitError::Changed);
     }
