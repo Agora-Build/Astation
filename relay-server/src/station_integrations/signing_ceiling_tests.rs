@@ -729,6 +729,7 @@ async fn postgres_delegated_service_drafts_retry_without_signing_or_reopening() 
     let draft = &review["service_drafts"];
     assert_eq!(draft, &b.unwrap()["service_drafts"]);
     assert_eq!(draft["status"], "prepared");
+    assert_eq!(draft["unresolved_services"], json!([]));
     let bodies: Vec<_> = draft["unsigned_bodies"].as_array().unwrap().iter()
         .map(|body| ControlBody::from_json(body).unwrap()).collect();
     assert_eq!(bodies.len(), 2);
@@ -742,6 +743,23 @@ async fn postgres_delegated_service_drafts_retry_without_signing_or_reopening() 
     assert_eq!(store.reservations(fixture.log.account_id(), &genesis).await.unwrap()[0].highest_ms, 0);
     let read = "SELECT bodies FROM station_delegated_service_drafts WHERE plan_id=$1";
     let plan_id = review["plan_id"].as_str().unwrap();
+    // The membership still requires a hold, even when a restarted replica
+    // cannot open the signing key. It must not report an empty batch as prepared.
+    let wrong_vault = crate::service_keys::ServiceKeyVault::new(&[83; 32], "other-operator").unwrap();
+    let partial = plan::prepare_with_sources(&replica, &fence, &genesis, Some(store),
+        Some(&runtime.binding), Some(&wrong_vault)).await.unwrap();
+    let missing = &partial["service_drafts"];
+    assert_eq!(missing["status"], "partial");
+    assert_eq!(missing["unresolved_services"], json!([{
+        "service_id":service,"key_fingerprint":key,"reason":"protected_key_unavailable"
+    }]));
+    assert_eq!(missing["unsigned_bodies"], json!([]));
+    assert_eq!(partial["recovery_ready"], false);
+    let restored = prepare(&primary.pool).await.unwrap();
+    let draft = &restored["service_drafts"];
+    assert_eq!(draft["status"], "prepared");
+    assert_eq!(draft["unsigned_bodies"][1]["action"], "hold");
+    assert_eq!(store.reservations(fixture.log.account_id(), &genesis).await.unwrap()[0].highest_ms, 0);
     policy("ready").await;
     sqlx::raw_sql("CREATE FUNCTION reject_draft() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN RAISE EXCEPTION 'injected failure'; END $$;
