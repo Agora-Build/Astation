@@ -73,7 +73,10 @@ impl CutProxy {
     }
 
     fn url(&self) -> String {
-        format!("redis://127.0.0.1:{}/", self.port)
+        let mut url = url::Url::parse(&test_url()).expect("valid local Redis test URL");
+        url.set_host(Some("127.0.0.1")).expect("loopback host");
+        url.set_port(Some(self.port)).expect("proxy port");
+        url.to_string()
     }
 
     fn cut(&self) {
