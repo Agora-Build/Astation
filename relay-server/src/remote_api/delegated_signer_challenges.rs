@@ -79,7 +79,7 @@ pub(crate) async fn mint(
     if request.expected != log.head() || !eligible(&log, &request.signer) {
         return Err(MintError::ContextChanged);
     }
-    review_source_evidence(&mut tx, &prepared, &log, binding, &mut evidence, false).await?;
+    let source = review_source_evidence(&mut tx, &prepared, &log, binding, &mut evidence, false).await?;
     let recovery = RecoveryPlan::from_json(&json!({
         "generation": binding.generation.to_string(), "plan_id": prepared.plan_id,
         "candidate_feed_id": prepared.candidate_feed_id, "source_hash": prepared.source_hash,
@@ -159,12 +159,13 @@ pub(crate) async fn mint(
     .map_err(|_| invalid())?
     .to_json();
     sqlx::query(
-        "INSERT INTO station_delegated_signer_challenges(plan_id,signer,slot,membership_head,challenge,expires_at) \
-         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(plan_id,signer,slot) DO UPDATE SET \
-         membership_head=EXCLUDED.membership_head,challenge=EXCLUDED.challenge,expires_at=EXCLUDED.expires_at"
+        "INSERT INTO station_delegated_signer_challenges(plan_id,signer,slot,membership_head,challenge,expires_at,external_source_hash) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(plan_id,signer,slot) DO UPDATE SET \
+         membership_head=EXCLUDED.membership_head,challenge=EXCLUDED.challenge,expires_at=EXCLUDED.expires_at,external_source_hash=EXCLUDED.external_source_hash"
     )
         .bind(&prepared.plan_id).bind(&request.signer).bind(&request.slot).bind(log.head().to_json())
-        .bind(&challenge).bind(i64::try_from(expires_at).map_err(|_| invalid())?).execute(&mut *tx).await?;
+        .bind(&challenge).bind(i64::try_from(expires_at).map_err(|_| invalid())?)
+        .bind(&source.external_source_hash).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(challenge)
 }

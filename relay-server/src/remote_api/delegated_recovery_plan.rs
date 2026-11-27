@@ -247,6 +247,7 @@ async fn review_evidence(
 }
 
 struct SignedEvidence {
+    external_source_hash: String,
     records: BTreeMap<String, Value>,
     exported_at_cut: BTreeSet<String>,
 }
@@ -276,6 +277,7 @@ async fn review_source_evidence(
     if !history.confirmation_hashes.is_empty() {
         report["author_confirmation_hash"] = source_hash(&json!(history.confirmation_hashes))?.into();
     }
+    let external_source_hash = source_hash(&sources)?;
     if !history.new_export_digests.is_empty() {
         sources["exported_records"] = json!(history.new_export_digests);
     }
@@ -284,7 +286,7 @@ async fn review_source_evidence(
         .filter(|(base, _)| base.to_hex() == evidence_hash)
         .flat_map(|(_, ids)| ids).collect();
     report["evidence_hash"] = evidence_hash.into();
-    Ok(SignedEvidence { records: history.signed, exported_at_cut })
+    Ok(SignedEvidence { external_source_hash, records: history.signed, exported_at_cut })
 }
 
 /// The fence and source stay locked until the caller commits all new evidence.

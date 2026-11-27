@@ -140,7 +140,10 @@ the reconstruction review, including drafts and journal metadata. Conflicting
 journal observations remain visible to the operator.
 
 A newly exported signed record changes the evidence hash. All authors then
-confirm the new round. The Mac keeps the held journal revision while renewing
+confirm the new round. A still-valid outstanding report for the previous round
+can arrive after another author exports a new record. Station retains the late
+response under its original challenge. A change to the checkpoint, imports or
+native archives requires a new challenge even for retention. The Mac keeps the held journal revision while renewing
 its challenge and durably advances its local checkpoint before exposing the new
 signature. Each request is bounded to 256 KiB
 and the Station retains up to 256 submissions per plan.

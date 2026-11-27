@@ -631,16 +631,17 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
         json!({"report":report.to_json(),"records":records}).to_string().into_bytes()
     };
     let initial_submission = make_submission(former, "manager", 1, vec![], &initial["evidence_hash"]).await;
-    let original_receipt = post_recovery(&app, &report_path, Some("alice"), initial_submission.clone()).await;
-    assert_eq!(original_receipt.0, StatusCode::OK);
-    let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
-    assert_eq!(first["evidence_hash"], initial["evidence_hash"]);
-    assert_ne!(first["reconstruction_hash"], initial["reconstruction_hash"]);
-    let second = make_submission(active, "replacement-manager", 1, vec![], &first["evidence_hash"]).await;
+    let second = make_submission(active, "replacement-manager", 1, vec![], &initial["evidence_hash"]).await;
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), second).await.0, StatusCode::OK);
-
+    let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
+    assert_ne!(first["evidence_hash"], initial["evidence_hash"]);
+    // The other author already approved the prior round. It can finish that
+    // outstanding request after discovery, then confirm the enlarged base.
+    let original_receipt = post_recovery(&other_app, &report_path, Some("alice"), initial_submission.clone()).await;
+    assert_eq!(original_receipt.0, StatusCode::OK);
     let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
-    assert_ne!(cut["evidence_hash"], first["evidence_hash"]);
+    assert_eq!(cut["evidence_hash"], first["evidence_hash"]);
+    assert_ne!(cut["reconstruction_hash"], first["reconstruction_hash"]);
     assert_eq!(cut["recovery_signatures"]["records"][0]["exported_at_cut"], false);
     assert!(plan::snapshot_stops::stage(&replica, &binding, &genesis,
         cut["reconstruction_hash"].as_str().unwrap()).await.is_err());
@@ -741,6 +742,14 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let after = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_eq!(after["evidence_hash"], fork["evidence_hash"]);
     assert_eq!(after["known_authors"]["journal_gaps"], fork["known_authors"]["journal_gaps"]);
+    sqlx::query("UPDATE station_delegated_signer_challenges SET expires_at=0").execute(&resumed).await.unwrap();
+    let outstanding = make_submission(former, "manager", 1, vec![], &after["evidence_hash"]).await;
+    let mut imported = replacement.clone();
+    imported.record_id = uuid::Uuid::new_v4().to_string();
+    let imported = build_control(&f.keys, &KeyId::new("replacement-manager"), &imported).unwrap();
+    let input = json!({"plan_id":plan_id,"source_hash":initial["source_hash"],"records":[imported.to_json()]});
+    plan::stops::retain(&resumed, &binding, &genesis, input.to_string().as_bytes()).await.unwrap();
+    assert_eq!(post_recovery(&other_app, &report_path, Some("alice"), outstanding).await.0, StatusCode::CONFLICT);
     assert_eq!(saved(&resumed, &genesis).await, root);
     assert!(!inspect(&resumed, ORIGIN).await.unwrap().unwrap().ready);
     database.cleanup().await;
