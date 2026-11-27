@@ -148,6 +148,9 @@ impl StationIntegrations {
         let verifier =
             OidcVerifier::new(&binding.issuer, &binding.station_origin, "astation.remote")
                 .map_err(|_| ())?;
+        if crate::integration_checkpoint::PortalCheckpoint::built_in(&binding) {
+            app.recovery.set_verifier_portal(&binding)?;
+        }
         Ok(Arc::new(Self {
             app,
             binding,
