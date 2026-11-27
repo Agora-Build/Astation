@@ -858,3 +858,63 @@ async fn postgres_bound_feed_age_starts_before_http_and_requires_a_completed_rea
     peer.0.close().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_binding_release_confirmation_requires_authoritative_settlement() {
+    use crate::remote_api::recovery::delegated_recovery::Binding as RecoveryFence;
+
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let store = PolicyStore(db.pool.clone());
+    let station = binding(true);
+    let fence = RecoveryFence::new(&station.station_origin, 1).unwrap();
+    assert!(fence.initialize(&db.pool, false).await.unwrap().ready);
+    let mut rows = Vec::new();
+    let mut releases = Vec::new();
+    for id in ["accepted", "conflict", "superseded"] {
+        let mut row = source(true)["checkpoint"]["bindings"][0].clone();
+        row["accountId"] = json!(id);
+        releases.push(release_for(&row, id));
+        rows.push(row);
+    }
+    save_release_checkpoint(&store, &station, json!(rows), Some(json!(releases))).await;
+    assert_eq!(store.apply_binding_releases(&station, &fence).await, Ok(3));
+    let restarted = PolicyStore(db.reconnect(2).await);
+    let mut rotated = station.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    for r in &mut rows { r["version"] = json!(4); }
+    rows[0]["bindingState"] = json!("released");
+    rows[2]["version"] = json!(5);
+    async fn confirmed(store: &PolicyStore) -> Vec<(String, i64)> {
+        sqlx::query_as("SELECT release_id,portal_version FROM station_applied_binding_releases
+            WHERE portal_version IS NOT NULL ORDER BY release_id").fetch_all(&store.0).await.unwrap()
+    }
+    // A pre-D27 response or a still-pending entry cannot settle a report.
+    save_release_checkpoint(&restarted, &rotated, json!(rows), None).await;
+    assert!(confirmed(&store).await.is_empty());
+    save_release_checkpoint(&restarted, &rotated, json!(rows), Some(json!(releases))).await;
+    assert!(confirmed(&store).await.is_empty());
+    let original: Vec<Value> = sqlx::query_scalar("SELECT report FROM station_applied_binding_releases ORDER BY release_id")
+        .fetch_all(&db.pool).await.unwrap();
+    // Failure while confirming rolls back the authenticated checkpoint too.
+    sqlx::query("ALTER TABLE station_applied_binding_releases ADD CONSTRAINT refuse_settlement CHECK (portal_version IS NULL)")
+        .execute(&db.pool).await.unwrap();
+    let before = restarted.load(&rotated).await.unwrap();
+    let mut cut = source(true);
+    cut["checkpoint"]["bindings"] = json!(rows);
+    cut["checkpoint"]["pendingReleases"] = json!([]);
+    let settled = before.apply_checkpoint(parse(&cut, &rotated).unwrap(), 102).unwrap();
+    assert!(restarted.commit(&before, &settled).await.is_err());
+    assert_eq!(restarted.load(&rotated).await.unwrap(), before);
+    assert!(confirmed(&store).await.is_empty());
+    sqlx::query("ALTER TABLE station_applied_binding_releases DROP CONSTRAINT refuse_settlement")
+        .execute(&db.pool).await.unwrap();
+    restarted.commit(&before, &settled).await.unwrap();
+    save_release_checkpoint(&restarted, &rotated, json!(rows), Some(json!([]))).await;
+    assert_eq!(confirmed(&store).await, [("accepted".into(), 4), ("superseded".into(), 5)]);
+    let retained: Vec<Value> = sqlx::query_scalar("SELECT report FROM station_applied_binding_releases ORDER BY release_id")
+        .fetch_all(&db.pool).await.unwrap();
+    assert_eq!(retained, original);
+    restarted.0.close().await;
+    db.cleanup().await;
+}

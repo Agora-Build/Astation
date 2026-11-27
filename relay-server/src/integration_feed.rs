@@ -705,6 +705,9 @@ impl PolicyStore {
                 &next.binding_releases
             };
             PendingRelease::retain(&mut tx, &next.binding, releases).await?;
+            if next.portal_snapshot_revision == Some(next.revision) {
+                Self::confirm_binding_releases(&mut tx, next.portal_snapshot.as_ref().ok_or(())?).await?;
+            }
             if changed_availability {
                 availability::retain_observation(&mut tx, &next.binding, next.cursor, next.availability.as_ref()).await?;
             }
