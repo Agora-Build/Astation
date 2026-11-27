@@ -23,6 +23,9 @@ const MAX_REPORTS: usize = 4;
 const MAX_BODY: usize = 16_640;
 const TOMBSTONE_MS: u64 = 30_000;
 
+#[path = "verifier_reports/external.rs"]
+pub(super) mod external;
+
 /// Check the authenticated owner of an account-private verifier operation.
 /// Mailbox callers already hold the root lock, so do not wait for a policy writer.
 pub(super) async fn portal_allows(
@@ -50,6 +53,10 @@ pub(super) struct Record {
     head: Value,
     reports: BTreeMap<String, Value>,
     closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_grant: Option<external::Grant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_external_fetch_ms: Option<u64>,
 }
 
 pub(super) enum Command {
@@ -119,6 +126,27 @@ fn reply(record: &Record) -> Reply {
     )
 }
 
+fn inbox_challenges(
+    records: &BTreeMap<String, Record>, log: &Membership, origin: &str, signer: &str,
+    slot: &str, expected: Head, now: u64, grant: Option<&external::Grant>,
+) -> Result<Vec<ReportChallenge>, Reply> {
+    ReportChallenge::new(signer, slot, origin, 1, now, now.saturating_add(1)).map_err(|_| invalid())?;
+    if log.frozen().is_some() || expected != log.head() || !active(log, signer, now) { return Err(changed()) }
+    let mut challenges = Vec::new();
+    for record in records.values() {
+        if record.closed || grant.is_some_and(|g| record.external_grant.as_ref() != Some(g) || !record.reports.is_empty()) {
+            continue;
+        }
+        let challenge = ReportChallenge::parse(record.challenge.to_string().as_bytes()).map_err(|_| changed())?;
+        if challenge.origin() == origin && challenge.signer() == signer && challenge.slot() == slot
+            && challenge.issued_at() <= now && now < challenge.expires_at() && record.head == expected.to_json()
+        {
+            challenges.push(challenge);
+        }
+    }
+    Ok(challenges)
+}
+
 pub(super) fn apply(
     records: &mut BTreeMap<String, Record>,
     log: &Membership,
@@ -136,27 +164,8 @@ pub(super) fn apply(
             slot,
             expected,
         } => {
-            // The shared builder checks the complete signer/slot grammar too.
-            ReportChallenge::new(&signer, &slot, origin, 1, now, now.saturating_add(1))
-                .map_err(|_| invalid())?;
-            if expected != log.head() || !active(log, &signer, now) {
-                return Err(changed());
-            }
-            let mut challenges = Vec::new();
-            for record in records.values() {
-                let c = ReportChallenge::parse(record.challenge.to_string().as_bytes())
-                    .map_err(|_| changed())?;
-                if !record.closed
-                    && c.origin() == origin
-                    && c.signer() == signer
-                    && c.slot() == slot
-                    && c.issued_at() <= now
-                    && now < c.expires_at()
-                    && record.head == expected.to_json()
-                {
-                    challenges.push(c.to_json());
-                }
-            }
+            let challenges = inbox_challenges(records, log, origin, &signer, &slot, expected, now, None)?
+                .into_iter().map(|c| c.to_json()).collect::<Vec<_>>();
             return Ok((StatusCode::OK, Json(json!({"challenges":challenges}))));
         }
         Command::Create {
@@ -177,6 +186,8 @@ pub(super) fn apply(
                 head: expected.to_json(),
                 reports: BTreeMap::new(),
                 closed: false,
+                external_grant: None,
+                first_external_fetch_ms: None,
             };
             if let Some(previous) = records.get(&nonce) {
                 if previous.challenge != record.challenge || previous.head != record.head {

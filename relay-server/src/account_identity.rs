@@ -487,6 +487,13 @@ impl OidcVerifier {
         service_fingerprint: Option<&str>,
     ) -> Result<VerifiedAccessToken, VerifyError> {
         let claims = self.verify_claims(token).await?;
+        if claims.client_id.starts_with("i-") && claims.r9_svc.as_deref() != service_fingerprint {
+            return Err(VerifyError::Rejected);
+        }
+        Self::station_claims(claims, scope)
+    }
+
+    fn station_claims(claims: Claims, scope: Option<&str>) -> Result<VerifiedAccessToken, VerifyError> {
         if claims.client_id.starts_with("i-")
             && (!integration_id(&claims.client_id)
                 || !claims.r9_svc.as_deref().is_some_and(|value| {
@@ -494,7 +501,6 @@ impl OidcVerifier {
                         && value
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                        && Some(value) == service_fingerprint
                 }))
         {
             return Err(VerifyError::Rejected);
@@ -534,6 +540,21 @@ impl OidcVerifier {
         let verified = self
             .verify_station(token, Some(scope), Some(service_fingerprint))
             .await?;
+        Self::service_claims(verified)
+    }
+
+    /// The external inbox compares the verified fingerprint with both Portal
+    /// and the signed membership under the account lock before returning a nonce.
+    pub(crate) async fn verify_verifier_token(&self, token: &str) -> Result<VerifiedServiceToken, VerifyError> {
+        let claims = self.verify_claims(token).await?;
+        // This credential must be addressed exclusively to this Station.
+        if matches!(&claims.aud, Audience::Many(origins) if origins.len() != 1) {
+            return Err(VerifyError::Rejected);
+        }
+        Self::service_claims(Self::station_claims(claims, Some("agent.view"))?)
+    }
+
+    fn service_claims(verified: VerifiedAccessToken) -> Result<VerifiedServiceToken, VerifyError> {
         if !integration_id(&verified.client_id) || verified.session_id.is_some() {
             return Err(VerifyError::Rejected);
         }

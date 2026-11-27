@@ -150,9 +150,7 @@ impl StationIntegrations {
         let verifier =
             OidcVerifier::new(&binding.issuer, &binding.station_origin, "astation.remote")
                 .map_err(|_| ())?;
-        if crate::integration_checkpoint::PortalCheckpoint::built_in(&binding) {
-            app.recovery.set_verifier_portal(&binding)?;
-        }
+        app.recovery.set_verifier_portal(&binding)?;
         Ok(Arc::new(Self {
             app,
             binding,
@@ -377,6 +375,10 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
             tokio::spawn(runtime.clone().run_delegated_reports());
         }
     }
+    routes_with_runtime(runtime)
+}
+
+pub(crate) fn routes_with_runtime(runtime: Option<Arc<StationIntegrations>>) -> Router<AppState> {
     Router::new()
         .route("/agora-build/v1/changes", post(nudge))
         .route("/agora-build/v1/details", get(details))
@@ -386,6 +388,7 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
         .route("/agora-build/v1/logs/:genesis/binding/commit", post(binding_challenges::commit))
         .route("/agora-build/v1/logs/:genesis/binding/transfer-consent", post(binding_challenges::consent))
         .route("/agora-build/v1/logs/:genesis/verifiers/services", post(verifier_inventory::services))
+        .route("/agora-build/v1/logs/:genesis/verifier-requests", post(verifier_inventory::external_requests))
         .route(
             "/agora-build/v1/integrations/:id/provision",
             post(provision),

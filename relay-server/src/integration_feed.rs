@@ -86,6 +86,16 @@ pub(crate) struct IntegrationPolicy {
 }
 
 impl IntegrationPolicy {
+    fn permits_external_verifier(&self, now: i64) -> bool {
+        self.r9_svc.is_some()
+            && matches!(self.state.as_str(), "provisioning" | "ready" | "waiting_for_host")
+            && self.expires_at().is_ok_and(|expiry| now < expiry)
+    }
+
+    fn same_verifier(&self, prior: &Self) -> bool {
+        self.r9_svc == prior.r9_svc && self.owner_account == prior.owner_account
+    }
+
     fn preserves_observed_lifecycle(&self, prior: &Self) -> bool {
         if self.owner_account != prior.owner_account {
             return false;
@@ -242,6 +252,9 @@ pub(crate) struct PolicyCheckpoint {
     // extend binding-based admission by their transit time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     feed_read_started_ms: Option<i64>,
+    // Revision at which each external verifier's uninterrupted grant began.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    verifier_grants: BTreeMap<String, u64>,
     pub denied: bool,
     pub integrations: BTreeMap<String, IntegrationPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +277,7 @@ impl PolicyCheckpoint {
             revision: 0,
             received_at: 0,
             feed_read_started_ms: None,
+            verifier_grants: BTreeMap::new(),
             denied: true,
             integrations: BTreeMap::new(),
             portal_snapshot: None,
@@ -288,6 +302,9 @@ impl PolicyCheckpoint {
             return Err(());
         }
         let mut next = self.clone();
+        if self.denied || (requested_cursor == 0 && self.cursor != 0) {
+            next.verifier_grants.clear();
+        }
         // An ordinary feed response cannot refresh the independently changing bindings.
         next.feed_read_started_ms = None;
         next.portal_snapshot_revision = None;
@@ -320,6 +337,20 @@ impl PolicyCheckpoint {
                 return Err(());
             }
             previous = change.id;
+            // A page can contain both pause and resume while both event rows
+            // contain the same latest integration projection.
+            match change.kind.as_str() {
+                "account_disabled" => {
+                    if let Some(owner) = change.account.as_ref().and_then(serde_json::Value::as_str) {
+                        next.verifier_grants.retain(|id, _| next.integrations.get(id)
+                            .is_some_and(|row| row.owner_account != owner));
+                    } else {
+                        next.verifier_grants.clear();
+                    }
+                }
+                "accounts_incomplete" => next.verifier_grants.clear(),
+                _ => {}
+            }
             if change.kind == "binding_released" {
                 if !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
                     return Err(());
@@ -329,6 +360,14 @@ impl PolicyCheckpoint {
             if let Some(id) = change.integration_id() {
                 if !client_id(id, "i-") {
                     return Err(());
+                }
+                let continuous = change.integration.as_ref().zip(next.integrations.get(id))
+                    .is_some_and(|(new, old)| new.same_verifier(old) && new.permits_external_verifier(now));
+                if !continuous || matches!(change.kind.as_str(), "integration_paused" | "integration_revoked" | "integration_reconciled")
+                    || change.state.as_ref().and_then(serde_json::Value::as_str)
+                        .is_some_and(|state| matches!(state, "paused" | "expired" | "revoking" | "revoked"))
+                {
+                    next.verifier_grants.remove(id);
                 }
                 match &change.integration {
                     Some(policy) => {
@@ -362,6 +401,16 @@ impl PolicyCheckpoint {
         }
         next.cursor = page.cursor;
         next.revision = next.revision.checked_add(1).ok_or(())?;
+        next.verifier_grants.retain(|id, _| next.integrations.get(id).is_some_and(|row|
+            self.integrations.get(id).is_some_and(|old| row.same_verifier(old)
+                && old.expires_at().is_ok_and(|expiry| now < expiry))));
+        for (id, row) in &next.integrations {
+            if cfg!(feature = "delegated-host-work") && row.permits_external_verifier(now) {
+                next.verifier_grants.entry(id.clone()).or_insert(next.revision);
+            } else {
+                next.verifier_grants.remove(id);
+            }
+        }
         next.received_at = now;
         next.denied = false;
         Ok(next)
@@ -412,6 +461,13 @@ impl PolicyCheckpoint {
         if snapshot.cursor != self.cursor {
             next.feed_read_started_ms = None;
         }
+        // A checkpoint can reveal a disable or changed key before ordinary polling catches up.
+        if snapshot.cursor >= self.cursor {
+            next.verifier_grants.retain(|id, _| snapshot.integrations.get(id).is_some_and(|row|
+                row.policy.permits_external_verifier(now)
+                    && self.integrations.get(id).is_some_and(|old| row.policy.same_verifier(old))
+                    && snapshot.accounts.as_ref().is_none_or(|accounts| accounts.enabled(&row.policy.owner_account))));
+        }
         next.revision = self.revision.checked_add(1).ok_or(())?;
         // Collection cannot replace live policy, refresh its lease or clear a denial.
         next.availability = snapshot.accounts.as_ref().map(|a| Availability::from_checkpoint(snapshot.cursor, a));
@@ -422,8 +478,9 @@ impl PolicyCheckpoint {
 
     pub(crate) fn record_completed_read(&mut self, started_ms: i64, ended_ms: i64) {
         if started_ms >= 0 && ended_ms >= started_ms && !self.denied
-            && self.portal_snapshot.as_ref().is_some_and(|s|
-                s.cursor <= self.cursor && s.pending_releases.is_some())
+            && self.portal_snapshot.as_ref().is_none_or(|snapshot| snapshot.cursor <= self.cursor)
+            && ((cfg!(feature = "delegated-host-work") && !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding))
+                || self.portal_snapshot.as_ref().is_some_and(|s| s.pending_releases.is_some()))
         {
             self.feed_read_started_ms = Some(started_ms);
         }
@@ -446,6 +503,24 @@ impl PolicyCheckpoint {
             s.pending_releases.is_some() && s.cursor <= self.cursor)
             && self.feed_read_started_ms.and_then(|start| now_ms.checked_sub(start))
                 .is_some_and(|age| (0..60_000).contains(&age))
+    }
+
+    pub(crate) fn external_verifier_grant(&self, id: &str, owner: &str, fingerprint: &str, now_ms: i64) -> Option<u64> {
+        let row = self.current(id, owner, now_ms / 1000).ok()?;
+        let age = now_ms.checked_sub(self.feed_read_started_ms?)?;
+        if !(0..60_000).contains(&age) || row.r9_svc.as_deref() != Some(fingerprint)
+            || !row.permits_external_verifier(now_ms / 1000)
+            || (crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) && !self.recent_d27_read(now_ms))
+        {
+            return None;
+        }
+        if let Some(cut) = self.portal_snapshot.as_ref().filter(|cut| cut.cursor == self.cursor) {
+            let observed = &cut.integrations.get(id)?.policy;
+            if !observed.same_verifier(row) || !observed.permits_external_verifier(now_ms / 1000) {
+                return None;
+            }
+        }
+        self.verifier_grants.get(id).copied()
     }
 
     pub(crate) fn allows_delegated_release(&self, owner: &str) -> bool {
@@ -719,18 +794,23 @@ impl PolicyStore {
             return Err(());
         }
         let changed_availability = next.availability != previous.availability || next.cursor != previous.cursor;
-        if (next.portal_snapshot_revision == Some(next.revision) || changed_availability || !next.binding_releases.is_empty())
-            && crate::integration_checkpoint::PortalCheckpoint::built_in(&next.binding)
-        {
+        let observed_checkpoint = next.portal_snapshot_revision == Some(next.revision);
+        let changed_feed = observed_checkpoint || changed_availability || !next.binding_releases.is_empty();
+        let built_in = crate::integration_checkpoint::PortalCheckpoint::built_in(&next.binding);
+        if changed_feed && (built_in || cfg!(feature = "delegated-host-work")) {
+            // A verifier can use a different report credential on another
+            // replica. Order its challenge delivery with this observation.
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 29))")
                 .bind(next.binding.report_control_binding()).execute(&mut *tx).await.map_err(|_| ())?;
-            let releases = if next.portal_snapshot_revision == Some(next.revision) {
+        }
+        if changed_feed && built_in {
+            let releases = if observed_checkpoint {
                 next.portal_snapshot.as_ref().and_then(|s| s.pending_releases.as_deref()).unwrap_or_default()
             } else {
                 &next.binding_releases
             };
             PendingRelease::retain(&mut tx, &next.binding, releases).await?;
-            if next.portal_snapshot_revision == Some(next.revision) {
+            if observed_checkpoint {
                 Self::confirm_binding_releases(&mut tx, next.portal_snapshot.as_ref().ok_or(())?).await?;
             }
             if changed_availability {
@@ -768,6 +848,24 @@ mod tests {
         serde_json::from_value(json!({"changes":[{"id":id,"integrationId":ID,
             "kind":"future_kind","state":"ready","integration":policy(state)}],"cursor":id}))
         .unwrap()
+    }
+    #[cfg(feature = "delegated-host-work")]
+    #[test]
+    fn external_verifier_keeps_its_nonce_across_an_unrelated_integrations_pause() {
+        let before = PolicyCheckpoint::empty(binding()).unwrap().apply(0, initial(), 1).unwrap();
+        let revision = before.verifier_grants[ID];
+        let mut own = policy("ready");
+        own["id"] = json!(ID);
+        let peer = "i-11234567890123456789012345";
+        let mut paused = policy("paused");
+        paused["id"] = json!(peer);
+        let changes = json!({"cursor":1, "integrations":[own, paused], "changes":[{
+            "id":1, "integrationId":peer, "kind":"integration_paused",
+            "state":"paused", "integration":paused
+        }]});
+        let after = before.apply(0, serde_json::from_value(changes).unwrap(), 2).unwrap();
+        assert_eq!(after.verifier_grants.get(ID), Some(&revision));
+        assert!(!after.verifier_grants.contains_key(peer));
     }
     #[test]
     fn host_work_scopes_require_view_and_notify_prerequisites() {
