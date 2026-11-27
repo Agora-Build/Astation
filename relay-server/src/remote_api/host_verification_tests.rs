@@ -405,7 +405,9 @@ async fn postgres_completion(delegated: bool) {
         RecoveryStore::postgres(second_pool.clone()),
     ] {
         if delegated {
-            store.configure_delegated("https://station-dev.agora.build", 1).await.unwrap();
+            let origin = "https://station-dev.agora.build";
+            store.configure_delegated(origin, 1).await.unwrap();
+            crate::station_integrations::tests::attach_test_room_owner(&store, origin).await;
         }
         let cluster = crate::start_redis_replica(
             &test_support::test_url(),

@@ -144,6 +144,7 @@ async fn postgres_delegated_recovery_rejects_lost_stops_reservations_and_stale_r
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let old = RecoveryStore::postgres(database.pool.clone());
     old.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&old, ORIGIN).await;
     let f = fixture();
     f.publish(&old).await;
     let genesis = f.log.genesis_hash().to_hex();
@@ -426,6 +427,7 @@ async fn postgres_delegated_recovery_fence_waits_for_the_write_boundary_and_surv
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 6).await;
     let store = RecoveryStore::postgres(database.pool.clone());
     store.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&store, ORIGIN).await;
     let f = fixture();
     f.publish(&store).await;
     let binding = admit(&store, &f, "write-boundary").await;
@@ -574,6 +576,7 @@ async fn postgres_delegated_replacement_feed_requires_new_relay_and_proxy_proofs
     let legacy = admit(&store, &f, "before-delegated").await;
     assert!(saved(&database.pool, &genesis).await["routes"]["host-a"].get("delegated_feed").is_none());
     store.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&store, ORIGIN).await;
     assert!(!store.prepare_delegated(&legacy).await);
     assert!(store.with_host_route(&legacy, || std::future::ready(())).await.is_some());
 
@@ -581,6 +584,7 @@ async fn postgres_delegated_replacement_feed_requires_new_relay_and_proxy_proofs
     let old_proxy = admit_proxy(&store, &f, "old-proxy").await;
     let replica = RecoveryStore::postgres(database.reconnect(2).await);
     replica.configure_delegated(ORIGIN, 1).await.unwrap();
+    crate::station_integrations::tests::attach_test_room_owner(&replica, ORIGIN).await;
     assert!(replica.prepare_delegated(&old_relay).await);
     assert!(replica.prepare_delegated(&old_proxy).await);
 

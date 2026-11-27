@@ -12,6 +12,8 @@ use atem_client::{
 };
 use sqlx::PgConnection;
 
+mod transaction;
+
 struct Intent {
     action: BindingAction,
     account: String,
@@ -55,9 +57,19 @@ pub(super) async fn consent(
     handle(state, path, headers, body, Operation::Consent).await
 }
 
+pub(super) async fn commit(
+    state: State<IntegrationState>,
+    path: Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    handle(state, path, headers, body, Operation::Commit).await
+}
+
 enum Operation {
     Mint,
     Consent,
+    Commit,
 }
 
 async fn handle(
@@ -90,7 +102,12 @@ async fn handle(
     let Ok(genesis) = Hash32::from_hex(&genesis) else {
         return invalid();
     };
-    let Ok(bytes) = axum::body::to_bytes(body, 4096).await else {
+    let limit = if matches!(operation, Operation::Commit) {
+        16_384
+    } else {
+        4096
+    };
+    let Ok(bytes) = axum::body::to_bytes(body, limit).await else {
         return invalid();
     };
     let Ok(mut tx) = runtime.policies.0.begin().await else {
@@ -105,6 +122,9 @@ async fn handle(
         return unavailable();
     }
     let result = match operation {
+        Operation::Commit => {
+            transaction::apply(&mut tx, &runtime.binding, &token, genesis, &bytes).await
+        }
         Operation::Mint => {
             let Some(intent) = Intent::parse(&bytes) else {
                 return invalid();
@@ -126,6 +146,12 @@ async fn handle(
         Ok(None) => error(StatusCode::CONFLICT, "binding_unavailable"),
         Err(_) => unavailable(),
     }
+}
+
+async fn binding_clock_ms(db: &mut PgConnection) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+        .fetch_one(db)
+        .await
 }
 
 async fn issue(
@@ -160,10 +186,7 @@ async fn issue(
         .bind(json!([station.issuer, station.station_origin]).to_string())
         .execute(&mut *db)
         .await?;
-    let now: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
-            .fetch_one(&mut *db)
-            .await?;
+    let now = binding_clock_ms(db).await?;
     let until = token
         .expires_at
         .saturating_mul(1000)
@@ -247,23 +270,20 @@ async fn review_intent(
     subject: &str,
 ) -> Result<Option<(Membership, crate::integration_feed::PolicyCheckpoint)>, sqlx::Error> {
     let invalid = || sqlx::Error::Protocol("binding authority unavailable".into());
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT checkpoint FROM station_integration_policy WHERE binding=$1 FOR SHARE",
-    )
-    .bind(station.storage_key().map_err(|_| invalid())?)
-    .fetch_optional(&mut *db)
-    .await?;
-    let policy = PolicyStore::decode_checkpoint(station, row).map_err(|_| invalid())?;
-    let Some(snapshot) = policy.portal_snapshot.as_ref() else {
+    let policy = PolicyStore::lock_for_binding(db,station).await.map_err(|_| invalid())?;
+    if policy
+        .portal_snapshot
+        .as_ref()
+        .and_then(|s| s.bindings.as_ref())
+        .is_none()
+    {
         return Ok(None);
-    };
-    let Some(bindings) = &snapshot.bindings else {
-        return Ok(None);
-    };
+    }
     let genesis_hex = genesis.to_hex();
-    let current = bindings
-        .iter()
-        .find(|b| b.genesis_hash == genesis_hex && b.account_id == intent.account);
+    let current = policy
+        .effective_binding(db, &intent.account, &genesis_hex)
+        .await?;
+    let current = current.as_ref();
     let expected = match current {
         Some(row) => {
             json!({"state":row.binding_state,"version":row.version,"binding_id":row.binding_id,"owner":row.account})
@@ -273,11 +293,6 @@ async fn review_intent(
     if expected != intent.expected.to_json() || !policy.allows_delegated_release(subject) {
         return Ok(None);
     }
-    // Order policy observations across credentials through the challenge commit.
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1,29))")
-        .bind(station.report_control_binding())
-        .execute(&mut *db)
-        .await?;
     if policy
         .has_competing_binding(db, &intent.account, &genesis_hex, current)
         .await
@@ -367,10 +382,7 @@ async fn record_consent(
         return Ok(None);
     }
     // Read time after all blocking locks. Consent ends at the earlier login or nonce deadline.
-    let now: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
-            .fetch_one(&mut *db)
-            .await?;
+    let now = binding_clock_ms(db).await?;
     let expires = token
         .expires_at
         .saturating_mul(1000)

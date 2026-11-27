@@ -179,6 +179,7 @@ mod tests {
         let database = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
         let store = RecoveryStore::postgres(database.pool.clone());
         store.configure_delegated(ORIGIN, 1).await.unwrap();
+        crate::station_integrations::tests::attach_test_room_owner(&store, ORIGIN).await;
         let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         f.publish(&store).await;
         let hub = RelayHub::new();

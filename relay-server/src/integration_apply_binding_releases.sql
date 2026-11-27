@@ -20,6 +20,12 @@ WITH candidates AS (
           AND ((other->>'version')::bigint > r.version
             OR ((other->>'version')::bigint=r.version AND other <> r.binding))
     ) AND NOT EXISTS (
+        SELECT 1 FROM station_native_binding_transitions n
+        WHERE (n.issuer,n.portal_origin,n.station_origin,n.account_id,n.genesis)=
+              (r.issuer,r.portal_origin,r.station_origin,r.account_id,r.genesis)
+          AND (n.version > r.version OR
+              (n.version=r.version AND (n.report - 'state' - 'reportId') <> r.binding))
+    ) AND NOT EXISTS (
         SELECT 1 FROM station_applied_binding_releases a
         WHERE (a.issuer,a.portal_origin,a.station_origin,a.account_id,a.genesis)=
               (r.issuer,r.portal_origin,r.station_origin,r.account_id,r.genesis)

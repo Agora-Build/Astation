@@ -149,6 +149,7 @@ async fn has_delegated_history(
     let retained: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM station_delegated_reporting)
              OR EXISTS (SELECT 1 FROM station_applied_binding_releases)
+             OR EXISTS (SELECT 1 FROM station_native_binding_transitions)
              OR EXISTS (SELECT 1 FROM station_verifier_rosters)
              OR EXISTS (SELECT 1 FROM station_integration_policy WHERE recovery_generation IS NOT NULL)
              OR EXISTS (SELECT 1 FROM remote_recovery_roots WHERE state->'delegated' <> '{}'::jsonb)",

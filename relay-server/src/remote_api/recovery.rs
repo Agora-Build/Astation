@@ -366,7 +366,7 @@ impl RecoveryStore {
     pub(crate) async fn with_delegated_route<T, F, Fut>(&self, binding: &HostBinding, action: F) -> Option<T>
     where F: FnOnce() -> Fut, Fut: std::future::Future<Output = T> {
         let origin = self.delegated_origin.get()?;
-        self.with_root(&binding.genesis, |root, log| delegated::current_link(root, log, origin, binding),
+        self.with_root(&binding.genesis, &binding.room, |root, log| delegated::current_link(root, log, origin, binding),
             |_, _| action()).await
     }
 
@@ -378,7 +378,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         let origin = self.delegated_origin.get()?;
-        self.with_root(&binding.genesis,
+        self.with_root(&binding.genesis, &binding.room,
             |root, log| delegated::current_link(root, log, origin, binding),
             |root, log| {
                 let response = match call {
@@ -484,7 +484,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| root.current(binding) && binding.valid(log),
             |_, _| action(),
         )
@@ -502,7 +502,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &route.genesis,
+            &route.genesis, &route.room,
             |root, log| {
                 // A socket that once proved its identity cannot become an
                 // unproved owner-present route when that proof is invalidated.
@@ -529,7 +529,7 @@ impl RecoveryStore {
         generation: u64,
     ) -> Option<VerificationAuthority> {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| {
                 root.current(binding)
                     && binding.valid(log)
@@ -568,7 +568,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| {
                 let manager_current = log.member(&binding.room).is_some_and(|m| {
                     m.status == MemberStatus::Active
@@ -602,7 +602,7 @@ impl RecoveryStore {
         ).await
     }
 
-    async fn with_root<T, P, F, Fut>(&self, genesis: &str, predicate: P, action: F) -> Option<T>
+    async fn with_root<T, P, F, Fut>(&self, genesis: &str, room: &str, predicate: P, action: F) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
         F: FnOnce(&Root, &Membership) -> Fut,
@@ -610,7 +610,7 @@ impl RecoveryStore {
     {
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            self.with_root_inner(genesis, predicate, action),
+            self.with_root_inner(genesis, room, predicate, action),
         )
         .await
         .ok()
@@ -620,6 +620,7 @@ impl RecoveryStore {
     async fn with_root_inner<T, P, F, Fut>(
         &self,
         genesis: &str,
+        room: &str,
         predicate: P,
         action: F,
     ) -> Option<T>
@@ -653,17 +654,49 @@ impl RecoveryStore {
             .execute(&mut *tx)
             .await
             .ok()?;
-        let saved: Option<(Value,)> = sqlx::query_as(
-            "SELECT state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE",
+        let saved: Option<(String,Value)> = sqlx::query_as(
+            "SELECT account_subject,state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE",
         )
         .bind(genesis)
         .fetch_optional(&mut *tx)
         .await
         .ok()?;
-        let root: Root = serde_json::from_value(saved?.0).ok()?;
+        let (principal,state) = saved?;
+        let root: Root = serde_json::from_value(state).ok()?;
         let log = valid(&root)?;
+        if !self.route_service_allowed(&mut tx,&principal,&root.account,genesis,room).await.ok()? {
+            return None;
+        }
         // No state changes: dropping the read transaction releases its locks.
         Some(action(&root, &log).await)
+    }
+
+    async fn route_service_allowed(
+        &self,
+        db: &mut sqlx::PgConnection,
+        principal: &str,
+        account: &str,
+        genesis: &str,
+        room: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let Some(origin) = self
+            .delegated_origin
+            .get()
+            .filter(|s| crate::account_identity::built_in_station(s))
+        else {
+            return Ok(true);
+        };
+        let Some(station) = self
+            .verifier_portal
+            .get()
+            .filter(|s| &s.station_origin == origin)
+        else {
+            return Ok(false);
+        };
+        delegated_recovery::route_ownership::may_serve(
+            db, station, principal, account, genesis, room,
+        )
+        .await
     }
 
     pub fn disabled() -> Arc<Self> {
@@ -874,6 +907,11 @@ impl RecoveryStore {
                 }
             }
         }
+        let admitted_room = match &operation {
+            Operation::HostRoute { room, .. } => Some(room.clone()),
+            Operation::Delegated { binding: Some(binding), .. } => Some(binding.room.clone()),
+            _ => None,
+        };
         let proved_room = match (&operation, self.room_ownership.as_ref()) {
             (Operation::HostRoute { room, proxy, .. }, Some(scope)) => Some((scope, room.clone(), proxy.is_some())),
             _ => None,
@@ -882,6 +920,11 @@ impl RecoveryStore {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
+        if let Some(room) = admitted_room {
+            if !self.route_service_allowed(connection,&owner,&root.account,genesis,&room).await? {
+                return Ok(error(StatusCode::SERVICE_UNAVAILABLE, "service_suspended"));
+            }
+        }
         if let Some(((origin, issuer), room, proxy)) = proved_room {
             let routes = if proxy { &root.proxies } else { &root.routes };
             let binding = reply.1.0["binding"]["host"].as_str().and_then(|host| routes.get(host))
