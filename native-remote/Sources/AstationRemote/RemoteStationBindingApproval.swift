@@ -15,13 +15,18 @@ public struct RemoteStationBindingReceipt: Codable, Equatable, Sendable {
     }
 }
 
-public enum RemoteStationBindingError: LocalizedError {
+public enum RemoteStationBindingError: LocalizedError, Equatable {
     case expiredWithoutCommit, consentExpired, awaitingReceipt
+    case featureUnavailable, requestRefused, stationBusy, stationUnavailable
     public var errorDescription: String? {
         switch self {
         case .expiredWithoutCommit: return "The previous approval expired before Station applied it. Review the ownership change again."
         case .consentExpired: return "This ownership request expired. Ask the manager to start a new request."
         case .awaitingReceipt: return "Station has not confirmed the outcome. Check the previous request again."
+        case .featureUnavailable: return "Delegated host work is disabled on the selected Station. Ownership requests will be available when it is enabled."
+        case .requestRefused: return "Station could not accept this ownership request. Check the current ownership and review the request again."
+        case .stationBusy: return "Station is busy. Try the ownership request again shortly."
+        case .stationUnavailable: return "The selected Station is unavailable. Try again when it is reachable."
         }
     }
 }
@@ -103,7 +108,7 @@ public struct RemoteStationBindingApproval {
             "account_id": anchor.accountID, "head": ["seq": head.seq, "hash": head.hash] as [String: Any],
             "signer": manager, "expected_binding": Self.wire(previous)])
         let (bytes, status) = try await http.send(call)
-        guard status == 200 else { throw Self.error(for: status) }
+        guard status == 200 else { throw Self.error(for: status, body: bytes) }
         guard bytes.count <= 4096, let wire = String(data: bytes, encoding: .utf8) else {
             throw AccountLoginError.invalidResponse
         }
@@ -155,7 +160,7 @@ public struct RemoteStationBindingApproval {
         call.setValue("Bearer " + session.accessToken, forHTTPHeaderField: "Authorization")
         let (data, status) = try await http.send(call)
         try checkLogin()
-        guard status == 200 else { throw Self.error(for: status) }
+        guard status == 200 else { throw Self.error(for: status, body: data) }
         guard data.count <= 8192, let text = String(data: data, encoding: .utf8),
               let envelope = try JSONSerialization.jsonObject(with: Data(canonicalJson(json: text).utf8)) as? [String: Any],
               envelope.count == 1, let request = envelope["request"] else { throw AccountLoginError.invalidResponse }
@@ -184,7 +189,7 @@ public struct RemoteStationBindingApproval {
         call.httpBody = body
         let (reply, code) = try await http.send(call)
         try checkLogin()
-        guard code == 200 else { throw Self.error(for: code) }
+        guard code == 200 else { throw Self.error(for: code, body: reply) }
         guard reply.count <= 4096,
               try canonicalJson(json: String(decoding: reply, as: UTF8.self)) == #"{"consented":true}"# else {
             throw AccountLoginError.invalidResponse
@@ -192,10 +197,15 @@ public struct RemoteStationBindingApproval {
         return .recorded
     }
 
-    private static func error(for status: Int) -> AccountLoginError {
-        if status == 401 { return .signInRequired }
-        if [403, 404, 409].contains(status) { return .changed }
-        return .unavailable
+    private static func error(for status: Int, body: Data) -> Error {
+        if status == 401 { return AccountLoginError.signInRequired }
+        let reply = body.count <= 4096 ? try? canonicalJson(json: String(decoding: body, as: UTF8.self)) : nil
+        switch (status, reply) {
+        case (503, #"{"error":{"code":"host_work_not_verified"}}"#): return RemoteStationBindingError.featureUnavailable
+        case (409, #"{"error":{"code":"binding_unavailable"}}"#): return RemoteStationBindingError.requestRefused
+        case (429, #"{"error":{"code":"binding_busy"}}"#): return RemoteStationBindingError.stationBusy
+        default: return RemoteStationBindingError.stationUnavailable
+        }
     }
 
     /// Retry a protected, previously approved proof verbatim. The Station can return
@@ -241,7 +251,7 @@ public struct RemoteStationBindingApproval {
             if inspecting && status == 410 && (try? canonicalJson(json: String(decoding: reply, as: UTF8.self))) == #"{"error":{"code":"binding_proof_expired"}}"# {
                 throw RemoteStationBindingError.expiredWithoutCommit
             }
-            guard status == 202 else { throw Self.error(for: status) }
+            guard status == 202 else { throw Self.error(for: status, body: reply) }
             let response = try canonicalJson(json: String(decoding: reply, as: UTF8.self))
             if inspecting {
                 guard response == #"{"pending":true}"#, originalSession() else { throw AccountLoginError.changed }

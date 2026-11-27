@@ -398,6 +398,32 @@ final class RemotePublishedSDKTests: XCTestCase {
         XCTAssertTrue(calls.allSatisfy { $0.httpBody == Data(proof.utf8) })
     }
 
+    @MainActor
+    func testOwnershipRefusalsIdentifyTheStationWithoutAskingForAnotherLogin() async throws {
+        let origin = "https://station-dev.agora.build"
+        let configuration = try AccountOIDCConfiguration(issuer: "https://auth.dev.agora.build", clientID: "astation",
+            resource: origin, requiredScope: "astation.remote")
+        let session = AccountLoginSession(configuration: configuration, subject: "owner", accessToken: "test-token",
+            refreshToken: "", expiresAt: .distantFuture, authenticatedAt: 0)
+        let cases: [(Int, String, RemoteStationBindingError)] = [
+            (503, #"{"error":{"code":"host_work_not_verified"}}"#, .featureUnavailable),
+            (409, #"{"error":{"code":"binding_unavailable"}}"#, .requestRefused),
+            (429, #"{"error":{"code":"binding_busy"}}"#, .stationBusy),
+            (503, "<html>Temporary outage</html>", .stationUnavailable),
+            (503, #"{"error":{"code":"host_work_not_verified","account":"unexpected"}}"#, .stationUnavailable)
+        ]
+        for (status, body, expected) in cases {
+            let http = BindingReceiptHTTP([(Data(body.utf8), status)])
+            let client = try RemoteStationBindingApproval(origin: origin, http: http)
+            do {
+                _ = try await client.reviewConsent(session: session, now: { 1000 }, current: { true }) { _ in
+                    XCTFail("A refused request cannot be confirmed"); return false
+                }
+                XCTFail("Expected refusal")
+            } catch { XCTAssertEqual(error as? RemoteStationBindingError, expected) }
+        }
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {
