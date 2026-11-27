@@ -147,12 +147,16 @@ impl Fixture {
         .unwrap()
     }
     pub async fn publish(&self, store: &RecoveryStore) {
+        self.publish_for(store, "alice").await;
+    }
+
+    pub(crate) async fn publish_for(&self, store: &RecoveryStore, principal: &str) {
         for entry in self.log.entries() {
             assert_eq!(
                 store
                     .perform(
                         &self.log.genesis_hash().to_hex(),
-                        "alice",
+                        principal,
                         Operation::Append {
                             entry: entry.clone(),
                             expected: Head {

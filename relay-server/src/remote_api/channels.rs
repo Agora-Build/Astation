@@ -34,6 +34,8 @@ pub(crate) struct Envelope<'a> {
 }
 
 impl<'a> Envelope<'a> {
+    pub(crate) fn event(&self) -> &str { &self.event }
+
     pub(crate) fn parse(text: &'a str) -> Option<Self> {
         if text.len() > MAX_BYTES {
             return None;
@@ -421,11 +423,11 @@ async fn serve(
         }
     }
     if let Some(binding) = binding.as_ref().filter(|_| recovery.delegated_enabled()) {
-        if recovery.host_suspension(binding).await.is_some() {
-            guard.notify_host = false;
+        let suspended = recovery.with_host_suspension(binding, |_| async {
             let close = json!({"type":"channel","event":"close","channel":open.channel,"reason":"service_suspended"});
             let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Text(close.to_string()))).await;
-        }
+        }).await;
+        if suspended.is_some() { guard.notify_host = false; }
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
 }
