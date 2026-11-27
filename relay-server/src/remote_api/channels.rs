@@ -396,7 +396,9 @@ async fn serve(
                 let sent = if let Some(binding) = &binding {
                     matches!(recovery.with_host_route(binding, write).await, Some(Ok(Ok(()))))
                 } else if let Some(route) = &owner_route {
-                    matches!(recovery.with_owner_route(route, None, write).await, Some(Ok(Ok(()))))
+                    recovery.with_owner_route(route, None, || async {
+                        hub.owner_route_current(route).await && matches!(write().await, Ok(Ok(())))
+                    }).await == Some(true)
                 } else {
                     false
                 };
