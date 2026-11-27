@@ -101,6 +101,10 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
             post(super::super::consent),
         )
         .route("/logs/:genesis/binding/commit", post(super::super::commit))
+        .route(
+            "/logs/:genesis/binding/receipt",
+            post(super::super::receipt),
+        )
         .with_state(IntegrationState(Some(runtime.clone())));
     let send = async |path: &str, body: &Value, claims: &Value| {
         let access = auth.token(auth.header(), claims.clone());
@@ -156,6 +160,43 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
         .unwrap();
     let (status, issued) = send("challenge", &intent, &owner).await;
     assert_eq!(status, StatusCode::OK);
+    let source = StationBindingChallenge::parse(issued.to_string().as_bytes()).unwrap();
+    let short = StationBindingChallenge::new(
+        source.action(),
+        origin,
+        source.claims(),
+        account,
+        source.genesis_hash(),
+        source.head(),
+        source.signer(),
+        source.expected_binding().clone(),
+        source.issued_at(),
+        source.issued_at() + 50,
+    )
+    .unwrap();
+    let nonce = atem_client::encoding::b64u(short.nonce());
+    sqlx::query("INSERT INTO station_binding_challenges(issuer,station_origin,subject,nonce,challenge,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6)").bind(&auth.issuer).bind(origin).bind(OWNER).bind(&nonce)
+        .bind(short.jcs()).bind(short.expires_at() as i64).execute(&db.pool).await.unwrap();
+    let short_proof = sign(&short.to_json());
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        send("receipt", &short_proof, &owner).await,
+        (
+            StatusCode::GONE,
+            json!({"error":{"code":"binding_proof_expired"}})
+        )
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM station_binding_challenges WHERE nonce=$1"
+        )
+        .bind(&nonce)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0
+    );
     let proof = sign(&issued);
     let refusal = (
         StatusCode::CONFLICT,
@@ -165,6 +206,11 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     let mut other_login = owner.clone();
     other_login["auth_time"] = json!(owner["auth_time"].as_i64().unwrap() - 1);
     assert_eq!(send("commit", &proof, &other_login).await, refusal);
+    assert_eq!(
+        send("receipt", &proof, &other_login).await,
+        (StatusCode::ACCEPTED, json!({"pending":true}))
+    );
+    assert_eq!(send("receipt", &proof, &new_owner).await, refusal);
     let mut broken = proof.clone();
     broken["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
     assert_eq!(send("commit", &broken, &owner).await, refusal);
@@ -202,6 +248,9 @@ async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_
     );
     assert_eq!(a.0, StatusCode::OK, "{}", a.1);
     assert_eq!(a, b);
+    assert_eq!(send("receipt", &proof, &other_login).await, a);
+    assert_eq!(send("commit", &proof, &other_login).await, refusal);
+    assert_eq!(send("receipt", &broken, &owner).await, refusal);
     assert_eq!(a.1["version"], 1);
     assert_eq!(a.1["account"], OWNER);
     assert_eq!(counts().await, (1, 0));

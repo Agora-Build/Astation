@@ -66,10 +66,20 @@ pub(super) async fn commit(
     handle(state, path, headers, body, Operation::Commit).await
 }
 
+pub(super) async fn receipt(
+    state: State<IntegrationState>,
+    path: Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    handle(state, path, headers, body, Operation::Receipt).await
+}
+
 enum Operation {
     Mint,
     Consent,
     Commit,
+    Receipt,
 }
 
 async fn handle(
@@ -102,7 +112,7 @@ async fn handle(
     let Ok(genesis) = Hash32::from_hex(&genesis) else {
         return invalid();
     };
-    let limit = if matches!(operation, Operation::Commit) {
+    let limit = if matches!(operation, Operation::Commit | Operation::Receipt) {
         16_384
     } else {
         4096
@@ -122,8 +132,30 @@ async fn handle(
         return unavailable();
     }
     let result = match operation {
-        Operation::Commit => {
-            transaction::apply(&mut tx, &runtime.binding, &token, genesis, &bytes).await
+        Operation::Commit | Operation::Receipt => {
+            match transaction::submit(
+                &mut tx,
+                &runtime.binding,
+                &token,
+                genesis,
+                &bytes,
+                matches!(operation, Operation::Receipt),
+            )
+            .await
+            {
+                Ok(transaction::Submission::Confirmed(receipt)) => Ok(Some(receipt)),
+                Ok(transaction::Submission::Refused) => Ok(None),
+                Ok(transaction::Submission::Outstanding) => {
+                    return (StatusCode::ACCEPTED, Json(json!({"pending":true}))).into_response()
+                }
+                Ok(transaction::Submission::Expired) => {
+                    if tx.commit().await.is_err() {
+                        return unavailable();
+                    }
+                    return error(StatusCode::GONE, "binding_proof_expired");
+                }
+                Err(error) => Err(error),
+            }
         }
         Operation::Mint => {
             let Some(intent) = Intent::parse(&bytes) else {
@@ -270,7 +302,9 @@ async fn review_intent(
     subject: &str,
 ) -> Result<Option<(Membership, crate::integration_feed::PolicyCheckpoint)>, sqlx::Error> {
     let invalid = || sqlx::Error::Protocol("binding authority unavailable".into());
-    let policy = PolicyStore::lock_for_binding(db,station).await.map_err(|_| invalid())?;
+    let policy = PolicyStore::lock_for_binding(db, station)
+        .await
+        .map_err(|_| invalid())?;
     if policy
         .portal_snapshot
         .as_ref()

@@ -2,38 +2,39 @@
 use super::*;
 use atem_client::{canonical::jcs, station_binding::verify_station_binding};
 
-pub(super) async fn apply(
+/// The exact proof identifies its durable receipt. A renewed login for the same
+/// account may inspect a receipt, but only the original auth_time may change ownership.
+pub(super) async fn submit(
     db: &mut PgConnection,
     station: &FeedBinding,
     token: &VerifiedAccessToken,
     genesis: Hash32,
     bytes: &[u8],
-) -> Result<Option<Value>, sqlx::Error> {
+    inspect_only: bool,
+) -> Result<Submission, sqlx::Error> {
     let Ok(proof) = StrictValue::parse(bytes, 16_384) else {
-        return Ok(None);
+        return Ok(Submission::Refused);
     };
     let Ok(challenge) =
         StationBindingChallenge::parse(proof.value()["body"].to_string().as_bytes())
     else {
-        return Ok(None);
+        return Ok(Submission::Refused);
     };
     if genesis != challenge.genesis_hash()
         || challenge.origin() != station.station_origin
         || token.identity.issuer != station.issuer
         || challenge.issuer() != station.issuer
         || challenge.subject() != token.identity.subject
-        || token.identity.authenticated_at != Some(challenge.auth_time() as i64)
+        || (!inspect_only && token.identity.authenticated_at != Some(challenge.auth_time() as i64))
     {
-        return Ok(None);
+        return Ok(Submission::Refused);
     }
     let Ok(canonical) = jcs(proof.value()) else {
-        return Ok(None);
+        return Ok(Submission::Refused);
     };
     let proof_hash = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
     let nonce = atem_client::encoding::b64u(challenge.nonce());
     let genesis_hex = genesis.to_hex();
-
-    // Two replicas may receive the same proof, or different nonces naming the same predecessor.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,38))")
         .bind(json!([station.issuer, station.station_origin, genesis_hex]).to_string())
         .execute(&mut *db)
@@ -48,11 +49,74 @@ pub(super) async fn apply(
     .bind(&nonce)
     .fetch_optional(&mut *db)
     .await?;
-    if let Some((hash, receipt)) = replay {
-        return Ok((hash.as_slice() == proof_hash.as_ref()
-            && token.expires_at.saturating_mul(1000) > binding_clock_ms(db).await?)
-            .then_some(receipt));
+    let now = binding_clock_ms(db).await?;
+    if now < 0 || token.expires_at.saturating_mul(1000) <= now {
+        return Ok(Submission::Refused);
     }
+    if let Some((hash, receipt)) = replay {
+        return Ok(if hash.as_slice() == proof_hash.as_ref() {
+            Submission::Confirmed(receipt)
+        } else {
+            Submission::Refused
+        });
+    }
+    if inspect_only {
+        return Ok(if now as u64 >= challenge.expires_at() {
+            // A negative receipt stays final across a subsequent clock correction.
+            sqlx::query(
+                "DELETE FROM station_binding_challenges WHERE issuer=$1 AND station_origin=$2
+                AND nonce=$3 AND subject=$4 AND challenge=$5 AND expires_at<=$6",
+            )
+            .bind(&station.issuer)
+            .bind(&station.station_origin)
+            .bind(&nonce)
+            .bind(challenge.subject())
+            .bind(challenge.jcs())
+            .bind(now)
+            .execute(&mut *db)
+            .await?;
+            Submission::Expired
+        } else {
+            Submission::Outstanding
+        });
+    }
+    Ok(
+        match apply(
+            db,
+            station,
+            token,
+            genesis,
+            bytes,
+            &challenge,
+            &nonce,
+            proof_hash.as_ref(),
+        )
+        .await?
+        {
+            Some(receipt) => Submission::Confirmed(receipt),
+            None => Submission::Refused,
+        },
+    )
+}
+
+pub(super) enum Submission {
+    Confirmed(Value),
+    Outstanding,
+    Expired,
+    Refused,
+}
+
+async fn apply(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    token: &VerifiedAccessToken,
+    genesis: Hash32,
+    bytes: &[u8],
+    challenge: &StationBindingChallenge,
+    nonce: &str,
+    proof_hash: &[u8],
+) -> Result<Option<Value>, sqlx::Error> {
+    let genesis_hex = genesis.to_hex();
     let intent = Intent {
         action: challenge.action(),
         account: challenge.account_id().to_owned(),
@@ -91,7 +155,7 @@ pub(super) async fn apply(
     )
     .bind(&station.issuer)
     .bind(&station.station_origin)
-    .bind(&nonce)
+    .bind(nonce)
     .bind(challenge.subject())
     .fetch_optional(&mut *db)
     .await?;
@@ -136,7 +200,7 @@ pub(super) async fn apply(
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb || jsonb_build_object('state','binding_changed',
         'reportId','binding_changed:' || encode(sha256(convert_to(jsonb_build_array($4::text,$5::text,$6::bigint)::text,'UTF8')),'hex')),$10)")
         .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin).bind(challenge.account_id())
-        .bind(&genesis_hex).bind(version as i64).bind(&nonce).bind(proof_hash.as_ref()).bind(&receipt).bind(&retired)
+        .bind(&genesis_hex).bind(version as i64).bind(nonce).bind(proof_hash).bind(&receipt).bind(&retired)
         .execute(&mut *db).await?;
     sqlx::query(
         "UPDATE remote_recovery_roots SET state=state || '{\"routes\":{},\"proxies\":{}}'::jsonb,
@@ -150,7 +214,7 @@ pub(super) async fn apply(
     )
     .bind(&station.issuer)
     .bind(&station.station_origin)
-    .bind(&nonce)
+    .bind(nonce)
     .execute(db)
     .await?;
     Ok(Some(receipt))

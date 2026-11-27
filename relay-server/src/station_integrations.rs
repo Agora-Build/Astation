@@ -378,6 +378,7 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
         .route("/agora-build/v1/changes", post(nudge))
         .route("/agora-build/v1/details", get(details))
         .route("/agora-build/v1/logs/:genesis/binding/challenge", post(binding_challenges::mint))
+        .route("/agora-build/v1/logs/:genesis/binding/receipt", post(binding_challenges::receipt))
         .route("/agora-build/v1/logs/:genesis/binding/commit", post(binding_challenges::commit))
         .route("/agora-build/v1/logs/:genesis/binding/transfer-consent", post(binding_challenges::consent))
         .route("/agora-build/v1/logs/:genesis/verifiers/services", post(verifier_inventory::services))
