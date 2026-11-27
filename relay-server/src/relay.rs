@@ -443,7 +443,7 @@ impl RelayHub {
         }
     }
 
-    async fn owner_route_current(&self, route: &crate::remote_api::recovery::OwnerRoute) -> bool {
+    pub(crate) async fn owner_route_current(&self, route: &crate::remote_api::recovery::OwnerRoute) -> bool {
         matches!(self.room(&route.room).await, Ok(Some(room)) if room.owner.is_some()
             && room.atems.get(&route.host) == Some(&route.connection))
     }
