@@ -242,10 +242,19 @@ challenge to PostgreSQL. Replicas can return the same outstanding challenge
 after a lost response. The lease ends within 30 seconds and by token expiry.
 The request and response use the delegated gate.
 
-Issuance prepares the confirmation. Applying the signed proof requires an
-atomic nonce consumption and ownership transition, fresh policy and room
-checks, separate current-owner consent for a transfer, route invalidation
-and a durable Portal report.
+For a transfer, the current owner sends the reviewed challenge as the body of
+`POST /agora-build/v1/logs/{genesis}/binding/transfer-consent` using their
+own Station-audience native login. Station compares the full challenge with
+the saved request, checks both accounts and the current ownership and
+membership, and records consent on that nonce in shared PostgreSQL. It
+returns `{"consented":true}` after commit. The earlier of the current owner's
+token expiry and the challenge expiry ends that consent. A retry during that
+period preserves the original deadline. A different recipient or binding
+version requires a new review.
+
+The ownership transition still requires the new owner's manager proof (the
+current owner's for unbind), atomic nonce consumption, fresh policy and room
+checks, route invalidation and a durable Portal report.
 
 ## Native client HTTP carriage
 
