@@ -425,3 +425,63 @@ async fn postgres_managed_service_inventory_opens_only_existing_account_bound_ke
     drop(runtime);
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_builtin_verifier_inventories_recheck_policy_before_delivery() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::integration_feed::PolicyStore;
+    use crate::remote_api::recovery::verifier_replicas::InventoryError;
+
+    let origin = "https://station-dev.agora.build";
+    let (db, runtime, f) = super::super::tests::fixture_at_station("https://auth.example", None, origin).await;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    recovery.configure_verifier_replicas(r#"{"generation":1,"replica":"a","replicas":["a"]}"#).await.unwrap();
+    let registry = recovery.verifier_replicas().unwrap();
+    let genesis = f.log.genesis_hash().to_hex();
+    let ids = [format!("svc-{ID}")];
+    let head = f.log.head();
+    let binding = &runtime.binding;
+    let replicas = || registry.snapshot_for(&genesis, PRINCIPAL, Some(binding));
+    let services = || registry.managed_services_for(&genesis, PRINCIPAL, &runtime, &ids, &head);
+    assert_eq!(replicas().await, Err(InventoryError::Suspended));
+    assert_eq!(services().await, Err(InventoryError::Suspended));
+    assert_eq!(registry.snapshot_for(&genesis, "foreign", Some(binding)).await.unwrap(), None);
+
+    let peer = PolicyStore(db.reconnect(2).await);
+    let prev = peer.load(binding).await.unwrap();
+    let row = json!({"account":OWNER,"accountId":f.log.account_id(),"genesisHash":genesis,
+        "bindingId":"binding-1","version":1,"bindingState":"bound"});
+    let cut = json!({"cursor":0,"changes":[],"checkpoint":{"at":"2026-11-23T00:00:00.000Z",
+        "integrations":[],"accounts":{"complete":true,"disabled":[]},"bindings":[row],"pendingReleases":[]}});
+    let observed = PortalCheckpoint::parse(&serde_json::to_vec(&cut).unwrap(), binding).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut stale = prev.apply_checkpoint(observed.clone(), now / 1000).unwrap();
+    stale.record_completed_read(now - 60_000, now);
+    peer.commit(&prev, &stale).await.unwrap();
+    assert_eq!(replicas().await, Err(InventoryError::Suspended));
+    assert_eq!(services().await, Err(InventoryError::Suspended));
+    let mut current = stale.apply_checkpoint(observed, now / 1000).unwrap();
+    current.record_completed_read(now, now);
+    peer.commit(&stale, &current).await.unwrap();
+    assert!(replicas().await.unwrap().is_some());
+    assert!(services().await.unwrap().is_some());
+
+    let release = json!({"changes":[{"id":1,"kind":"binding_released","integrationId":null,
+        "state":null,"reason":"agora_build","at":"2026-11-23T00:00:00.000Z","releaseId":"release-1",
+        "account":OWNER,"binding":{"accountId":f.log.account_id(),"genesisHash":genesis,
+        "bindingId":"binding-1","version":1}}],"cursor":1,"integrations":[]});
+    let mut rotated = binding.clone();
+    rotated.report_client_id = "s-11234567890123456789012345".into();
+    let empty = peer.load(&rotated).await.unwrap();
+    let released = empty.apply(0, serde_json::from_value(release).unwrap(), now / 1000).unwrap();
+    peer.commit(&empty, &released).await.unwrap();
+    assert_eq!(peer.load(binding).await.unwrap(), current);
+    assert_eq!(replicas().await, Err(InventoryError::Suspended));
+    assert_eq!(services().await, Err(InventoryError::Suspended));
+    assert_eq!(registry.snapshot_for(&genesis, "foreign", Some(binding)).await.unwrap(), None);
+    peer.0.close().await;
+    drop(runtime);
+    db.cleanup().await;
+}

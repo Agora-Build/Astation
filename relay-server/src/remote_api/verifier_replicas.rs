@@ -60,6 +60,18 @@ fn unavailable() -> sqlx::Error {
     sqlx::Error::Protocol("Station verifier inventory is unavailable or changed".into())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InventoryError {
+    Unavailable,
+    Suspended,
+}
+
+impl From<sqlx::Error> for InventoryError {
+    fn from(_: sqlx::Error) -> Self {
+        Self::Unavailable
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ReplicaRegistry {
     pool: PgPool,
@@ -270,8 +282,10 @@ impl ReplicaRegistry {
         &self,
         genesis: &str,
         owner: &str,
-    ) -> Result<Option<Value>, sqlx::Error> {
-        self.snapshot_inner(Some((genesis, owner)), None).await
+        portal: Option<&crate::integration_feed::FeedBinding>,
+    ) -> Result<Option<Value>, InventoryError> {
+        let snapshot = self.snapshot_inner(Some((genesis, owner)), None).await?;
+        self.authorize_snapshot(snapshot, genesis, owner, portal).await
     }
 
     pub async fn managed_services_for(
@@ -281,7 +295,7 @@ impl ReplicaRegistry {
         runtime: &crate::station_integrations::StationIntegrations,
         ids: &[String],
         expected: &atem_client::membership::Head,
-    ) -> Result<Option<Value>, sqlx::Error> {
+    ) -> Result<Option<Value>, InventoryError> {
         if ids.is_empty()
             || ids.len() > 64
             || !ids.windows(2).all(|pair| pair[0] < pair[1])
@@ -289,10 +303,35 @@ impl ReplicaRegistry {
                 id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_graphic())
             })
         {
-            return Err(unavailable());
+            return Err(InventoryError::Unavailable);
         }
-        self.snapshot_inner(Some((genesis, owner)), Some((runtime, ids, expected)))
-            .await
+        let snapshot = self.snapshot_inner(Some((genesis, owner)), Some((runtime, ids, expected))).await?;
+        self.authorize_snapshot(snapshot, genesis, owner, Some(&runtime.binding)).await
+    }
+
+    async fn authorize_snapshot(
+        &self,
+        snapshot: Option<Value>,
+        genesis: &str,
+        owner: &str,
+        portal: Option<&crate::integration_feed::FeedBinding>,
+    ) -> Result<Option<Value>, InventoryError> {
+        let Some(snapshot) = snapshot else { return Ok(None) };
+        if crate::account_identity::built_in_station(&self.origin) {
+            let portal = portal.filter(|p| p.station_origin == self.origin).ok_or(InventoryError::Unavailable)?;
+            let account = snapshot["account_id"].as_str().ok_or(InventoryError::Unavailable)?;
+            // The inventory uses repeatable read. Authorize delivery in a fresh
+            // transaction so even a rotated credential's intervening release is visible.
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("SET LOCAL statement_timeout='5s'").execute(&mut *tx).await?;
+            self.recovery.lock(&mut tx).await?;
+            self.lock_live(&mut tx).await?;
+            if !super::verifier_reports::portal_allows(&mut tx, portal, owner, account, genesis).await? {
+                return Err(InventoryError::Suspended);
+            }
+            tx.commit().await?;
+        }
+        Ok(Some(snapshot))
     }
 
     async fn snapshot_inner(

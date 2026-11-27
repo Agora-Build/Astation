@@ -98,6 +98,8 @@ async fn service_request(
     {
         Ok(Some(snapshot)) => Json(snapshot).into_response(),
         Ok(None) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+        Err(crate::remote_api::recovery::verifier_replicas::InventoryError::Suspended) =>
+            error(StatusCode::SERVICE_UNAVAILABLE, "service_suspended"),
         _ => unavailable(),
     }
 }
