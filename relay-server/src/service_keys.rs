@@ -218,59 +218,105 @@ pub(crate) struct ServiceSigner {
 }
 
 impl ServiceSigner {
+    /// Validate the entire batch against the protected key and verified list before
+    /// advancing its independently durable clock. Recovery and ordinary feeds use
+    /// the same signing inputs and reservation transaction.
     pub(crate) async fn sign_control_batch(
         &self,
         store: &crate::service_signing_ceilings::SigningCeilings,
+        log: &atem_client::membership::Membership,
+        feed_id: &str,
         bodies: &[atem_client::control::ControlBody],
-        previously_signed: u64,
+        mark: &crate::service_signing_ceilings::SigningMark,
         policy_allows_signing: impl Fn() -> bool,
     ) -> Result<Vec<atem_client::control::ControlRecord>, ()> {
-        use atem_client::control::{principal_key_of, ControlRecord};
+        use atem_client::control::{
+            control_with_signature, principal_key_of, verify_control, ControlCheck, ControlRecord,
+        };
+        use std::collections::BTreeSet;
+
         let first = bodies.first().ok_or(())?;
         let last = bodies.last().ok_or(())?;
-        if bodies
-            .iter()
-            .any(|body| body.account_id != first.account_id)
+        let fingerprint = principal_key_of(&self.public).map_err(|_| ())?;
+        if log.frozen().is_some()
+            || log.genesis_hash().to_hex() != self.context.genesis
+            || !log.member(&self.context.service_id).is_some_and(|m| {
+                matches!(
+                    m.member.kind,
+                    atem_client::membership::MemberKind::Service { .. }
+                ) && m.member.auth_key == self.public
+            })
+            || mark.key_fingerprint != fingerprint.to_hex()
             || !bodies
                 .windows(2)
                 .all(|pair| pair[0].issued_at.checked_add(1) == Some(pair[1].issued_at))
         {
             return Err(());
         }
-        let key = principal_key_of(&self.public).map_err(|_| ())?.to_hex();
+
+        let mut ids = BTreeSet::new();
+        let mut inputs = Vec::with_capacity(bodies.len());
+        for body in bodies {
+            if body.account_id != log.account_id()
+                || !ids.insert(&body.record_id)
+                || body.feed.as_ref().is_none_or(|f| f.feed_id != feed_id)
+            {
+                return Err(());
+            }
+            inputs.push(self.control_input(body).map_err(|_| ())?);
+        }
+        let last_time = i64::try_from(last.issued_at).map_err(|_| ())?;
+        let current =
+            || policy_allows_signing() && chrono::Utc::now().timestamp_millis() >= last_time;
+        if !current() {
+            return Err(());
+        }
         store
-            .reserve(
-                &first.account_id,
+            .reserve_reviewed(
+                log.account_id(),
                 &self.context.genesis,
                 &self.context.service_id,
-                &key,
-                previously_signed,
+                mark,
                 first.issued_at..=last.issued_at,
             )
             .await?;
-        bodies
-            .iter()
-            .map(|body| {
-                // Waiting for a reservation can outlast the grant. Keep the
-                // reservation consumed even if the signature is withheld.
-                if !policy_allows_signing() {
-                    return Err(());
-                }
-                let object = self.sign_control(body).map_err(|_| ())?;
-                ControlRecord::from_signed(object).map_err(|_| ())
-            })
-            .collect()
+
+        let mut records = Vec::with_capacity(bodies.len());
+        for (body, input) in bodies.iter().zip(inputs) {
+            // The policy or wall clock can change while waiting for the independent store.
+            if !current() {
+                return Err(());
+            }
+            let sig = self
+                .key
+                .sign(&SystemRandom::new(), input.as_bytes())
+                .map_err(|_| ())?;
+            let signed =
+                control_with_signature(body, &self.public, sig.as_ref()).map_err(|_| ())?;
+            let record = ControlRecord::from_signed(signed).map_err(|_| ())?;
+            if !matches!(verify_control(&record, log), ControlCheck::Valid(_)) {
+                return Err(());
+            }
+            records.push(record);
+        }
+        if !current() {
+            return Err(());
+        }
+        Ok(records)
     }
 
-    /// Control signing stays separate from the channel-only KeyProvider. The
-    /// caller cannot change the sealed key's principal, integration or Station.
-    fn sign_control(&self, body: &atem_client::control::ControlBody)
-        -> atem_client::Result<atem_client::SignedObject>
-    {
-        use atem_client::control::{control_signing_input, control_with_signature,
-            principal_key_of, ControlPrincipal, ControlSigner};
+    fn control_input(
+        &self,
+        body: &atem_client::control::ControlBody,
+    ) -> atem_client::Result<SigningInput> {
+        use atem_client::control::{
+            control_signing_input, principal_key_of, ControlPrincipal, ControlSigner,
+        };
         if body.genesis_hash.to_hex() != self.context.genesis
-            || body.feed.as_ref().is_none_or(|feed| feed.origin != self.context.station_origin)
+            || body
+                .feed
+                .as_ref()
+                .is_none_or(|feed| feed.origin != self.context.station_origin)
             || body.principal != ControlPrincipal::Service(self.context.service_id.clone())
             || body.signer != ControlSigner::Principal
             || body.about.integration_id.as_deref() != Some(self.context.integration_id.as_str())
@@ -278,10 +324,7 @@ impl ServiceSigner {
         {
             return Err(atem_client::Error::BadKey);
         }
-        let input = control_signing_input(body)?;
-        let signature = self.key.sign(&SystemRandom::new(), input.as_bytes())
-            .map_err(|_| atem_client::Error::BadSignature)?;
-        control_with_signature(body, &self.public, signature.as_ref())
+        control_signing_input(body)
     }
 }
 
@@ -479,8 +522,8 @@ mod tests {
             record_id: uuid::Uuid::new_v4().to_string(), issued_at: 100,
             about: ControlAbout { integration_id: Some(context.integration_id.clone()), by: "owner".into() },
         };
-        let object = signer.sign_control(&body).unwrap();
-        signer.public.verify(&control_signing_input(&body).unwrap(), object.sig()).unwrap();
+        let input = signer.control_input(&body).unwrap();
+        assert_eq!(input, control_signing_input(&body).unwrap());
         for field in 0..7 {
             let mut other = body.clone();
             match field {
@@ -492,7 +535,7 @@ mod tests {
                 5 => other.about.integration_id = Some("i-11234567890123456789012345".into()),
                 _ => other.principal_key = None,
             }
-            assert!(signer.sign_control(&other).is_err(), "context field {field}");
+            assert!(signer.control_input(&other).is_err(), "context field {field}");
         }
         assert!(signer.sign(&KeyId::new(&context.service_id), &control_signing_input(&body).unwrap()).is_err());
     }

@@ -1101,6 +1101,19 @@ need reconciliation. Preparation produces no signatures or reservations.
 Final signing must recheck participant coverage,
 policy, membership and signing floors before publishing the snapshot.
 
+The service signer takes the reviewed membership, exact feed ID and signing
+mark with the batch. It checks every body before reserving time. The separate
+signing database advances the exact key's ceiling only if it still equals
+the reviewed value. Even an intervening reservation below the proposed
+timestamps requires a new review. A native stop can raise the principal's
+minimum timestamp above the service key's own ceiling.
+
+If policy or wall time changes while the signing store commits, the signer
+withholds the batch and the reservation stays consumed. The signer checks the
+completed records with the shared membership verifier. Recovery preparation
+continues to return unsigned bodies. The final publisher must supply its
+verified participant cut and retain the records atomically.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run

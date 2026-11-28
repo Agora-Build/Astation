@@ -722,7 +722,7 @@ impl super::RecoveryStore {
              WHERE origin=$1 AND account_id=$2 AND genesis_hash=$3 AND service_id=$4",
         )
         .bind(origin).bind(log.account_id()).bind(&context.genesis)
-        .bind(&context.service_id).bind(fingerprint)
+        .bind(&context.service_id).bind(&fingerprint)
         .fetch_one(&mut *tx).await.map_err(|_| ())?;
         if conflicting_key {
             return Err(());
@@ -733,7 +733,9 @@ impl super::RecoveryStore {
         } else {
             clock.wall_ms
         };
-        for record in signer.sign_control_batch(store, &bodies, required_floor, policy_allows_signing).await? {
+        let mark = store.live_mark(log.account_id(), &context.genesis, &context.service_id, &fingerprint,
+            required_floor, feed.signing_high_water.get(&bodies[0].principal.name()).copied().unwrap_or(0)).await?;
+        for record in signer.sign_control_batch(store, &log, &feed.feed_id, &bodies, &mark, policy_allows_signing).await? {
             feed.publish(
                 origin,
                 &log,
