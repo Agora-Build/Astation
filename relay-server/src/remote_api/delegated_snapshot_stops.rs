@@ -2,14 +2,14 @@
 use super::{checkpoint, invalid, review_evidence, source_hash, Binding, Prepared};
 use atem_client::{
     control::{
-        check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlPrincipal, ControlRecord,
-        RefusalReason, SnapshotConsistency, SnapshotInput,
+        check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlPrincipal,
+        ControlRecord, RefusalReason, SnapshotConsistency, SnapshotInput,
     },
     membership::Membership,
 };
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct StopSources {
     pub signed: BTreeMap<String, Value>,
@@ -17,18 +17,15 @@ pub(super) struct StopSources {
 }
 
 impl StopSources {
-    fn assemble(
-        mut self,
+    fn select(
+        &self,
         log: &Membership,
-        origin: &str,
-        plan: &Prepared,
-    ) -> Result<Vec<ControlRecord>, sqlx::Error> {
+    ) -> Result<Option<(Vec<ControlRecord>, Vec<ControlRecord>)>, sqlx::Error> {
         let mut originals = Vec::new();
         let mut selected_records = BTreeMap::new();
-        for (id, value) in self.signed {
-            let original =
-                ControlRecord::parse(&serde_json::to_vec(&value).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?;
+        for (id, value) in &self.signed {
+            let original = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
+                .map_err(|_| invalid())?;
             if !matches!(
                 original.action(),
                 ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }
@@ -40,16 +37,28 @@ impl StopSources {
             let selected = match verify_control(&original, log) {
                 ControlCheck::Valid(_) => original.clone(),
                 ControlCheck::Refused(RefusalReason::RemovedManager) => {
-                    self.copies.remove(&id).ok_or_else(invalid)?
+                    let Some(copy) = self.copies.get(id) else {
+                        return Ok(None);
+                    };
+                    copy.clone()
                 }
-                _ => return Err(invalid()),
+                _ => return Ok(None),
             };
             originals.push(original);
             // The same signed copy can be both a replacement and a retained
             // original in its own right. Publish its bytes once.
             selected_records.insert(selected.record_id().to_owned(), selected);
         }
-        let snapshot: Vec<_> = selected_records.into_values().collect();
+        Ok(Some((originals, selected_records.into_values().collect())))
+    }
+
+    fn assemble(
+        &self,
+        log: &Membership,
+        origin: &str,
+        plan: &Prepared,
+    ) -> Result<Vec<ControlRecord>, sqlx::Error> {
+        let (originals, snapshot) = self.select(log)?.ok_or_else(invalid)?;
         let input = SnapshotInput {
             list: log,
             origin,
@@ -68,6 +77,73 @@ impl StopSources {
         }
         Ok(snapshot)
     }
+
+    /// Assemble the signed candidate in feed order. The shared checker verifies
+    /// effects for these inputs; author completeness is verified separately.
+    pub(super) fn with_services(
+        &self,
+        log: &Membership,
+        origin: &str,
+        plan: &Prepared,
+        fresh: &[ControlRecord],
+        provisioned: &BTreeMap<String, String>,
+        marks: &BTreeMap<String, u64>,
+    ) -> Result<Option<Vec<ControlRecord>>, sqlx::Error> {
+        let Some((retained, stops)) = self.select(log)? else {
+            return Ok(None);
+        };
+        let mut covered = BTreeSet::new();
+        for (id, key) in provisioned {
+            let removed = log.member(id).is_some_and(|m| {
+                m.status == atem_client::membership::MemberStatus::Removed
+                    && atem_client::membership::service_key_fingerprint(&m.member.auth_key)
+                        .ok()
+                        .as_ref()
+                        == Some(key)
+            });
+            if !removed {
+                covered.insert(ControlPrincipal::Service(id.clone()).name());
+            }
+        }
+        let mut ids = BTreeMap::new();
+        let mut snapshot = Vec::with_capacity(fresh.len() + stops.len());
+        // A covered principal's fresh cover must precede its carried interrupts.
+        for record in fresh.iter().chain(&stops) {
+            if let Some(previous) = ids.insert(record.record_id(), record) {
+                if previous != record {
+                    return Err(invalid());
+                }
+                continue;
+            }
+            if ids.len() > super::history::MAX_RECORDS {
+                return Err(invalid());
+            }
+            if let (ControlPrincipal::Service(id), ControlAction::Revoke { .. }) =
+                (record.principal(), record.action())
+            {
+                let key = record.principal_key().ok_or_else(invalid)?.to_hex();
+                if provisioned.get(id) == Some(&key) {
+                    covered.remove(&record.principal().name());
+                }
+            }
+            snapshot.push(record.clone());
+        }
+        let input = SnapshotInput {
+            list: log,
+            origin,
+            candidate_feed_id: &plan.candidate_feed_id,
+            retained: &retained,
+            snapshot: &snapshot,
+            marks,
+            covered: &covered,
+        };
+        if check_snapshot_consistency(&input).map_err(|_| invalid())?
+            != SnapshotConsistency::Consistent
+        {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
+    }
 }
 
 fn records_json(records: &[ControlRecord]) -> Value {
@@ -78,7 +154,7 @@ fn records_json(records: &[ControlRecord]) -> Value {
 /// Reassembly also checks omitted or substituted records after a restore.
 pub(super) async fn staged_service_revokes(
     connection: &mut PgConnection,
-    sources: StopSources,
+    sources: &StopSources,
     plan: &Prepared,
     log: &Membership,
     origin: &str,
@@ -103,7 +179,9 @@ pub(super) async fn staged_service_revokes(
                 (record.principal(), record.action())
             {
                 let fingerprint = record.principal_key().ok_or_else(invalid)?.to_hex();
-                revokes.entry((id.clone(), fingerprint)).or_insert_with(|| record.record_id().to_owned());
+                revokes
+                    .entry((id.clone(), fingerprint))
+                    .or_insert_with(|| record.record_id().to_owned());
             }
         }
     }

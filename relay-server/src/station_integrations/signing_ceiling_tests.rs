@@ -735,6 +735,7 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     let prepared = review().await.unwrap();
     let portal = &prepared["portal_service_evidence"];
     let provisioned = portal["provisioned_without_membership"].as_array().unwrap();
+    assert_eq!(prepared["candidate_snapshot"]["status"], "provisioning_unresolved");
     assert_eq!(provisioned.len(), 1);
     assert_eq!(provisioned[0]["key_fingerprint"], fingerprint);
     assert_eq!(provisioned[0]["portal_observation"]["interrupt_running"], true);
@@ -969,6 +970,39 @@ async fn postgres_delegated_service_drafts_retry_without_signing_or_reopening() 
 
 #[tokio::test]
 #[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_empty_candidate_is_identical_across_replicas() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql")).execute(&external.pool).await.unwrap();
+    let (primary, runtime, fixture) = fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let fence = Binding::new(&runtime.binding.station_origin, 2).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let source = json!({"changes":[],"cursor":previous.cursor,
+        "checkpoint":{"at":"2026-11-27T10:00:00.000Z","integrations":[]}});
+    let policy = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let next = previous.apply_checkpoint(policy, previous.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+    let clock = runtime.app.recovery.signing_ceilings.get().unwrap();
+    let replica = primary.reconnect(2).await;
+    for pool in [&primary.pool, &replica] {
+        let review = plan::prepare_with_sources(pool, &fence, &genesis,
+            Some(clock), Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+        assert_eq!(review["candidate_snapshot"], json!({"status":"assembled","record_count":0,
+            "records_hash":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}));
+        assert_eq!(review["snapshot_complete"], false);
+        assert_eq!(review["recovery_ready"], false);
+    }
+    replica.close().await;
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
 async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock_and_feed() {
     use crate::integration_checkpoint::PortalCheckpoint;
     use crate::service_keys::load_approved;
@@ -1058,6 +1092,9 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
         Ok::<_,sqlx::Error>(receipt)
     };
     assert!(persist(&other, &initial, &records, true).await.is_err());
+    let mut changed_clock = review.clone();
+    changed_clock["service_clock_evidence"]["snapshot_signing_marks"][&principal]["sign_above_ms"] = json!(0);
+    assert!(persist(&other, &changed_clock, &records, true).await.is_err());
     let receipt = persist(&primary.pool, &review, &records, false).await.unwrap();
     let known = plan::prepare(&other, &fence, &genesis).await.unwrap();
     assert!(known["known_history"]["checkpoints"][0].get("service_components").is_none());
@@ -1065,14 +1102,46 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     assert_eq!(persist(&other, &review, &records, true).await.unwrap(), receipt);
     let (superseding, _, _) = prepare().await;
     assert_ne!(superseding["service_drafts"]["source_hash"], receipt["source_hash"]);
+    assert_eq!(initial["candidate_snapshot"]["status"], "awaiting_service_signatures");
+    assert_eq!(superseding["candidate_snapshot"], json!({"status":"assembled","record_count":2,
+        "records_hash":receipt["records_hash"]}));
+    let retried = plan::prepare_with_sources(&other, &fence, &genesis, Some(clock),
+        Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+    assert_eq!(retried["candidate_snapshot"], superseding["candidate_snapshot"]);
     assert_eq!(superseding["evidence_hash"], review["evidence_hash"],
         "Station's own service signatures must preserve the native author round that authorized them");
     assert_ne!(superseding["reconstruction_hash"], review["reconstruction_hash"]);
     assert_eq!(superseding["known_history"]["checkpoints"][0]["service_components"], json!([receipt]));
     assert_eq!(receipt["membership_head"], log.head().to_json());
     assert_eq!(persist(&primary.pool, &review, &records, true).await.unwrap(), receipt);
+    let original_cut: Value = sqlx::query_scalar("SELECT signing_cut FROM station_delegated_service_components WHERE source_hash=$1")
+        .bind(receipt["source_hash"].as_str().unwrap()).fetch_one(&other).await.unwrap();
+    assert_eq!(original_cut["service_clock_evidence"], review["service_clock_evidence"]);
+    let mut altered_cut = original_cut.clone();
+    altered_cut["service_clock_evidence"]["snapshot_signing_marks"][&principal]["highest_reserved_ms"] =
+        json!(records.last().unwrap().issued_at());
+    let change_cut = "UPDATE station_delegated_service_components SET signing_cut=$2 WHERE source_hash=$1";
+    // A receipt from before signing cuts were stored still proves what was retained.
+    // It cannot supply a fresh cover or hold.
+    sqlx::query(change_cut).bind(receipt["source_hash"].as_str().unwrap())
+        .bind(Option::<Value>::None).execute(&other).await.unwrap();
+    assert_eq!(persist(&other, &review, &records, true).await.unwrap(), receipt);
+    let (legacy, _, _) = prepare().await;
+    assert_eq!(legacy["candidate_snapshot"]["status"], "awaiting_service_signatures");
+    sqlx::query(change_cut).bind(receipt["source_hash"].as_str().unwrap()).bind(&altered_cut).execute(&other).await.unwrap();
+    assert!(plan::prepare(&primary.pool, &fence, &genesis).await.is_err());
+    sqlx::query(change_cut).bind(receipt["source_hash"].as_str().unwrap()).bind(&original_cut).execute(&other).await.unwrap();
+    assert_eq!(persist(&other, &review, &records, true).await.unwrap(), receipt);
     assert!(persist(&other, &superseding, &records, true).await.is_err());
     assert!(persist(&other, &review, &records[..1], true).await.is_err());
+
+    // A new Portal checkpoint can have the same cursor and the same required actions.
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let refreshed = previous.apply_checkpoint(previous.portal_snapshot.clone().unwrap(), previous.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&previous, &refreshed, Some(&fence)).await.unwrap();
+    let (refreshed, _, _) = prepare().await;
+    assert_eq!(refreshed["candidate_snapshot"]["status"], "awaiting_service_signatures");
+    assert_eq!(persist(&other, &review, &records, true).await.unwrap(), receipt);
 
     // A revoke signed under this plan survives abandonment and becomes a required stop of the next plan.
     let previous = runtime.policies.load(&runtime.binding).await.unwrap();
@@ -1112,6 +1181,15 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     let (rev, stops) = sign_revoke().await;
     assert!(stops.iter().any(|r| matches!(r.action(), atem_client::control::ControlAction::Revoke { interrupt_running:true })));
     let final_receipt = persist(&other, &rev, &stops, true).await.unwrap();
+    let current = plan::prepare(&other, &fence, &genesis).await.unwrap();
+    let stop_only = plan::snapshot_stops::stage(&other, &fence, &genesis,
+        current["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    let after_revoke = plan::prepare_with_sources(&other, &fence, &genesis, Some(clock),
+        Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+    assert_eq!(after_revoke["service_drafts"]["unsigned_bodies"], json!([]));
+    assert_eq!(after_revoke["candidate_snapshot"], json!({"status":"assembled",
+        "record_count":stop_only["stop_count"],"records_hash":stop_only["records_hash"]}));
+    assert_eq!(after_revoke["snapshot_complete"], false);
     plan::outcome::abandon(&other, &fence, &genesis, receipt["plan_id"].as_str().unwrap()).await.unwrap();
     let next_fence = Binding::new(origin, 3).unwrap();
     next_fence.initialize(&primary.pool, true).await.unwrap();

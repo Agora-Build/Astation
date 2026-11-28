@@ -20,6 +20,8 @@ pub(crate) mod stops;
 mod service_drafts;
 #[path = "delegated_service_components.rs"]
 pub(crate) mod service_components;
+#[path = "delegated_candidate_snapshot.rs"]
+mod candidate_snapshot;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
@@ -145,7 +147,7 @@ pub(crate) async fn prepare_with_sources(
         let covered = covers_retained_membership(&report);
         let revokes = if covered {
             snapshot_stops::staged_service_revokes(
-                &mut tx, stops, &prepared, &log, &binding.origin,
+                &mut tx, &stops, &prepared, &log, &binding.origin,
                 report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
             ).await?
         } else {
@@ -164,6 +166,11 @@ pub(crate) async fn prepare_with_sources(
             } else {
                 json!({"status":"membership_history_unresolved"})
             };
+            if covered {
+                report["candidate_snapshot"] = candidate_snapshot::inspect(
+                    &mut tx, &prepared, &log, &binding.origin, &report, &stops,
+                ).await?;
+            }
         }
         report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
     }
@@ -296,6 +303,11 @@ async fn review_evidence(
     let mut source = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
     let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &mut source).await?;
     report["recovery_signatures"] = summary;
+    report["reconstruction_hash"] = source_hash(&reconstruction_inputs(report))?.into();
+    Ok(snapshot_stops::StopSources { signed: source.records, copies })
+}
+
+fn reconstruction_inputs(report: &Value) -> Value {
     let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
         "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
@@ -310,8 +322,7 @@ async fn review_evidence(
     if report["recovery_signatures"]["records"].as_array().is_some_and(|rows| !rows.is_empty()) {
         reconstruction["includes_signed_copies"] = true.into();
     }
-    report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
-    Ok(snapshot_stops::StopSources { signed: source.records, copies })
+    reconstruction
 }
 
 struct SignedEvidence {

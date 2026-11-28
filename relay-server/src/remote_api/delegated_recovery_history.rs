@@ -87,7 +87,7 @@ pub(super) async fn inspection(
     if count == 0 || count > MAX_CHECKPOINTS || bytes > MAX_STATE as i64 {
         return Err(invalid());
     }
-    super::service_components::check_size(connection, &binding.origin, &log.genesis_hash().to_hex(), &json!([]))
+    super::service_components::check_size(connection, &binding.origin, &log.genesis_hash().to_hex(), None, None)
         .await?;
     let checkpoints: Vec<Historical> = sqlx::query_as(
         "SELECT generation,abandoned,plan_id,candidate_feed_id,source_hash,retained \

@@ -297,6 +297,7 @@ pub(super) async fn observe(
         })
         .collect();
     let mut evidence = json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
+        "policy_revision":policy.revision,
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":genesis,
         "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,

@@ -1148,6 +1148,16 @@ revocations and interrupts into the next review, and accounts for each key's
 highest observed signature. A retained receipt alone grants no publication
 authority.
 
+When service review is available, the operator's `prepare` returns
+`candidate_snapshot`. An `assembled` result contains the record count and
+SHA-256 of the ordered signed records. Station checks the current required
+actions, membership, author evidence and independent signing reservations before
+reusing signatures from a previous attempt. A new batch retains the clock
+evidence from before it signed. An older batch without that evidence can still
+supply historical stops. A list can have an empty candidate or one containing
+only revokes and interrupts. The assembled result is a preview. Publication
+requires the final participant check and a separate commit.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run
