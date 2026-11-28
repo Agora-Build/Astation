@@ -12,13 +12,14 @@ struct Outcome {
     source_hash: String,
     account_id: String,
     abandoned: bool,
+    published: bool,
 }
 
 impl Outcome {
     fn receipt(&self, origin: &str, genesis: &str) -> Value {
         json!({"account_id":self.account_id,"genesis_hash":genesis,"origin":origin,
             "generation":self.generation.to_string(),"plan_id":self.plan_id,"candidate_feed_id":self.candidate_feed_id,
-            "source_hash":self.source_hash,"outcome":if self.abandoned {"abandoned"} else {"pending"}})
+            "source_hash":self.source_hash,"outcome":if self.published {"published"} else if self.abandoned {"abandoned"} else {"pending"}})
     }
 }
 
@@ -30,7 +31,8 @@ pub(crate) async fn for_owner(
     owner: &str,
 ) -> Result<Value, sqlx::Error> {
     let row: Outcome = sqlx::query_as(
-        "SELECT p.generation,p.plan_id,p.candidate_feed_id,p.source_hash,p.retained->>'account_id' AS account_id,p.abandoned
+        "SELECT p.generation,p.plan_id,p.candidate_feed_id,p.source_hash,p.retained->>'account_id' AS account_id,p.abandoned,
+                p.published_cut_hash IS NOT NULL AS published
          FROM station_delegated_recovery_plans p JOIN remote_recovery_roots r USING(genesis_hash)
          JOIN station_delegated_recovery f ON f.origin=p.origin
          WHERE p.genesis_hash=$1 AND p.plan_id=$2 AND p.origin=$3 AND f.generation=$4 AND p.generation <= f.generation
@@ -68,7 +70,9 @@ pub(crate) async fn abandon(
     let row: Outcome = sqlx::query_as(
         "UPDATE station_delegated_recovery_plans SET abandoned=true
          WHERE origin=$1 AND generation=$2 AND genesis_hash=$3 AND plan_id=$4 AND retained->>'account_subject'=$5
-         RETURNING generation,plan_id,candidate_feed_id,source_hash,retained->>'account_id' AS account_id,abandoned"
+           AND published_cut_hash IS NULL
+         RETURNING generation,plan_id,candidate_feed_id,source_hash,retained->>'account_id' AS account_id,abandoned,
+                   false AS published"
     ).bind(&binding.origin).bind(binding.generation).bind(genesis).bind(plan).bind(owner).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(row.receipt(&binding.origin, genesis))

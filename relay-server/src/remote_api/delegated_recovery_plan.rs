@@ -24,6 +24,8 @@ pub(crate) mod service_components;
 mod candidate_snapshot;
 #[path = "delegated_replacement_feed.rs"]
 mod replacement_feed;
+#[path = "delegated_publication.rs"]
+pub(crate) mod publication;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
