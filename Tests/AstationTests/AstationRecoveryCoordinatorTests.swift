@@ -576,6 +576,33 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
 
     func testStationTransferUsesTheExistingMacManagerKeyToSignAFreshChallenge() async throws {
         let h = RecoveryCoordinatorHarness()
+        var callsAtConfirmation: Int?
+        try await verifyStationTransfer(h) { _ in
+            callsAtConfirmation = h.identityCryptography.signingCalls
+            return true
+        }
+        XCTAssertEqual(h.identityCryptography.signingCalls, try XCTUnwrap(callsAtConfirmation) + 1)
+    }
+
+    func testProvisionedStationTransferWithDeviceOwnerAuthentication() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] == "1",
+              environment["ASTATION_TEST_OWNER_PRESENCE"] == "1" else {
+            throw XCTSkip("Run the provisioned test with ASTATION_TEST_OWNER_PRESENCE=1 and the owner present.")
+        }
+        let h = RecoveryCoordinatorHarness()
+        h.identity = AtemE2EIdentity(storage: h.identityStorage)
+        try await verifyStationTransfer(h) { review in
+            await withCheckedContinuation { continuation in
+                DeviceOwnerAuth.authenticate(reason: "Local Astation test with a disposable account. " + review.confirmation) {
+                    continuation.resume(returning: $0)
+                }
+            }
+        }
+    }
+
+    private func verifyStationTransfer(_ h: RecoveryCoordinatorHarness,
+        confirm: (RemoteStationBindingApproval.Review) async -> Bool) async throws {
         let origin = "https://station-dev.agora.build"
         let coordinator = try h.coordinator(relayURL: origin)
         _ = try await coordinator.setup()
@@ -598,15 +625,13 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let session = AccountLoginSession(configuration: configuration, subject: claims.subject,
             accessToken: "fixture-token", refreshToken: "", expiresAt: Date().addingTimeInterval(60),
             authenticatedAt: Int64(claims.authTime))
-        let calls = h.identityCryptography.signingCalls
         let proof = try await approvals.prove(action: .transfer, previous: previous, session: session,
             managerID: "manager-a", membership: { log }, now: { AstationRecoveryCoordinator.clock().wallMs },
             current: { true }, confirm: { review in
                 XCTAssertEqual(review.subject, session.subject)
                 XCTAssertEqual(review.previous, previous)
-                return true
+                return await confirm(review)
             }, sign: { try h.identity.signStationBinding($0, expectedKey: $1) })
-        XCTAssertEqual(h.identityCryptography.signingCalls, calls + 1)
         let checked = try verifyStationBinding(log: log, proofJson: proof, expectedChallengeJson: challenge,
             nowMs: AstationRecoveryCoordinator.clock().wallMs)
         XCTAssertTrue(checked.atHead)

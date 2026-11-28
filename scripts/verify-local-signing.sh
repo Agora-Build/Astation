@@ -60,6 +60,7 @@ fi
 
 # Xcode's driver dumps its environment on some errors. Pass only test necessities.
 env -i PATH=/usr/bin:/bin ASTATION_REQUIRE_KEYCHAIN_TESTS=1 \
+    ASTATION_TEST_OWNER_PRESENCE="${ASTATION_TEST_OWNER_PRESENCE:-0}" \
     DYLD_FRAMEWORK_PATH="$platform_dir/Library/Frameworks" \
     DYLD_LIBRARY_PATH="$platform_dir/usr/lib" \
     "$test_host/Contents/MacOS/AstationLocalSigning" -XCTest "$test_filter" "$test_bundle" 2>&1 \
