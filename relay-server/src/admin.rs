@@ -10,6 +10,7 @@ pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_
        station-relay-server admin migrate-room-owners <genesis_hash>\n\
        station-relay-server admin delegated-recovery status|fence\n\
        station-relay-server admin delegated-recovery release-signing-hold\n\
+       station-relay-server admin delegated-recovery review-publication <process-export> [<process-export> ...]\n\
        station-relay-server admin delegated-recovery list-roots [after_genesis_hash]\n\
        station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>\n\
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
@@ -177,6 +178,8 @@ async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{canonical_genesis, generation, inspect, inspect_root, list_roots, Binding};
     let (fence, root, files, plan_or_hash) = match args {
         [command] if matches!(command.as_str(), "status" | "release-signing-hold") => (false, None, None, None),
+        [command, first, rest @ ..] if command == "review-publication" && !first.is_empty()
+            && rest.iter().all(|file| !file.is_empty()) => (false, None, None, None),
         [command, rest @ ..] if command == "list-roots"
             && (rest.is_empty() || rest.len() == 1 && canonical_genesis(&rest[0])) =>
         {
@@ -259,6 +262,39 @@ async fn delegated_recovery(args: &[String]) -> i32 {
         ).await {
             Ok(()) => { println!("Signing hold reconciled."); 0 }
             Err(_) => { eprintln!("Check the Station generation, active publication and signing database."); 1 }
+        };
+    }
+    if args[0] == "review-publication" {
+        use crate::remote_api::recovery::delegated_recovery::plan::{author_roster, publication};
+        let mut lists = publication::ProcessLists::default();
+        for file in &args[1..] {
+            let Ok(bytes) = read_stop_evidence(std::path::Path::new(file), author_roster::INPUT_LIMIT).await else {
+                eprintln!("could not read bounded native process export");
+                return 1;
+            };
+            if lists.add(bytes).is_err() {
+                eprintln!("invalid process export or combined process lists exceed the per-list limit");
+                return 1;
+            }
+        }
+        let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+            eprintln!("review-publication requires the independent signing database");
+            return 1;
+        };
+        let Ok(Some(portal)) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+            eprintln!("review-publication requires the Portal reporting configuration");
+            return 1;
+        };
+        let Ok(Some(vault)) = crate::station_integrations::configured_service_vault() else {
+            eprintln!("review-publication requires the service wrapping key");
+            return 1;
+        };
+        return match publication::review_publication(&pool, &binding, &portal, &signing, &vault, lists).await {
+            Ok(report) => { println!("{report}"); 0 }
+            Err(_) => {
+                eprintln!("could not review the closed generation; check list-roots, prepare and compare-authors for each list");
+                1
+            }
         };
     }
     if args[0] == "list-roots" {

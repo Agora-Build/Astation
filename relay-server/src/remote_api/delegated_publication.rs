@@ -4,7 +4,7 @@ use crate::integration_feed::FeedBinding;
 use crate::service_keys::ServiceKeyVault;
 use crate::service_signing_ceilings::SigningCeilings;
 use atem_client::membership::Membership;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::collections::BTreeMap;
 
@@ -17,8 +17,33 @@ pub(super) struct AccountCut {
     pub process_lists: Vec<Vec<u8>>,
 }
 
-struct Publication<'a> {
-    tx: Transaction<'a, Postgres>,
+/// Operator files are the existing native process exports. Keep the same
+/// per-list size bound as compare-authors, including across separate files.
+#[derive(Default)]
+pub(crate) struct ProcessLists(BTreeMap<String, (usize, Vec<Vec<u8>>)>);
+
+impl ProcessLists {
+    pub(crate) fn add(&mut self, bytes: Vec<u8>) -> Result<(), sqlx::Error> {
+        let limit = super::author_roster::INPUT_LIMIT;
+        let value = atem_client::canonical::StrictValue::parse(&bytes, limit)
+            .map_err(|_| invalid())?
+            .into_value();
+        let genesis = value["genesis_hash"]
+            .as_str()
+            .filter(|id| super::super::canonical_genesis(id))
+            .ok_or_else(invalid)?;
+        let (size, files) = self.0.entry(genesis.to_owned()).or_default();
+        *size = size
+            .checked_add(bytes.len())
+            .filter(|total| *total <= limit)
+            .ok_or_else(invalid)?;
+        files.push(bytes);
+        Ok(())
+    }
+}
+
+struct Publication {
+    tx: Transaction<'static, Postgres>,
     binding: Binding,
     primary_store: String,
 }
@@ -76,6 +101,86 @@ pub(super) async fn publish_after_verification(
     cuts: BTreeMap<String, AccountCut>,
     verify: impl AsyncFnMut(&Membership, &Value, &Value) -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
+    with_publication_hold(pool, binding, portal, signing, async |mut publication| {
+        publication
+            .verify_inputs(&cuts, portal, signing, vault, verify)
+            .await?;
+        publication.commit(&cuts).await
+    })
+    .await
+}
+
+/// Exercise the same generation-wide input checks as publication. The primary
+/// rolls back all preparation writes; only actual publication can install a feed.
+pub(crate) async fn review_publication(
+    pool: &PgPool,
+    binding: &Binding,
+    portal: &FeedBinding,
+    signing: &SigningCeilings,
+    vault: &ServiceKeyVault,
+    lists: ProcessLists,
+) -> Result<Value, sqlx::Error> {
+    with_publication_hold(pool, binding, portal, signing, async |mut publication| {
+        let mut cuts = BTreeMap::new();
+        for (genesis, (_, process_lists)) in lists.0 {
+            let (plan_id, cut_hash, feed_hash, membership_head) = sqlx::query_as(
+                "SELECT p.plan_id,f.cut_hash,f.feed_hash,r.state->'membership'->'head'
+                 FROM station_delegated_recovery_plans p
+                 JOIN station_delegated_replacement_feeds f USING(plan_id)
+                 JOIN remote_recovery_roots r USING(genesis_hash)
+                 WHERE p.genesis_hash=$1 AND p.origin=$2 AND p.generation=$3
+                   AND NOT p.abandoned AND p.published_cut_hash IS NULL",
+            )
+            .bind(&genesis)
+            .bind(&binding.origin)
+            .bind(binding.generation)
+            .fetch_one(&mut *publication.tx)
+            .await?;
+            cuts.insert(
+                genesis,
+                AccountCut {
+                    plan_id,
+                    cut_hash,
+                    feed_hash,
+                    membership_head,
+                    process_lists,
+                },
+            );
+        }
+        let mut reviews = Vec::new();
+        publication
+            .verify_inputs(
+                &cuts,
+                portal,
+                signing,
+                vault,
+                async |_, review, comparison| {
+                    reviews.push(json!({
+                        "genesis_hash":review["genesis_hash"], "plan_id":review["plan_id"],
+                        "cut_hash":review["replacement_feed"]["cut_hash"],
+                        "feed_hash":review["replacement_feed"]["feed_hash"],
+                        "process_comparison":comparison,
+                    }));
+                    Ok(())
+                },
+            )
+            .await?;
+        publication.tx.rollback().await?;
+        Ok(
+            json!({"origin":binding.origin, "generation":binding.generation.to_string(),
+            "lists":reviews, "final_verification":"pending", "published":false}),
+        )
+    })
+    .await
+}
+
+async fn with_publication_hold<T>(
+    pool: &PgPool,
+    binding: &Binding,
+    portal: &FeedBinding,
+    signing: &SigningCeilings,
+    action: impl AsyncFnOnce(Publication) -> Result<T, sqlx::Error>,
+) -> Result<T, sqlx::Error> {
     if portal.station_origin != binding.origin || portal.validate().is_err() {
         return Err(invalid());
     }
@@ -89,9 +194,7 @@ pub(super) async fn publish_after_verification(
                 &publication.primary_store,
             )
             .await?;
-        publication
-            .commit(cuts, portal, signing, vault, verify)
-            .await
+        action(publication).await
     }
     .await;
     // An uncertain primary commit can still be running. Reacquiring its
@@ -100,7 +203,7 @@ pub(super) async fn publish_after_verification(
     result
 }
 
-impl Publication<'_> {
+impl Publication {
     async fn begin(pool: &PgPool, binding: &Binding) -> Result<Self, sqlx::Error> {
         let mut tx = pool.begin().await?;
         sqlx::query("SET LOCAL statement_timeout = '5s'")
@@ -125,11 +228,9 @@ impl Publication<'_> {
         })
     }
 
-    /// Consuming the transaction rolls back every root and receipt on any
-    /// error, including an error from a deferred constraint at commit.
-    async fn commit(
-        mut self,
-        cuts: BTreeMap<String, AccountCut>,
+    async fn verify_inputs(
+        &mut self,
+        cuts: &BTreeMap<String, AccountCut>,
         portal: &FeedBinding,
         signing: &SigningCeilings,
         vault: &ServiceKeyVault,
@@ -168,7 +269,7 @@ impl Publication<'_> {
         // Repeat the same reconstruction used by operator preparation. Read
         // every list before replacing any feed, including lists used to
         // attribute a Portal integration belonging to the same owner.
-        for (genesis, cut) in &cuts {
+        for (genesis, cut) in cuts {
             let staged: bool = sqlx::query_scalar("SELECT EXISTS(
                 SELECT 1 FROM station_delegated_replacement_feeds WHERE plan_id=$1 AND cut_hash=$2 AND feed_hash=$3)")
                 .bind(&cut.plan_id).bind(&cut.cut_hash).bind(&cut.feed_hash)
@@ -224,7 +325,12 @@ impl Publication<'_> {
             // and service coverage still need the final verifier.
             verify(&log, &review, &comparison).await?;
         }
-        for (genesis, cut) in &cuts {
+        Ok(())
+    }
+
+    /// Install receipts and feeds together, including on a deferred commit error.
+    async fn commit(mut self, cuts: &BTreeMap<String, AccountCut>) -> Result<(), sqlx::Error> {
+        for (genesis, cut) in cuts {
             self.install(genesis, cut).await?;
         }
         let updated = sqlx::query(
@@ -637,6 +743,67 @@ mod tests {
                 PRINCIPAL,
             )
         };
+
+        let process_lists = |rows: &[Value]| {
+            let mut files = ProcessLists::default();
+            for cut in cuts(rows).into_values() {
+                for export in cut.process_lists {
+                    files.add(export).unwrap();
+                }
+            }
+            files
+        };
+        let review_inputs = async |rows: &[Value]| {
+            review_publication(
+                &db.pool,
+                &fence,
+                &runtime.binding,
+                signing,
+                &runtime.vault,
+                process_lists(rows),
+            )
+            .await
+        };
+        assert!(review_inputs(&reviews[..1]).await.is_err());
+        let checked = review_inputs(&reviews).await.unwrap();
+        assert_eq!(checked["final_verification"], "pending");
+        assert_eq!(checked["published"], false);
+        let checked_lists = checked["lists"].as_array().unwrap();
+        assert_eq!(checked_lists.len(), reviews.len());
+        for review in &reviews {
+            let row = checked_lists
+                .iter()
+                .find(|row| row["genesis_hash"] == review["genesis_hash"])
+                .unwrap();
+            assert_eq!(row["cut_hash"], review["replacement_feed"]["cut_hash"]);
+            assert_eq!(row["feed_hash"], review["replacement_feed"]["feed_hash"]);
+            assert_eq!(
+                row["process_comparison"]["matching_evidence_confirmations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(review_inputs(&reviews).await.unwrap(), checked);
+        assert!(signing.publication_hold().await.unwrap().is_none());
+        assert!(
+            !inspect(&replica, &fence.origin)
+                .await
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, Value)>(read_roots)
+                .fetch_all(&replica)
+                .await
+                .unwrap(),
+            initial
+        );
+        for i in 0..2 {
+            assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
+        }
 
         let subset = cuts(&reviews[..1]);
         assert!(publish_after_verification(

@@ -818,6 +818,22 @@ The database lets in-flight signing reservations finish before publication
 checks the clocks and refuses new reservations and key registrations until
 the primary recovery transaction settles.
 
+With the generation fenced and the replacement feeds staged, an operator can
+review all lists together. Pass the native **Save Reviewed Processes** exports
+for every device list in this Station generation.
+
+```sh
+station-relay-server admin delegated-recovery review-publication processes-a.json processes-b.json
+```
+
+The command uses the operator's primary and signing databases, Portal reporting
+configuration and service wrapping key. It holds signing reservations while it
+compares the staged feeds with current membership, Portal evidence and process
+exports. On success it prints the reviewed cut and feed hashes for each list.
+It rolls back its primary transaction and releases the signing hold. The
+output includes `"final_verification":"pending"`. Production publication still
+needs signed journal attachments, replacement-copy checks and service coverage.
+
 After a publisher disconnects, use
 `station-relay-server admin delegated-recovery release-signing-hold` with the
 operator's database connections and the current Station origin and generation.
