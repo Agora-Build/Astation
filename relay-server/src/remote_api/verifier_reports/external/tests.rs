@@ -318,8 +318,17 @@ async fn exercise_inbox(origin: &str) {
     assert_eq!(submit(&one).await, accepted);
     assert_eq!(native_read().await.1["reports"], json!([one]));
     assert_eq!(http(&raw).await.1["challenges"], json!([first.to_json()]));
-    assert_eq!(submit(&two).await.0, StatusCode::CONFLICT);
-    assert_eq!(submit(&one).await.0, StatusCode::CONFLICT);
+    let conflict = (StatusCode::CONFLICT, json!({"error":{"code":"verifier_process_conflict"}}));
+    assert_eq!(submit(&two).await, conflict);
+    assert_eq!(submit(&one).await, conflict);
+    assert_eq!(submit(&two).await, conflict);
+    let mut foreign = claims.clone();
+    foreign["client_id"] = json!("i-11234567890123456789012345");
+    assert_eq!(
+        call(reqwest::Method::POST, &answer_path, &issuer.token(issuer.header(), foreign),
+            Some(json!({"report":one}))).await.0,
+        StatusCode::NOT_FOUND
+    );
     let reports = native_read().await.1["reports"].as_array().unwrap().clone();
     assert_eq!(reports.len(), 2);
     assert!(reports.contains(&one) && reports.contains(&two));
@@ -395,6 +404,7 @@ async fn exercise_inbox(origin: &str) {
     changed.record_completed_read(now, now);
     runtime.policies.commit(&previous, &changed).await.unwrap();
     assert_eq!(http(&raw).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(submit(&two).await.0, StatusCode::NOT_FOUND);
     poll(vec![(6, "integration_reconciled", "ready")]).await;
     assert_eq!(http(&raw).await.1["challenges"], json!([]));
     if PortalCheckpoint::built_in(binding) {

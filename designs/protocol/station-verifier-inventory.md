@@ -404,7 +404,6 @@ commit returns `{"accepted":true}`. A retry of the same signed report uses
 the same receipt and original deadline. A native manager reading or retrying
 the challenge must still have access to its original Portal grant.
 
-The proposed conflict behavior is under review on Astation #101 and Portal #41.
 If two SDK processes answered the same fetched challenge, Station retains both
 signed reports so the manager can authenticate the conflict. The second answer
 and subsequent retries return HTTP 409 with `verifier_process_conflict`. The
