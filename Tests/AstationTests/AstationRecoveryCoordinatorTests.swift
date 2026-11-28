@@ -1777,9 +1777,20 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             views.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains(text) }
         }
         var records = try await portal.owned(stationOrigin: coordinator.relayURL)
+        let retired = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": "i-01234567890123456789012346", "name": "Retired bot", "stationOrigin": "https://retired.example",
+            "state": "revoked", "scopes": ["agent.view"], "expiresAt": "2025-01-01T00:00:00Z", "role": "owner",
+            "stationRemoved": true, "pendingHostRevocation": true, "r9Svc": String(repeating: "a", count: 64)
+        ]))
+        let retiredLabel = "Retired bot · https://retired.example"
+        try controller.presentPortalList((records, [retired]), current: { true })
+        let notice = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.stringValue.contains(retiredLabel) })
+        XCTAssertFalse(notice.isHidden)
+        XCTAssertEqual(picker.itemTitles, ["Test bot · awaiting approval"])
+        let accountEpoch = hub.integrationAccountGeneration
         let initialMembership = try await coordinator.serviceMembership()
         try controller.presentRequests(records, membership: initialMembership, coordinator: coordinator,
-            portal: portal, current: { true })
+            portal: portal, current: { hub.integrationAccountGeneration == accountEpoch })
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · awaiting approval")
         XCTAssertTrue(approve.isEnabled)
         approve.performClick(nil)
@@ -1789,6 +1800,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(load.isEnabled, "Approval must complete")
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · provisioning", "Approval must not clear the integration selector")
+        XCTAssertTrue(notice.stringValue.contains(retiredLabel), "Updating a selected integration preserves other Stations' notices")
+        XCTAssertFalse(notice.isHidden)
         XCTAssertTrue(shows("The Station is preparing this integration"))
         XCTAssertFalse(approve.isEnabled)
         XCTAssertFalse(review.isEnabled)
@@ -1797,7 +1810,16 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let posts = await transport.count()
         XCTAssertEqual(posts, 1)
 
-        controller.cancelPending()
+        // Changing the Station retires the displayed account context while the tab remains open.
+        hub._testRelayUrlOverride = "https://replacement.example"
+        try hub.configureIntegrationRelayAuth()
+        XCTAssertNotEqual(hub.integrationAccountGeneration, accountEpoch)
+        for _ in 0..<100 where !notice.isHidden { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
+        XCTAssertThrowsError(try controller.presentPortalList((records, [retired]), current: { false }))
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
         XCTAssertEqual(picker.titleOfSelectedItem, "Load requests to choose an integration")
         XCTAssertFalse(shows("The Station is preparing this integration"), "Closing clears stale status text")
         XCTAssertEqual(sessions.stringValue, "")
@@ -1805,6 +1827,12 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         await transport.setState("ready")
         records = try await portal.owned(stationOrigin: coordinator.relayURL)
         let membership = try await coordinator.serviceMembership()
+        try controller.presentPortalList(([], [retired]), current: { true })
+        XCTAssertEqual(picker.itemTitles, ["No integrations on this Station"])
+        XCTAssertTrue(notice.stringValue.contains(retiredLabel))
+        try controller.presentPortalList((records, []), current: { true })
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
         try controller.presentRequests(records, membership: membership, coordinator: coordinator,
             portal: portal, current: { true }, selectedID: approval.integrationID)
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · ready")
