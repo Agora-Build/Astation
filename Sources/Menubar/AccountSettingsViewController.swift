@@ -1,4 +1,5 @@
 import AppKit
+import AtemClient
 import AstationRemote
 
 final class AccountSettingsViewController: NSViewController {
@@ -8,6 +9,8 @@ final class AccountSettingsViewController: NSViewController {
     private let status = NSTextField(wrappingLabelWithString: "")
     private lazy var signIn = NSButton(title: "Sign in to Agora.Build", target: self, action: #selector(login))
     private lazy var signOut = NSButton(title: "Sign out", target: self, action: #selector(logout))
+    private lazy var stationOwnership = NSButton(title: "Review Station Ownership…", target: self, action: #selector(reviewStationOwnership))
+    private lazy var incomingConsent = NSButton(title: "Review Incoming Ownership Request…", target: self, action: #selector(reviewIncomingConsent))
     private var busy = false
     private var loginTask: Task<Void, Never>?
     private var loginAuth: AstationAccountAuth?
@@ -29,8 +32,8 @@ final class AccountSettingsViewController: NSViewController {
         identity.font = .systemFont(ofSize: 13, weight: .medium); identity.isSelectable = true
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [signIn, signOut]); actions.spacing = 10
-        [signIn, signOut].forEach { $0.bezelStyle = .rounded }
-        [title, description, identity, actions, status].forEach { stack.addArrangedSubview($0) }
+        [signIn, signOut, stationOwnership, incomingConsent].forEach { $0.bezelStyle = .rounded }
+        [title, description, identity, actions, stationOwnership, incomingConsent, status].forEach { stack.addArrangedSubview($0) }
         stack.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -47,13 +50,17 @@ final class AccountSettingsViewController: NSViewController {
     @objc private func sessionChanged() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if self.busy, self.loginAuth !== self.auth {
-                self.loginTask?.cancel(); self.loginAuth = nil; self.busy = false
+            if let task = self.loginTask, self.loginAuth !== self.auth {
+                task.cancel(); self.loginTask = nil; self.loginAuth = nil; self.busy = false
             }
             self.refresh()
         }
     }
     private func refresh() {
+        stationOwnership.isHidden = !["https://station-dev.agora.build", "https://station.agora.build"].contains(hub.stationRelayUrl)
+        incomingConsent.isHidden = stationOwnership.isHidden
+        stationOwnership.isEnabled = !busy && !hub.needsAccountSignIn
+        incomingConsent.isEnabled = stationOwnership.isEnabled
         guard isViewLoaded, !busy else { return }
         Task { @MainActor in
             do {
@@ -76,6 +83,110 @@ final class AccountSettingsViewController: NSViewController {
             }
         }
     }
+    @MainActor @objc private func reviewStationOwnership() { reviewOwnership(incoming: false) }
+    @MainActor @objc private func reviewIncomingConsent() { reviewOwnership(incoming: true) }
+
+    @MainActor private func reviewOwnership(incoming: Bool) {
+        guard !busy, let owner = hub.signedInAccount, !hub.needsAccountSignIn else { return }
+        let origin = hub.stationRelayUrl, epoch = hub.integrationAccountGeneration
+        let authorization = hub.accountAuth
+        func current() -> Bool {
+            hub.stationRelayUrl == origin && hub.integrationAccountGeneration == epoch &&
+                hub.signedInAccount == owner && !hub.needsAccountSignIn && hub.accountAuth === authorization
+        }
+        busy = true
+        stationOwnership.isEnabled = false
+        incomingConsent.isEnabled = false
+        signIn.isEnabled = false
+        signOut.isEnabled = false
+        Task { @MainActor in
+            defer {
+                busy = false
+                signIn.isEnabled = auth?.configuration != nil
+                signOut.isEnabled = hub.signedInAccount != nil
+                stationOwnership.isEnabled = !hub.needsAccountSignIn
+                incomingConsent.isEnabled = stationOwnership.isEnabled
+                if !current() { refresh() }
+            }
+            do {
+                _ = try await authorization.accessToken(relayURL: origin)
+                guard current(), let session = try await authorization.current()?.session,
+                      current(), session.subject == owner else { throw AccountLoginError.changed }
+                if incoming {
+                    let client = try RemoteStationBindingApproval(origin: origin)
+                    let outcome = try await client.reviewConsent(session: session,
+                        now: { UInt64(Date().timeIntervalSince1970 * 1000) }, current: current) { challenge in
+                        guard current(), self.view.window?.isVisible == true else { return false }
+                        let alert = NSAlert()
+                        alert.messageText = challenge.action == .transfer ? "Allow this ownership transfer?" : "Allow this device list to be bound?"
+                        let expiry = Date(timeIntervalSince1970: Double(challenge.expiresAt) / 1000)
+                        alert.informativeText = """
+                            The proposed owner's account status will control whether Station serves hosts for this device list.
+
+                            Device list: \(challenge.accountId)
+                            Proposed Agora.Build owner: \(challenge.subject)
+                            Station: \(origin)
+                            Signed in as: \(owner)
+                            Expires: \(expiry.formatted(date: .omitted, time: .standard))
+                            """
+                        alert.addButton(withTitle: "Cancel")
+                        alert.addButton(withTitle: "Allow Ownership Change")
+                        return alert.runModal() == .alertSecondButtonReturn
+                    }
+                    guard current() else { return }
+                    switch outcome {
+                    case .noRequest: status.stringValue = "No ownership requests are waiting for this account."
+                    case .recorded: status.stringValue = "Station recorded your consent."
+                    case .cancelled: return
+                    }
+                    status.textColor = .secondaryLabelColor
+                    return
+                }
+                let coordinator = try hub.recoveryCoordinator()
+                let receipt = coordinator.lastStationBindingReceipt
+                let previous = receipt?.ownership ?? .neverBound
+                let pending = coordinator.hasPendingStationBinding
+                let submission: AstationRecoveryCoordinator.StationBindingSubmission
+                let label: String
+                let details: String
+                if pending {
+                    submission = .retry
+                    label = "Check Previous Request"
+                    details = "Check the Station's receipt for the ownership request already approved on this Mac."
+                } else if let receipt, receipt.bindingState == "bound" {
+                    let action: BindingAction = receipt.account == owner ? .unbind : .transfer
+                    submission = .change(action, previous)
+                    label = action == .unbind ? "Review Unbind…" : "Review Transfer…"
+                    details = "This Mac last confirmed owner " + receipt.account + " at version " + String(receipt.version) + ". " +
+                        (action == .unbind ? "Unbinding stops this Station from serving these hosts." :
+                            "A transfer needs the current owner's separate consent.")
+                } else {
+                    submission = .change(.bind, previous)
+                    label = "Review Binding…"
+                    details = "Bind this device list to your Agora.Build account so its account status controls service at this Station."
+                }
+                let alert = NSAlert()
+                alert.messageText = "Station ownership"
+                alert.informativeText = details + "\n\nStation: " + origin + "\nSigned in as: " + owner
+                alert.addButton(withTitle: "Cancel")
+                alert.addButton(withTitle: label)
+                guard alert.runModal() == .alertSecondButtonReturn, current() else { return }
+                let confirmed = try await coordinator.submitStationBinding(submission,
+                    session: session, current: current, awaitingConsent: {
+                        self.status.stringValue = "Waiting for the other owners. They can review the request in Settings > Account."
+                        self.status.textColor = .secondaryLabelColor
+                    })
+                guard current() else { return }
+                status.stringValue = "Station confirmed " + confirmed.bindingState + " at version " + String(confirmed.version) + "."
+                status.textColor = .secondaryLabelColor
+            } catch {
+                guard current() else { return }
+                status.stringValue = error.localizedDescription
+                status.textColor = .systemRed
+            }
+        }
+    }
+
     @objc private func login() {
         guard !busy else { return }; busy = true; signIn.isEnabled = false; signOut.isEnabled = false
         let context = auth
@@ -86,11 +197,13 @@ final class AccountSettingsViewController: NSViewController {
                 if hub.signedInAccount != nil, !hub.accountSignInRequired, hub.stationAccountSignInRequired {
                     try await hub.prepareAccountSecurityAccess()
                 } else { try await hub.signInAccount() }
-                guard loginAuth === context else { return }
+                guard !Task.isCancelled, loginAuth === context else { return }
+                loginTask = nil; loginAuth = nil
                 busy = false; refresh()
             }
             catch {
-                guard loginAuth === context else { return }
+                guard !Task.isCancelled, loginAuth === context else { return }
+                loginTask = nil; loginAuth = nil
                 busy = false; status.stringValue = error.localizedDescription; status.textColor = .systemRed
                 signIn.isEnabled = true; signOut.isEnabled = true
             }

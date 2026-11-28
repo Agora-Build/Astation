@@ -580,6 +580,82 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         return (log, gate, request)
     }
 
+    func testStationTransferUsesTheExistingMacManagerKeyToSignAFreshChallenge() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var callsAtConfirmation: Int?
+        try await verifyStationTransfer(h) { _ in
+            callsAtConfirmation = h.identityCryptography.signingCalls
+            return true
+        }
+        XCTAssertEqual(h.identityCryptography.signingCalls, try XCTUnwrap(callsAtConfirmation) + 1)
+    }
+
+    func testProvisionedStationTransferWithDeviceOwnerAuthentication() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] == "1",
+              environment["ASTATION_TEST_OWNER_PRESENCE"] == "1" else {
+            throw XCTSkip("Run the provisioned test with ASTATION_TEST_OWNER_PRESENCE=1 and the owner present.")
+        }
+        let account = "station-transfer-test-" + UUID().uuidString
+        let storage = AtemIdentityKeychainStorage(astationId: account)
+        defer {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "build.agora.astation.atem-e2e-v1", kSecAttrAccount as String: account,
+                kSecUseDataProtectionKeychain as String: true]
+            let status = SecItemDelete(query as CFDictionary)
+            XCTAssertTrue(status == errSecSuccess || status == errSecItemNotFound)
+        }
+        let h = RecoveryCoordinatorHarness()
+        h.identity = AtemE2EIdentity(storage: storage)
+        try await verifyStationTransfer(h) { review in
+            // The proof must use the same protected manager identity after a reload.
+            h.identity = AtemE2EIdentity(storage: storage)
+            return await withCheckedContinuation { continuation in
+                DeviceOwnerAuth.authenticate(reason: "Local Astation test with a disposable account. " + review.confirmation) {
+                    continuation.resume(returning: $0)
+                }
+            }
+        }
+    }
+
+    private func verifyStationTransfer(_ h: RecoveryCoordinatorHarness,
+        confirm: (RemoteStationBindingApproval.Review) async -> Bool) async throws {
+        let origin = "https://station-dev.agora.build"
+        let coordinator = try h.coordinator(relayURL: origin)
+        _ = try await coordinator.setup()
+        let saved = await h.relay.log
+        let log = try XCTUnwrap(saved).snapshot()
+        let now = AstationRecoveryCoordinator.clock().wallMs
+        let claims = AuthClaims(issuer: "https://auth.dev.agora.build", subject: "ab00000000000000000000000001",
+            authTime: now / 1000)
+        let previous = ExpectedBinding.bound(bindingId: "binding-one", version: 4, owner: "ab00000000000000000000000002")
+        let challenge = try stationBindingChallenge(action: .transfer, origin: origin, claims: claims,
+            accountId: log.accountId(), genesisHash: log.genesisHash(), head: log.head(), signer: "member:manager-a",
+            expectedBinding: previous, issuedAt: now, expiresAt: now + 30_000)
+        RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = { _, _ in Data(challenge.utf8) } }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        let network = URLSessionConfiguration.ephemeral
+        network.protocolClasses = [RecoveryReportHTTPStub.self]
+        let approvals = try RemoteStationBindingApproval(origin: origin, http: AccountURLSessionHTTP(configuration: network))
+        let configuration = try AccountOIDCConfiguration(issuer: claims.issuer, clientID: "astation",
+            resource: origin, requiredScope: "astation.remote")
+        let session = AccountLoginSession(configuration: configuration, subject: claims.subject,
+            accessToken: "fixture-token", refreshToken: "", expiresAt: Date().addingTimeInterval(60),
+            authenticatedAt: Int64(claims.authTime))
+        let proof = try await approvals.prove(action: .transfer, previous: previous, session: session,
+            managerID: "manager-a", membership: { log }, now: { AstationRecoveryCoordinator.clock().wallMs },
+            current: { true }, confirm: { review in
+                XCTAssertEqual(review.subject, session.subject)
+                XCTAssertEqual(review.previous, previous)
+                return await confirm(review)
+            }, sign: { try h.identity.signStationBinding($0, expectedKey: $1) })
+        let checked = try verifyStationBinding(log: log, proofJson: proof, expectedChallengeJson: challenge,
+            nowMs: AstationRecoveryCoordinator.clock().wallMs)
+        XCTAssertTrue(checked.atHead)
+        XCTAssertEqual(checked.expectedBinding, previous)
+        XCTAssertEqual(checked.signer, "member:manager-a")
+    }
+
     func testLocalVerifierUsesTheLoadedCoreAndExactExistingNativeKeys() async throws {
         let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
         _ = try await coordinator.setup()
