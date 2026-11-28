@@ -68,7 +68,7 @@ impl StationIntegrations {
         let policy = checkpoint.owned(id, &context.owner, now)?;
         // Expiry changes API access only and cannot release an earlier hold.
         let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
-        if desired == ServiceDesired::Active && !policy.grant_unexpired(now) {
+        if desired == ServiceDesired::Active && !policy.confirms_control_release(now) {
             return Ok(());
         }
         let signer = crate::service_keys::load_approved_in(
@@ -880,6 +880,64 @@ mod tests {
             .fetch_one(&database.pool).await.unwrap();
         assert_eq!(revocation["revoked_at_ms"], revoked_at.timestamp_millis());
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_ordinary_feed_carries_hold_and_first_revocation_time() {
+        use super::super::tests::{append_body, fixture, request};
+        use crate::integration_feed::FeedPage;
+        let (db, runtime, f) = fixture().await;
+        let genesis = f.log.genesis_hash().to_hex();
+        runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        let mut row = serde_json::to_value(&runtime.policies.load(&runtime.binding).await.unwrap().integrations[ID]).unwrap();
+        row["id"] = json!(ID);
+        row["r9Svc"] = draft["fingerprint"].clone();
+        row["state"] = json!("expired");
+        row["expiresAt"] = json!("2000-01-01T00:00:00.000Z");
+        let poll = async |row: &Value| {
+            let old = runtime.policies.load(&runtime.binding).await.unwrap();
+            let cursor = old.cursor + 1;
+            let mut page = json!({"cursor":cursor,"changes":[{"id":cursor,
+                "integrationId":ID,"kind":"integration_reconciled","integration":row}]});
+            if old.cursor == 0 { page["integrations"] = json!([row]); }
+            let now = chrono::Utc::now().timestamp();
+            let next = old.apply(old.cursor, FeedPage::parse(&serde_json::to_vec(&page).unwrap()).unwrap(), now)?;
+            assert!(next.current(ID, OWNER, now).is_err(), "expired API grant");
+            runtime.policies.commit(&old, &next).await?;
+            runtime.reconcile_delegated_service(ID).await
+        };
+        for held in [true, true, false, false] {
+            row["held"] = json!(held);
+            poll(&row).await.unwrap();
+        }
+        let at = chrono::Utc::now() - chrono::Duration::hours(25);
+        row.as_object_mut().unwrap().remove("held");
+        row["state"] = json!("revoking");
+        row["revokedAt"] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        row["interruptRunning"] = json!(false);
+        poll(&row).await.unwrap();
+        row["state"] = json!("revoked");
+        row["interruptRunning"] = json!(true);
+        let mut conflicting = row.clone();
+        conflicting["revokedAt"] = json!("2026-01-01T00:00:00.000Z");
+        assert!(poll(&conflicting).await.is_err());
+        row.as_object_mut().unwrap().remove("revokedAt");
+        poll(&row).await.unwrap();
+        let saved = runtime.policies.load(&runtime.binding).await.unwrap();
+        assert_eq!(saved.known_revocation_ms(ID), Ok(Some(at.timestamp_millis() as u64)));
+        let records = feed(&runtime, &genesis).await;
+        let actions: Vec<_> = records.iter().map(|r| r["body"]["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["cover", "hold", "release", "revoke", "interrupt_running"]);
+        let ledger_time: i64 = sqlx::query_scalar(
+            "SELECT (state->'delegated'->$2->'ledger'->'revocations'->$3->>'revoked_at_ms')::bigint
+             FROM remote_recovery_roots WHERE genesis_hash=$1",
+        ).bind(&genesis).bind(&runtime.binding.station_origin).bind(format!("service:svc-{ID}"))
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(ledger_time, at.timestamp_millis());
+        db.cleanup().await;
     }
 
     #[tokio::test]

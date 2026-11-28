@@ -645,6 +645,8 @@ pub(crate) enum ServiceDesired {
 impl ServiceDesired {
     pub(crate) fn from_policy(policy: &crate::integration_feed::IntegrationPolicy) -> Option<Self> {
         match policy.state.as_str() {
+            "expired" => policy.held.map(|held| if held { Self::Held } else { Self::Active }),
+            "provisioning" | "waiting_for_host" | "ready" if policy.held == Some(true) => Some(Self::Held),
             "provisioning" | "waiting_for_host" | "ready" => Some(Self::Active),
             "paused" => Some(Self::Held),
             "revoking" | "revoked" => Some(Self::Revoked {
@@ -689,7 +691,7 @@ impl super::RecoveryStore {
                 return true;
             }
             let now = chrono::Utc::now();
-            checkpoint.current(&context.integration_id, &context.owner, now.timestamp()).is_ok()
+            checkpoint.allows_control_release(&context.integration_id, &context.owner, now.timestamp())
                 && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis())
         };
         if !policy_allows_signing() || (desired == ServiceDesired::Active

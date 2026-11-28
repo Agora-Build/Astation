@@ -83,6 +83,10 @@ pub(crate) struct IntegrationPolicy {
     pub quota_per_second: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_running: Option<bool>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub held: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
 }
 
 impl IntegrationPolicy {
@@ -90,8 +94,18 @@ impl IntegrationPolicy {
         self.expires_at().is_ok_and(|expiry| now < expiry)
     }
 
+    pub(crate) fn confirms_control_release(&self, now: i64) -> bool {
+        if !matches!(self.state.as_str(), "provisioning" | "waiting_for_host" | "ready" | "expired") {
+            return false;
+        }
+        match self.held {
+            Some(held) => !held,
+            None => self.state != "expired" && self.grant_unexpired(now),
+        }
+    }
+
     fn permits_external_verifier(&self, now: i64) -> bool {
-        self.r9_svc.is_some()
+        self.r9_svc.is_some() && self.held != Some(true)
             && matches!(self.state.as_str(), "provisioning" | "ready" | "waiting_for_host")
             && self.grant_unexpired(now)
     }
@@ -113,6 +127,12 @@ impl IntegrationPolicy {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ()> {
+        let stopped = matches!(self.state.as_str(), "revoking" | "revoked");
+        if (stopped && self.held.is_some()) || (self.state == "paused" && self.held == Some(false))
+            || self.revoked_at.as_deref().is_some_and(|at| !stopped || !crate::integration_checkpoint::timestamp(at))
+        {
+            return Err(());
+        }
         if self.owner_account.len() != 28
             || !self.owner_account.starts_with("ab")
             || !self.owner_account.as_bytes()[2..]
@@ -164,6 +184,19 @@ impl IntegrationPolicy {
         chrono::DateTime::parse_from_rfc3339(&self.expires_at)
             .map(|d| d.timestamp())
             .map_err(|_| ())
+    }
+
+    fn retain_revocation_time(&mut self, prior: &Self) -> Result<(), ()> {
+        if self.owner_account != prior.owner_account { return Err(()); }
+        if let Some(at) = &prior.revoked_at {
+            if !self.preserves_observed_lifecycle(prior)
+                || self.revoked_at.as_ref().is_some_and(|next| next != at)
+            {
+                return Err(());
+            }
+            self.revoked_at = Some(at.clone());
+        }
+        Ok(())
     }
 }
 
@@ -315,17 +348,13 @@ impl PolicyCheckpoint {
         next.binding_releases.clear();
         if let Some(snapshot) = page.integrations {
             next.integrations.clear();
-            for row in snapshot {
+            for mut row in snapshot {
                 if !client_id(&row.id, "i-") || next.integrations.contains_key(&row.id) {
                     return Err(());
                 }
                 row.policy.validate()?;
-                if self
-                    .integrations
-                    .get(&row.id)
-                    .is_some_and(|old| old.owner_account != row.policy.owner_account)
-                {
-                    return Err(());
+                if let Some(prior) = self.integrations.get(&row.id) {
+                    row.policy.retain_revocation_time(prior)?;
                 }
                 next.integrations.insert(row.id, row.policy);
             }
@@ -376,14 +405,11 @@ impl PolicyCheckpoint {
                 match &change.integration {
                     Some(policy) => {
                         policy.validate()?;
-                        if self
-                            .integrations
-                            .get(id)
-                            .is_some_and(|old| old.owner_account != policy.owner_account)
-                        {
-                            return Err(());
+                        let mut policy = policy.clone();
+                        if let Some(prior) = next.integrations.get(id).or_else(|| self.integrations.get(id)) {
+                            policy.retain_revocation_time(prior)?;
                         }
-                        next.integrations.insert(id.to_owned(), policy.clone());
+                        next.integrations.insert(id.to_owned(), policy);
                     }
                     None => {
                         next.integrations.remove(id);
@@ -394,6 +420,14 @@ impl PolicyCheckpoint {
             }
         }
         if page.cursor != previous {
+            return Err(());
+        }
+        for (id, policy) in &next.integrations {
+            if policy.revoked_at.is_some() {
+                next.known_revocation_ms(id)?;
+            }
+        }
+        if self.integrations.iter().any(|(id, old)| old.revoked_at.is_some() && !next.integrations.contains_key(id)) {
             return Err(());
         }
         // A reset or malformed availability change needs another exact checkpoint.
@@ -433,7 +467,8 @@ impl PolicyCheckpoint {
         }
         for (id, old) in &self.integrations {
             match snapshot.integrations.get(id) {
-                Some(row) if !row.policy.preserves_observed_lifecycle(old) => return Err(()),
+                Some(row) if !row.policy.preserves_observed_lifecycle(old)
+                    || old.revoked_at.is_some() && old.revoked_at != row.revoked_at => return Err(()),
                 None if matches!(old.state.as_str(), "revoking" | "revoked") => return Err(()),
                 _ => {}
             }
@@ -610,26 +645,35 @@ impl PolicyCheckpoint {
             && now.checked_sub(self.received_at).is_some_and(|age| (0..MAX_POLICY_AGE_SECS).contains(&age))
     }
 
-    /// A terminal checkpoint preserves the original Portal revocation time across
-    /// later feed changes, including an interrupt requested after revocation.
+    pub(crate) fn allows_control_release(&self, id: &str, owner: &str, now: i64) -> bool {
+        let Ok(live) = self.owned(id, owner, now) else { return false };
+        if !live.confirms_control_release(now) { return false; }
+        // A checkpoint can observe a pause before ordinary polling reaches that event.
+        self.portal_snapshot.as_ref().filter(|cut| cut.cursor >= self.cursor).is_none_or(|cut| {
+            cut.integrations.get(id).is_some_and(|row| row.policy.same_verifier(live)
+                && row.policy.confirms_control_release(now))
+        })
+    }
+
+    /// Either authenticated source can be the first to observe a revocation.
     pub(crate) fn known_revocation_ms(&self, id: &str) -> Result<Option<u64>, ()> {
-        let Some(snapshot) = &self.portal_snapshot else {
+        let Some(current) = self.integrations.get(id) else {
             return Ok(None);
         };
-        if snapshot.binding != self.binding {
+        if !matches!(current.state.as_str(), "revoking" | "revoked") {
+            return Ok(None);
+        }
+        if self.portal_snapshot.as_ref().is_some_and(|cut| cut.binding != self.binding) {
             return Err(());
         }
-        let Some(row) = snapshot.integrations.get(id) else {
-            return Ok(None);
-        };
-        let current = self.integrations.get(id).ok_or(())?;
-        if !matches!(row.policy.state.as_str(), "revoking" | "revoked")
-            || !matches!(current.state.as_str(), "revoking" | "revoked")
-            || !row.policy.same_verifier(current)
-        {
-            return Ok(None);
+        let checkpoint_at = self.portal_snapshot.as_ref().and_then(|cut| cut.integrations.get(id))
+            .filter(|row| row.policy.same_verifier(current) && matches!(row.policy.state.as_str(), "revoking" | "revoked"))
+            .and_then(|row| row.revoked_at.as_deref());
+        let ordinary_at = current.revoked_at.as_deref();
+        if matches!((ordinary_at, checkpoint_at), (Some(a), Some(b)) if a != b) {
+            return Err(());
         }
-        row.revoked_at.as_deref().map(|at| {
+        ordinary_at.or(checkpoint_at).map(|at| {
             let time = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| ())?;
             u64::try_from(time.timestamp_millis()).map_err(|_| ())
         }).transpose()
@@ -649,7 +693,7 @@ impl PolicyCheckpoint {
 
     pub fn current(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         let policy = self.owned(id, owner, now)?;
-        if !policy.grant_unexpired(now) { return Err(()); }
+        if policy.held == Some(true) || !policy.grant_unexpired(now) { return Err(()); }
         Ok(policy)
     }
 

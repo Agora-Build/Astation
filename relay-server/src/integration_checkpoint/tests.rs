@@ -63,6 +63,51 @@ fn exact_checkpoint_retains_accounts_bindings_and_unknown_legacy_revocation_time
 }
 
 #[test]
+fn held_is_an_optional_boolean_for_nonterminal_integrations() {
+    for built_in in [true, false] {
+        let config = binding(built_in);
+        let mut value = source(built_in);
+        value["checkpoint"]["integrations"][0]["state"] = json!("expired");
+        for held in [true, false] {
+            value["checkpoint"]["integrations"][0]["held"] = json!(held);
+            let cut = parse(&value, &config).unwrap();
+            assert_eq!(cut.integrations[ID].policy.held, Some(held));
+        }
+        for malformed in [Value::Null, json!("false"), json!(0)] {
+            value["checkpoint"]["integrations"][0]["held"] = malformed;
+            assert!(parse(&value, &config).is_err());
+        }
+        let row = &mut value["checkpoint"]["integrations"][0];
+        row["state"] = json!("revoked");
+        row["revokedAt"] = Value::Null;
+        row["interruptRunning"] = json!(false);
+        row["held"] = json!(false);
+        assert!(parse(&value, &config).is_err());
+    }
+}
+
+#[test]
+fn a_more_recent_checkpoint_hold_blocks_an_ordinary_release_even_after_expiry() {
+    let config = binding(false);
+    let mut cut = source(false);
+    let row = &mut cut["checkpoint"]["integrations"][0];
+    row["state"] = json!("expired");
+    row["expiresAt"] = json!("2000-01-01T00:00:00.000Z");
+    row["held"] = json!(false);
+    let ordinary = json!({"changes":[],"cursor":0,"integrations":[row]});
+    let now = 1_800_000_000;
+    let policy = PolicyCheckpoint::empty(config.clone()).unwrap()
+        .apply(0, serde_json::from_value(ordinary).unwrap(), now).unwrap();
+    assert!(policy.allows_control_release(ID, OWNER, now));
+    for held in [true, false] {
+        cut["checkpoint"]["integrations"][0]["held"] = json!(held);
+        let next = policy.apply_checkpoint(parse(&cut, &config).unwrap(), now).unwrap();
+        assert_eq!(next.allows_control_release(ID, OWNER, now), !held);
+        assert!(next.current(ID, OWNER, now).is_err());
+    }
+}
+
+#[test]
 fn incomplete_accounts_never_mean_an_absent_account_is_enabled() {
     let mut value = source(true);
     value["checkpoint"]["accounts"]["complete"] = json!(false);

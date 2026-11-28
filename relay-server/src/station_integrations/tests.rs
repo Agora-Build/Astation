@@ -659,23 +659,30 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
     let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding), Some(&runtime.vault));
     let future = "2099-01-01T00:00:00.000Z";
     let elapsed = "2000-01-01T00:00:00.000Z";
-    for (state, expires_at, expected) in [
-        ("paused",elapsed,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
-        ("ready",future,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
-        ("expired",future,json!({"status":"pre_expiry_state_unresolved"})),
-        ("ready",elapsed,json!({"status":"pre_expiry_state_unresolved"})),
-        ("ready",future,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+    let held_review = json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]});
+    let released_review = json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]});
+    let unknown = json!({"status":"pre_expiry_state_unresolved"});
+    for (state, expires_at, held, expected) in [
+        ("paused", elapsed, None, &held_review),
+        ("expired", future, None, &unknown),
+        ("ready", elapsed, None, &unknown),
+        ("expired", elapsed, Some(true), &held_review),
+        ("expired", elapsed, Some(false), &released_review),
+        ("ready", future, None, &released_review),
     ] {
         let previous = runtime.policies.load(&runtime.binding).await.unwrap();
-        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+        let mut source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
             "id":ID,"ownerAccount":OWNER,"state":state,"scopes":["agent.view"],"r9Svc":draft["fingerprint"],
             "expiresAt":expires_at,"quotaPerSecond":10
         }]}});
+        if let Some(held) = held { source["checkpoint"]["integrations"][0]["held"] = json!(held); }
         let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
         let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
         runtime.policies.commit_for_recovery(&previous,&next,Some(&fence)).await.unwrap();
         let result = review().await.unwrap();
-        assert_eq!(result["portal_service_evidence"]["services"][0]["snapshot_review"],expected);
+        let service = &result["portal_service_evidence"]["services"][0];
+        assert_eq!(&service["snapshot_review"], expected);
+        assert_eq!(service["observation"].get("held").and_then(Value::as_bool), held);
         assert_eq!(result["recovery_ready"], false);
     }
     // An authenticated snapshot alone cannot renew the ordinary policy lease.
