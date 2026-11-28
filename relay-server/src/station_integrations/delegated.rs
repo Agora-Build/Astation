@@ -1,6 +1,6 @@
 use super::*;
 use crate::remote_api::recovery::delegated::{
-    Command, LedgerUpdate, ReportControlEvent, ServiceDesired,
+    Command, LedgerUpdate, ReportControlEvent, ServiceDesired, ServiceReconciliation,
 };
 use crate::remote_api::recovery::delegated_recovery::plan::reporting_history::reconcile_report_restart;
 use atem_client::control::{AckLedger, ReportAnswer, ReportIntent};
@@ -47,6 +47,19 @@ impl StationIntegrations {
     }
 
     async fn reconcile_delegated_service(&self, id: &str) -> Result<(), ()> {
+        loop {
+            match self.reconcile_service_once(id).await? {
+                ServiceReconciliation::Current => return Ok(()),
+                ServiceReconciliation::FeedChanged => {
+                    self.app.recovery.notify_delegated_change();
+                    return Ok(());
+                }
+                ServiceReconciliation::TimeSavedWithControlsPending => continue,
+            }
+        }
+    }
+
+    async fn reconcile_service_once(&self, id: &str) -> Result<ServiceReconciliation, ()> {
         let context = self.context(id).await.map_err(|_| ())?;
         let principal = self.owner_principal(&context.owner).await.map_err(|_| ())?;
         let mut tx = self.policies.0.begin().await.map_err(|_| ())?;
@@ -67,26 +80,15 @@ impl StationIntegrations {
         let now = chrono::Utc::now().timestamp();
         let policy = checkpoint.owned(id, &context.owner, now)?;
         // Expiry changes API access only and cannot release an earlier hold.
-        let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
+        let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(ServiceReconciliation::Current) };
         if desired == ServiceDesired::Active && !policy.confirms_control_release(now) {
-            return Ok(());
+            return Ok(ServiceReconciliation::Current);
         }
-        let signer = crate::service_keys::load_approved_in(
-            &mut tx,
-            &self.vault,
-            &context,
-            policy.r9_svc.as_deref().ok_or(())?,
-        )
-        .await?;
-        let recovery = &self.app.recovery;
-        let published = recovery
-            .reconcile_service_in(&mut tx, &principal, &context, &signer, desired, &checkpoint)
+        let result = self.app.recovery
+            .reconcile_service_in(&mut tx, &principal, &context, &self.vault, desired, &checkpoint)
             .await?;
         tx.commit().await.map_err(|_| ())?;
-        if published {
-            recovery.notify_delegated_change();
-        }
-        Ok(())
+        Ok(result)
     }
 
     pub(super) async fn run_delegated_reports(self: Arc<Self>) {
@@ -842,7 +844,26 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_revocation_uses_portal_time_after_station_downtime() {
-        use super::super::tests::{append_body, fixture, request};
+        check_portal_revocation_time(DateArrival::AtIntake).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_updates_existing_revoke_without_signing_again() {
+        check_portal_revocation_time(DateArrival::AfterKeyRemoval).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_survives_failed_interrupt_and_retry() {
+        check_portal_revocation_time(DateArrival::WithInterrupt).await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DateArrival { AtIntake, AfterKeyRemoval, WithInterrupt }
+
+    async fn check_portal_revocation_time(arrival: DateArrival) {
+        use super::super::tests::{append_body, fixture, request, signed_action};
         let (database, runtime, f) = fixture().await;
         let genesis = f.log.genesis_hash().to_hex();
         runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
@@ -853,8 +874,36 @@ mod tests {
         runtime.reconcile_delegated_service(ID).await.unwrap();
         // The ordinary feed carries the stop. The authenticated checkpoint dates it.
         policy(&runtime, "revoking", fingerprint, Some(false)).await;
-        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
         let revoked_at = chrono::Utc::now() - chrono::Duration::hours(25);
+        let read_pool = database.reconnect(1).await;
+        let stored = async || {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT state->'delegated'->$2 FROM remote_recovery_roots WHERE genesis_hash=$1",
+            ).bind(&genesis).bind(&runtime.binding.station_origin).fetch_one(&read_pool).await.unwrap()
+        };
+        let principal = format!("service:svc-{ID}");
+        let first = if arrival != DateArrival::AtIntake {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+            let feed = stored().await;
+            let revoke = feed["records"].as_array().unwrap().last().unwrap();
+            assert_eq!(revoke["body"]["action"], "revoke");
+            assert_eq!(feed["ledger"]["revocations"][&principal]["revoked_at_ms"], revoke["body"]["issued_at"]);
+            if arrival == DateArrival::AfterKeyRemoval {
+                signed_action(&runtime, &f, atem_client::membership::Action::Remove {
+                    device_id: format!("svc-{ID}"),
+                }).await;
+                runtime.report_revocations().await;
+                let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")
+                    .fetch_one(&read_pool).await.unwrap();
+                assert_eq!(keys, 0);
+            } else {
+                policy(&runtime, "revoked", fingerprint, Some(true)).await;
+            }
+            Some(feed)
+        } else {
+            None
+        };
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
         let mut row = serde_json::to_value(&previous.integrations[ID]).unwrap();
         row["id"] = json!(ID);
         row["revokedAt"] = json!(revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
@@ -872,13 +921,41 @@ mod tests {
         legacy.portal_snapshot.as_mut().unwrap().integrations.get_mut(ID).unwrap().revoked_at = None;
         assert_eq!(legacy.known_revocation_ms(ID), Ok(None));
         runtime.policies.commit(&previous, &next).await.unwrap();
+        if arrival == DateArrival::WithInterrupt {
+            sqlx::raw_sql("CREATE FUNCTION refuse_interrupt() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'test reservation failure'; END $$;
+                CREATE TRIGGER refuse_interrupt BEFORE UPDATE ON station_service_signing_ceilings
+                FOR EACH ROW EXECUTE FUNCTION refuse_interrupt()").execute(&database.pool).await.unwrap();
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+            sqlx::query("DROP TRIGGER refuse_interrupt ON station_service_signing_ceilings")
+                .execute(&database.pool).await.unwrap();
+        } else {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+        }
+        let learned = stored().await;
+        assert_eq!(learned["ledger"]["revocations"][&principal]["revoked_at_ms"], revoked_at.timestamp_millis());
+        let reports = AckLedger::from_json(&learned["ledger"]).unwrap().pending_reports();
+        assert_eq!(reports.len(), 1);
+        let final_report = reports[0].report.to_json();
+        assert_eq!(final_report["integration_id"], ID);
+        assert_eq!(final_report["outcome"], "deadline_passed");
+        if let Some(first) = first {
+            assert_eq!(first["records"], learned["records"]);
+            assert_eq!(first["signing_high_water"], learned["signing_high_water"]);
+        }
         runtime.reconcile_delegated_service(ID).await.unwrap();
-        runtime.reconcile_delegated_service(ID).await.unwrap();
-        let revocation: Value = sqlx::query_scalar(
-            "SELECT state->'delegated'->$2->'ledger'->'revocations'->$3 FROM remote_recovery_roots WHERE genesis_hash=$1",
-        ).bind(&genesis).bind(&runtime.binding.station_origin).bind(format!("service:svc-{ID}"))
-            .fetch_one(&database.pool).await.unwrap();
-        assert_eq!(revocation["revoked_at_ms"], revoked_at.timestamp_millis());
+        let retried = stored().await;
+        if arrival == DateArrival::WithInterrupt {
+            let records = retried["records"].as_array().unwrap();
+            assert_eq!(records.len(), learned["records"].as_array().unwrap().len() + 1);
+            assert_eq!(records.last().unwrap()["body"]["action"], "interrupt_running");
+            assert_eq!(retried["ledger"]["revocations"], learned["ledger"]["revocations"]);
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+            assert_eq!(stored().await, retried);
+        } else {
+            assert_eq!(retried, learned);
+        }
+        read_pool.close().await;
         database.cleanup().await;
     }
 

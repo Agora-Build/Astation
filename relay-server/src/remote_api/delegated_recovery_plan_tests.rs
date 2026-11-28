@@ -46,7 +46,7 @@ pub(super) async fn retained(
         ORIGIN,
         &f.log,
         &held,
-        f.created,
+        None,
         &["host-a".into()],
         f.created,
     )
@@ -68,7 +68,7 @@ pub(super) async fn retained(
         ORIGIN,
         &f.log,
         &native,
-        f.created,
+        None,
         &["host-a".into()],
         f.created,
     )
