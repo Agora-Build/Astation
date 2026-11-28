@@ -13,17 +13,18 @@ use sqlx::{PgConnection, Postgres, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(sqlx::FromRow)]
-struct Component {
+pub(super) struct Component {
     source_hash: String,
     bodies_hash: String,
     membership_seq: i64,
     membership_hash: String,
     records_hash: String,
     records: Value,
+    pub(super) signing_cut: Option<Value>,
 }
 
 impl Component {
-    fn verify(
+    pub(super) fn verify(
         &self,
         plan: &Prepared,
         origin: &str,
@@ -61,7 +62,52 @@ impl Component {
         if self.bodies_hash != source_hash(&Value::Array(bodies))? {
             return Err(invalid());
         }
+        if let Some(cut) = &self.signing_cut {
+            self.verify_signing_cut(cut, plan, &records)?;
+        }
         Ok(records)
+    }
+
+    fn verify_signing_cut(
+        &self,
+        cut: &Value,
+        plan: &Prepared,
+        records: &[ControlRecord],
+    ) -> Result<(), sqlx::Error> {
+        let clock = &cut["service_clock_evidence"];
+        let portal_hash = source_hash(&json!({
+            "plan_id":plan.plan_id, "reconstruction_hash":clock["reconstruction_hash"],
+            "source":cut["portal_service_evidence"],
+        }))?;
+        let source = super::service_drafts::source_commitment(
+            &clock["reconstruction_hash"],
+            &json!(source_hash(clock)?),
+            &json!(portal_hash),
+        )?;
+        if clock["plan_id"] != plan.plan_id
+            || clock["source_hash"] != plan.source_hash
+            || clock["reconstruction_hash"] != source_hash(&cut["reconstruction"])?
+            || source != self.source_hash
+        {
+            return Err(invalid());
+        }
+        let mut previous = BTreeMap::new();
+        for record in records {
+            let principal = record.principal().name();
+            let mark: crate::service_signing_ceilings::SigningMark =
+                serde_json::from_value(clock["snapshot_signing_marks"][&principal].clone())
+                    .map_err(|_| invalid())?;
+            if record.principal_key().ok_or_else(invalid)?.to_hex() != mark.key_fingerprint
+                || mark.sign_above_ms < mark.highest_reserved_ms
+                || record.issued_at() <= mark.sign_above_ms
+                || previous
+                    .insert(principal, record.issued_at())
+                    .is_some_and(|old: u64| old.checked_add(1) != Some(record.issued_at()))
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 
     fn receipt(&self, plan: &Prepared) -> Value {
@@ -77,14 +123,16 @@ pub(super) async fn check_size(
     db: &mut PgConnection,
     origin: &str,
     genesis: &str,
-    additional: &Value,
+    records: Option<&Value>,
+    cut: Option<&Value>,
 ) -> Result<(), sqlx::Error> {
     let fits: bool = sqlx::query_scalar(
-        "SELECT COALESCE(sum(jsonb_array_length(c.records)),0) + jsonb_array_length($3) <= $4
-         AND COALESCE(sum(octet_length(c.records::text)),0) + CASE WHEN $3='[]'::jsonb THEN 0 ELSE octet_length($3::jsonb::text) END <= $5
+        "SELECT COALESCE(sum(jsonb_array_length(c.records)),0) + COALESCE(jsonb_array_length($3),0) <= $5
+         AND COALESCE(sum(octet_length(c.records::text) + COALESCE(octet_length(c.signing_cut::text),0)),0)
+             + COALESCE(octet_length($3::jsonb::text),0) + COALESCE(octet_length($4::jsonb::text),0) <= $6
          FROM station_delegated_service_components c JOIN station_delegated_recovery_plans p USING(plan_id)
          WHERE p.origin=$1 AND p.genesis_hash=$2",
-    ).bind(origin).bind(genesis).bind(additional).bind(MAX_RECORDS as i64).bind(MAX_STATE as i64)
+    ).bind(origin).bind(genesis).bind(records).bind(cut).bind(MAX_RECORDS as i64).bind(MAX_STATE as i64)
     .fetch_one(db).await?;
     if !fits {
         return Err(invalid());
@@ -100,7 +148,7 @@ pub(super) async fn visit(
     mut observe: impl FnMut(ControlRecord) -> Result<(), sqlx::Error>,
 ) -> Result<Vec<Value>, sqlx::Error> {
     let rows: Vec<Component> = sqlx::query_as(
-        "SELECT source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records
+        "SELECT source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records,signing_cut
          FROM station_delegated_service_components WHERE plan_id=$1 ORDER BY source_hash",
     )
     .bind(&plan.plan_id)
@@ -117,6 +165,18 @@ pub(super) async fn visit(
         receipts.push(row.receipt(plan));
     }
     Ok(receipts)
+}
+
+pub(super) async fn at_current_head(
+    db: &mut PgConnection,
+    plan: &Prepared,
+    log: &Membership,
+) -> Result<Vec<Component>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records,signing_cut
+         FROM station_delegated_service_components WHERE plan_id=$1 AND membership_seq=$2
+         AND membership_hash=$3 AND signing_cut IS NOT NULL ORDER BY source_hash",
+    ).bind(&plan.plan_id).bind(log.head().seq as i64).bind(log.head().hash.to_hex()).fetch_all(db).await
 }
 
 /// Internal to the recovery publisher. Retaining signatures never authorizes signing or opens a feed.
@@ -142,7 +202,7 @@ pub(crate) async fn retain(
     }
     let signed = Value::Array(records.iter().map(|r| r.object().to_json()).collect());
     let previous: Option<Component> = sqlx::query_as(
-        "SELECT source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records
+        "SELECT source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records,signing_cut
          FROM station_delegated_service_components WHERE plan_id=$1 AND source_hash=$2",
     )
     .bind(plan_id)
@@ -185,6 +245,18 @@ pub(crate) async fn retain(
     }
 
     let head = log.head();
+    let portal_hash = source_hash(&json!({
+        "plan_id":plan_id,"reconstruction_hash":current["reconstruction_hash"],
+        "source":reviewed["portal_service_evidence"],
+    }))?;
+    if reviewed["portal_service_evidence_hash"] != portal_hash
+        || reviewed["service_clock_evidence_hash"]
+            != source_hash(&reviewed["service_clock_evidence"])?
+        || reviewed["service_clock_evidence"]["reconstruction_hash"]
+            != current["reconstruction_hash"]
+    {
+        return Err(invalid());
+    }
     let component = Component {
         source_hash: source.into(),
         bodies_hash: bodies_hash.into(),
@@ -192,13 +264,25 @@ pub(crate) async fn retain(
         membership_hash: head.hash.to_hex(),
         records_hash: source_hash(&signed)?,
         records: signed,
+        signing_cut: Some(
+            json!({"reconstruction":super::reconstruction_inputs(&current),
+            "service_clock_evidence":reviewed["service_clock_evidence"],
+            "portal_service_evidence":reviewed["portal_service_evidence"]}),
+        ),
     };
     component.verify(&plan, &binding.origin, &log)?;
-    check_size(tx, &binding.origin, genesis, &component.records).await?;
+    check_size(
+        tx,
+        &binding.origin,
+        genesis,
+        Some(&component.records),
+        component.signing_cut.as_ref(),
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO station_delegated_service_components
-        (plan_id,source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records)
-        VALUES($1,$2,$3,$4,$5,$6,$7)",
+        (plan_id,source_hash,bodies_hash,membership_seq,membership_hash,records_hash,records,signing_cut)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(plan_id)
     .bind(source)
@@ -207,6 +291,7 @@ pub(crate) async fn retain(
     .bind(&component.membership_hash)
     .bind(&component.records_hash)
     .bind(&component.records)
+    .bind(&component.signing_cut)
     .execute(&mut **tx)
     .await?;
     Ok(component.receipt(&plan))

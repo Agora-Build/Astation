@@ -119,10 +119,13 @@ fn batches(review: &Value) -> Result<DraftBatches<'_>, sqlx::Error> {
 }
 
 pub(super) fn review_source(review: &Value) -> Result<String, sqlx::Error> {
+    source_commitment(&review["reconstruction_hash"], &review["service_clock_evidence_hash"],
+        &review["portal_service_evidence_hash"])
+}
+
+pub(super) fn source_commitment(reconstruction: &Value, clock: &Value, portal: &Value) -> Result<String, sqlx::Error> {
     source_hash(&json!({
-        "reconstruction":review["reconstruction_hash"],
-        "service_clock":review["service_clock_evidence_hash"],
-        "portal":review["portal_service_evidence_hash"],
+        "reconstruction":reconstruction, "service_clock":clock, "portal":portal,
     }))
 }
 
