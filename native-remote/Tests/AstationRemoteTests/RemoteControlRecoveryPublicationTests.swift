@@ -99,11 +99,12 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let http = try RemoteRecoveryHTTP(relayURL: context.stationOrigin, configuration: config, accessToken: { "native-test" })
         let firstTime = f.authority.reservedTime
         let hash = SHA256.hash(data: Data(try canonicalJson(json: f.original).utf8)).map { String(format: "%02x", $0) }.joined()
-        func serve(time: UInt64, wrongReceipt: Bool = false) {
+        func serve(time: UInt64, wrongReceipt: Bool = false, after: UInt64? = nil) {
             RecoveryHTTPStub.install(host: host) { request in
                 XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/" + context.genesisHash + "/control/recovery/copy-reservations")
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-test")
                 var reply = try RemoteRecoveryHTTPTests.requestBody(request)
+                XCTAssertEqual(reply.removeValue(forKey: "after_issued_at") as? UInt64, after)
                 XCTAssertEqual(reply["manager"] as? String, manager)
                 XCTAssertEqual(reply["original_hash"] as? String, hash)
                 if let exact = reply["issued_at"] as? UInt64, exact != time {
@@ -135,8 +136,13 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         serve(time: firstTime + 1, wrongReceipt: true)
         do { _ = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log); XCTFail("wrong origin") }
         catch RemoteRecoveryTransportError.invalidResponse {}
-        serve(time: firstTime + 1)
-        let next = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log)
+        serve(time: firstTime, after: firstTime)
+        do {
+            _ = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log, after: firstTime)
+            XCTFail("accepted the Mac's previous timestamp")
+        } catch RemoteRecoveryTransportError.invalidResponse {}
+        serve(time: firstTime + 1, after: firstTime)
+        let next = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log, after: firstTime)
         let replacement = try f.journal.prepare(originalRecordJSON: f.original, context: context, managerID: manager,
             issuedAt: next, log: log, authority: restarted, replacingRecordID: first.body.recordId)
         try f.restore()

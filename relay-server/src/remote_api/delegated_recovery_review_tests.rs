@@ -137,10 +137,29 @@ async fn postgres_delegated_copy_reservation_rechecks_the_original_manager_and_c
     assert_eq!(send(&b, Some("alice"), &exact).await, one);
     let mut wrong_time = exact.clone(); wrong_time["issued_at"] = json!(time - 1);
     assert_eq!(send(&a, Some("alice"), &wrong_time).await.0, StatusCode::CONFLICT);
+    // The response was lost before this draft reached the Mac's journal. Another
+    // draft for the same principal has since raised the Mac's local floor.
+    let mut newer = request.clone();
+    newer["after_issued_at"] = json!(time);
+    let advanced = send(&b, Some("alice"), &newer).await;
+    assert_eq!(advanced.0, StatusCode::OK);
+    let next = advanced.1["issued_at"].as_u64().unwrap();
+    assert!(next > time);
+    assert_eq!(send(&a, Some("alice"), &newer).await, advanced);
+    assert_eq!(send(&a, Some("alice"), &exact).await.0, StatusCode::CONFLICT);
+    exact["issued_at"] = json!(next);
+    assert_eq!(send(&a, Some("alice"), &exact).await, advanced);
+    let mut future = newer.clone();
+    future["after_issued_at"] = json!(9_007_199_254_740_991u64);
+    assert_eq!(send(&b, Some("alice"), &future).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(send(&b, Some("alice"), &exact).await, advanced);
+    let mut mixed = exact.clone();
+    mixed["after_issued_at"] = json!(time);
+    assert_eq!(send(&a, Some("alice"), &mixed).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(plan::prepare(&db.pool, &binding, &genesis).await.unwrap(), cut);
     let mut body = ControlRecord::parse(original.to_string().as_bytes()).unwrap().body().clone();
     body.signer = ControlSigner::Member("replacement-manager".into());
-    body.record_id = uuid::Uuid::new_v4().to_string(); body.issued_at = time;
+    body.record_id = uuid::Uuid::new_v4().to_string(); body.issued_at = next;
     let copy = build_control(&f.keys, &KeyId::new("replacement-manager"), &body).unwrap();
     let input = json!({"evidence_hash":cut["evidence_hash"], "replacements":[{"original_record_id":request["original_record_id"],
         "record":copy.to_json()}]});

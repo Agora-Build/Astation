@@ -285,7 +285,7 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
     }
 
     func reserveRecoveryCopy(context: RemoteControlRecoveryContext, original: String,
-        manager: String, issuedAt: UInt64?) async throws -> UInt64 {
+        manager: String, issuedAt: UInt64?, after: UInt64) async throws -> UInt64 {
         try context.validate()
         let body = try parseControlRecord(recordJson: original)
         guard stationOrigin == context.stationOrigin, RemoteRecoveryKit.validID(manager),
@@ -296,7 +296,9 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
             "expected":["seq":context.membershipHead.seq, "hash":context.membershipHead.hash] as [String: Any],
             "recovery":["generation":String(context.generation), "plan_id":context.planID, "source_hash":context.sourceHash,
                         "candidate_feed_id":context.candidateFeedID, "evidence_hash":context.evidenceHash]]
+        guard after <= 9_007_199_254_740_991, after == 0 || issuedAt == nil else { throw RemoteChannelError.invalidInput }
         if let issuedAt { request["issued_at"] = issuedAt }
+        if after > 0 { request["after_issued_at"] = after }
         let (status, bytes) = try await perform(url: path(context.genesisHash, "control/recovery/copy-reservations"),
             method: "POST", body: Self.encode(request), allowConflict: true)
         if status == 409 {
@@ -309,9 +311,10 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         let reply = try Self.dictionary(bytes)
         guard let number = reply["issued_at"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
               number.stringValue == String(number.uint64Value), number.uint64Value <= 9_007_199_254_740_991,
-              number.uint64Value > body.issuedAt, issuedAt == nil || issuedAt == number.uint64Value else {
+              number.uint64Value > max(body.issuedAt, after), issuedAt == nil || issuedAt == number.uint64Value else {
             throw RemoteRecoveryTransportError.invalidResponse
         }
+        request.removeValue(forKey: "after_issued_at")
         request["issued_at"] = number.uint64Value
         request["origin"] = stationOrigin
         request["account_id"] = context.accountID

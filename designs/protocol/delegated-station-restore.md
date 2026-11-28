@@ -857,8 +857,12 @@ canonical signed original. Station checks that the original still needs a
 new manager signature. It stores one elapsed timestamp for this review in
 shared PostgreSQL, above the retained principal's observed times and its
 previous native copy reservations. Concurrent replicas return the same
-reservation for the same request. The independent service signing clock is
-used only for service signatures.
+reservation for the same request. When the Mac has already saved a draft for
+the same principal, it sends that journal's most recent timestamp as
+`after_issued_at` on a new reservation. If an earlier reply was lost, Station
+can replace its unseen reservation with an elapsed timestamp above this floor.
+An exact `issued_at` recheck and a new reservation are distinct requests.
+The independent service signing clock is used only for service signatures.
 
 The Mac rechecks the exact saved `issued_at` before showing owner confirmation
 and after the owner responds. This request can only verify an existing

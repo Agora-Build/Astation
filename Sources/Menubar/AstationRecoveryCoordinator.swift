@@ -2435,8 +2435,9 @@ extension AstationRecoveryCoordinator {
         } else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
         let recovery = try recoveryControls(origin: context.stationOrigin)
+        let reviews = try recovery.reviews()
         var replacing: String?
-        if let prior = try recovery.reviews().last(where: { $0.context == context && $0.originalRecordID == recordID }) {
+        if let prior = reviews.last(where: { $0.context == context && $0.originalRecordID == recordID }) {
             guard prior.body.signer == "member:" + managerID, try canonicalJson(json: prior.originalRecordJSON) == canonicalJson(json: original) else {
                 throw RemoteRecoveryError.requiresReview
             }
@@ -2453,8 +2454,10 @@ extension AstationRecoveryCoordinator {
             try requireDurableRecoveryCheckpoint()
             if replacing == nil { return prior }
         }
+        let principal = try parseControlRecord(recordJson: original).principal
+        let lastTime = reviews.last(where: { $0.body.principal == principal })?.body.issuedAt ?? 0
         let time = try await authority.reserve(originalRecordJSON: original, context: context,
-            managerID: managerID, log: log)
+            managerID: managerID, log: log, after: lastTime)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
         try requireDurableRecoveryCheckpoint()
         let latest = try await refreshedLog(genesis: kit.genesisHash)

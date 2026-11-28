@@ -73,11 +73,20 @@ public struct RemoteControlRecoveryReview: Equatable, Sendable {
 public protocol RemoteControlRecoveryAuthorizing {
     func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
         managerID: String, log: MembershipLog) async throws -> UInt64
+    func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64
     func authorize(_ review: RemoteControlRecoveryReview, log: MembershipLog) throws
     func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws
 }
 
 public extension RemoteControlRecoveryAuthorizing {
+    func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64 {
+        let time = try await reserve(originalRecordJSON: originalRecordJSON, context: context, managerID: managerID, log: log)
+        guard time > issuedAt else { throw RemoteControlPublicationError.requiresReview }
+        return time
+    }
+
     func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws {
         try authorize(review, log: log)
     }
@@ -96,7 +105,13 @@ public final class RemoteStationRecoveryCopyAuthority: RemoteControlRecoveryAuth
 
     public func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
         managerID: String, log: MembershipLog) async throws -> UInt64 {
-        try await check(original: originalRecordJSON, context: context, manager: managerID, log: log, issuedAt: nil)
+        try await reserve(originalRecordJSON: originalRecordJSON, context: context, managerID: managerID, log: log, after: 0)
+    }
+
+    public func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64 {
+        try await check(original: originalRecordJSON, context: context, manager: managerID, log: log,
+            issuedAt: nil, after: issuedAt)
     }
 
     public func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws {
@@ -106,7 +121,7 @@ public final class RemoteStationRecoveryCopyAuthority: RemoteControlRecoveryAuth
     }
 
     private func check(original: String, context: RemoteControlRecoveryContext, manager: String,
-        log: MembershipLog, issuedAt: UInt64?) async throws -> UInt64 {
+        log: MembershipLog, issuedAt: UInt64?, after: UInt64 = 0) async throws -> UInt64 {
         reservation = nil
         guard context.stationOrigin == station.controlStationOrigin, context.accountID == log.accountId(),
               context.genesisHash == log.genesisHash(), context.membershipHead == log.head(), log.frozen() == nil,
@@ -114,7 +129,7 @@ public final class RemoteStationRecoveryCopyAuthority: RemoteControlRecoveryAuth
               member.roles.contains("manage"), case .refused(let reason) = try verifyControlRecord(log: log, recordJson: original),
               reason == "removed_manager" else { throw RemoteControlPublicationError.requiresReview }
         let canonical = try canonicalJson(json: original)
-        let time = try await station.reserveRecoveryCopy(context: context, original: canonical, manager: manager, issuedAt: issuedAt)
+        let time = try await station.reserveRecoveryCopy(context: context, original: canonical, manager: manager, issuedAt: issuedAt, after: after)
         try Task.checkCancellation()
         guard context.membershipHead == log.head(), log.frozen() == nil else { throw RemoteControlPublicationError.requiresReview }
         reservation = (context, canonical, manager, time, .now)

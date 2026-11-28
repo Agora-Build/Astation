@@ -20,18 +20,23 @@ pub(crate) struct Request {
     original_id: String,
     original_hash: Hash32,
     issued_at: Option<u64>,
+    after_issued_at: Option<u64>,
 }
 
 impl Request {
     pub(crate) fn parse(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
-        let issued_at = match object.get("issued_at") {
-            Some(t) => Some(t.as_u64().filter(|t| (1..=MAX_TIME).contains(t))?),
-            None => None,
+        let timestamp = |field| match object.get(field) {
+            Some(Value::Number(n)) => n.as_u64().filter(|t| (1..=MAX_TIME).contains(t)).map(Some),
+            None => Some(None),
+            _ => None,
         };
+        let issued_at = timestamp("issued_at")?;
+        let after_issued_at = timestamp("after_issued_at")?;
         let original_id = object.get("original_record_id")?.as_str()?;
         let manager = object.get("manager")?.as_str()?;
-        if object.len() != 5 + usize::from(issued_at.is_some())
+        if (issued_at.is_some() && after_issued_at.is_some())
+            || object.len() != 5 + usize::from(issued_at.is_some() || after_issued_at.is_some())
             || !canonical_uuid(original_id)
             || !(1..=128).contains(&manager.len())
             || !manager
@@ -47,6 +52,7 @@ impl Request {
             original_hash: Hash32::from_hex(object.get("original_hash")?.as_str()?).ok()?,
             manager: manager.to_owned(),
             issued_at,
+            after_issued_at,
         })
     }
 }
@@ -108,7 +114,9 @@ pub(crate) async fn reserve(
     let source = ControlRecord::parse(&serde_json::to_vec(original).map_err(|_| invalid())?)
         .map_err(|_| invalid())?;
     let principal = source.principal().name();
-    let mut floor = source.issued_at();
+    // A lost reply can leave an older Station reservation unseen by the
+    // manager until after another draft for this principal reached its journal.
+    let mut floor = source.issued_at().max(request.after_issued_at.unwrap_or(0));
     for key in ["known_history", "recovery_signatures"] {
         let marks = report[key]["observed_signing_lower_bounds"]
             .as_object()
