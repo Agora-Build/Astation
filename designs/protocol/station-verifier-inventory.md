@@ -397,8 +397,18 @@ nonce. Rotating the integration's OAuth client key preserves the R9 service
 grant. Foreign roots, owners and fingerprints return the same 404. Responses
 carry `Cache-Control: no-store`.
 
-External report submission and the consumer's handling of two processes that
-answer one challenge are tracked on Astation #101 and Portal #41.
+After a successful fetch, the integration posts `{"report":<signed SDK report>}`
+to `/agora-build/v1/logs/{genesis}/verifier-reports/{nonce}`. Station checks the
+token, original grant, signed membership and SDK proof again. A successful
+commit returns `{"accepted":true}`. A retry of the same signed report uses
+the same receipt and original deadline. A native manager reading or retrying
+the challenge must still have access to its original Portal grant.
+
+If two SDK processes answered the same fetched challenge, Station retains both
+signed reports so the manager can authenticate the conflict. The second answer
+and subsequent retries return HTTP 409 with `verifier_process_conflict`. The
+integration receives no other process's report. The manager holds the slot
+until its reviewed process conflict is resolved.
 
 ### Manager review of a member's verifier processes
 
