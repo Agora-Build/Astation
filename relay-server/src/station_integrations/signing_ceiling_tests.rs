@@ -1013,9 +1013,10 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
             .map(|body| ControlBody::from_json(body).unwrap()).collect();
         assert_eq!(bodies.len(), 2);
         let mark: SigningMark = serde_json::from_value(review["service_clock_evidence"]["snapshot_signing_marks"][&principal].clone()).unwrap();
-        (review["candidate_feed_id"].as_str().unwrap().to_owned(), bodies, mark)
+        (review, bodies, mark)
     };
-    let (candidate, bodies, mark) = prepare().await;
+    let (initial, bodies, mark) = prepare().await;
+    let candidate = initial["candidate_feed_id"].as_str().unwrap().to_owned();
     let old_feed = uuid::Uuid::new_v4().to_string();
     let mut mixed = bodies.clone();
     mixed[1].feed.as_mut().unwrap().feed_id = old_feed.clone();
@@ -1040,15 +1041,73 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     let burned = fresh.last().unwrap().issued_at;
     assert_eq!(replica.reservations(log.account_id(), &genesis).await.unwrap()[0].highest_ms as u64, burned);
 
-    let (_, fresh, updated) = prepare().await;
+    let (review, fresh, updated) = prepare().await;
     let records = signer.sign_control_batch(&replica, &log, &candidate, &fresh, &updated, || true).await.unwrap();
     assert!(records[0].issued_at() > burned);
     assert!(signer.sign_control_batch(clock, &log, &candidate, &fresh, &updated, || true).await.is_err());
     let input = SnapshotInput {
         list: &log, origin, candidate_feed_id: &candidate, retained: &[], snapshot: &records,
-        marks: &[(principal.clone(), updated.sign_above_ms)].into(), covered: &[principal].into(),
+        marks: &[(principal.clone(), updated.sign_above_ms)].into(), covered: &[principal.clone()].into(),
     };
     assert_eq!(check_snapshot_consistency(&input).unwrap(), SnapshotConsistency::Consistent);
+    let other = primary.reconnect(3).await;
+    let persist = async |pool: &sqlx::PgPool, review: &Value, batch: &[atem_client::control::ControlRecord], commit: bool| {
+        let mut tx = pool.begin().await?;
+        let receipt = plan::service_components::retain(&mut tx, &fence, &genesis,
+            review["plan_id"].as_str().unwrap(), review["service_drafts"]["source_hash"].as_str().unwrap(),
+            review["service_drafts"]["bodies_hash"].as_str().unwrap(), batch).await?;
+        if commit { tx.commit().await?; } else { tx.rollback().await?; }
+        Ok::<_,sqlx::Error>(receipt)
+    };
+    assert!(persist(&other, &initial, &records, true).await.is_err());
+    let receipt = persist(&primary.pool, &review, &records, false).await.unwrap();
+    let known = plan::prepare(&other, &fence, &genesis).await.unwrap();
+    assert!(known["known_history"]["checkpoints"][0].get("service_components").is_none());
+    // Commit and lose the response. The independent clock now forces a different draft.
+    assert_eq!(persist(&other, &review, &records, true).await.unwrap(), receipt);
+    let (superseding, _, _) = prepare().await;
+    assert_ne!(superseding["service_drafts"]["source_hash"], receipt["source_hash"]);
+    assert_eq!(superseding["known_history"]["checkpoints"][0]["service_components"], json!([receipt]));
+    assert_eq!(receipt["membership_head"], log.head().to_json());
+    assert_eq!(persist(&primary.pool, &review, &records, true).await.unwrap(), receipt);
+    assert!(persist(&other, &superseding, &records, true).await.is_err());
+    assert!(persist(&other, &review, &records[..1], true).await.is_err());
+
+    // A revoke signed under this plan survives abandonment and becomes a required stop of the next plan.
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut revoked = source.clone();
+    let integration = &mut revoked["checkpoint"]["integrations"][0];
+    integration["state"] = json!("revoked");
+    integration["interruptRunning"] = json!(true);
+    integration["revokedAt"] = Value::Null;
+    revoked["checkpoint"]["at"] = json!("2026-11-27T10:01:00.000Z");
+    let policy = PortalCheckpoint::parse(&serde_json::to_vec(&revoked).unwrap(), &runtime.binding).unwrap();
+    let next = previous.apply_checkpoint(policy, previous.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+    let rev = plan::prepare_with_sources(&other, &fence, &genesis, Some(clock),
+        Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+    let rev_bodies: Vec<_> = rev["service_drafts"]["unsigned_bodies"].as_array().unwrap().iter()
+        .map(|body| ControlBody::from_json(body).unwrap()).collect();
+    let rev_mark: SigningMark = serde_json::from_value(rev["service_clock_evidence"]["snapshot_signing_marks"][&principal].clone()).unwrap();
+    let stops = signer.sign_control_batch(clock, &log, &candidate, &rev_bodies, &rev_mark, || true).await.unwrap();
+    assert!(stops.iter().any(|r| matches!(r.action(), atem_client::control::ControlAction::Revoke { interrupt_running:true })));
+    let final_receipt = persist(&other, &rev, &stops, true).await.unwrap();
+    plan::outcome::abandon(&other, &fence, &genesis, receipt["plan_id"].as_str().unwrap()).await.unwrap();
+    let next_fence = Binding::new(origin, 3).unwrap();
+    next_fence.initialize(&primary.pool, true).await.unwrap();
+    let historical = plan::prepare(&other, &next_fence, &genesis).await.unwrap();
+    let prior = historical["known_history"]["checkpoints"][0]["service_components"].as_array().unwrap();
+    assert!(prior.contains(&receipt) && prior.contains(&final_receipt));
+    let staged = plan::snapshot_stops::stage(&other, &next_fence, &genesis,
+        historical["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], stops.len());
+    let stored: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops WHERE plan_id=$1")
+        .bind(historical["plan_id"].as_str().unwrap()).fetch_one(&other).await.unwrap();
+    for stop in &stops { assert!(stored.as_array().unwrap().contains(&stop.object().to_json())); }
+    sqlx::query("UPDATE station_delegated_service_components SET membership_hash=$1 WHERE source_hash=$2")
+        .bind("0".repeat(64)).bind(receipt["source_hash"].as_str().unwrap()).execute(&other).await.unwrap();
+    assert!(plan::prepare(&primary.pool, &next_fence, &genesis).await.is_err());
+    other.close().await;
     assert!(feed(&runtime, &genesis).await.is_empty());
     assert!(fence.lock(&mut *primary.pool.acquire().await.unwrap()).await.is_err());
     drop(runtime);

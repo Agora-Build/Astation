@@ -1,11 +1,11 @@
 //! Reconcile every retained checkpoint. A newer restored source cannot erase
 //! known stops, clock reservations or unresolved reporting evidence.
-use super::super::super::{delegated::Stored, MAX_STATE};
+use super::super::super::{delegated::{recovery_record_review, Stored}, MAX_STATE};
 use super::super::Binding;
 use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepared};
 use atem_client::{
     channel::HeadRelation,
-    control::{principal_key_of, verify_control, ControlCheck, ControlRecord, RefusalReason},
+    control::{principal_key_of, verify_control, ControlCheck, ControlPrincipal, ControlRecord, RefusalReason},
     membership::{Action, MemberKind, Membership},
     Hash32,
 };
@@ -87,6 +87,8 @@ pub(super) async fn inspection(
     if count == 0 || count > MAX_CHECKPOINTS || bytes > MAX_STATE as i64 {
         return Err(invalid());
     }
+    super::service_components::check_size(connection, &binding.origin, &log.genesis_hash().to_hex(), &json!([]))
+        .await?;
     let checkpoints: Vec<Historical> = sqlx::query_as(
         "SELECT generation,abandoned,plan_id,candidate_feed_id,source_hash,retained \
          FROM station_delegated_recovery_plans \
@@ -260,6 +262,21 @@ pub(super) async fn inspection(
             "generation": generation, "plan_id": checkpoint.plan_id,
             "candidate_feed_id": checkpoint.candidate_feed_id, "source_hash": checkpoint.source_hash,
         });
+        let components = super::service_components::visit(connection, &checkpoint, &binding.origin, &heads, |record| {
+            let ControlPrincipal::Service(service) = record.principal() else { return Err(invalid()); };
+            let key = record.principal_key().ok_or_else(invalid)?.to_hex();
+            let highest = service_keys.entry((service.clone(), key)).or_default();
+            *highest = Some(highest.map_or(record.issued_at(), |v| v.max(record.issued_at())));
+            let lower = lower_bounds.entry(record.principal().name()).or_default();
+            *lower = (*lower).max(record.issued_at());
+            add_record(&mut records, &record, recovery_record_review(&record, log))
+        }).await?;
+        if !components.is_empty() {
+            if !current_plan {
+                retained_feed_ids.insert(checkpoint.candidate_feed_id.clone());
+            }
+            commitment["service_components"] = source_hash(&json!(components))?.into();
+        }
         if heads.len() > 1 {
             commitment["observed_membership"] = source_hash(&latest.to_stored())?.into();
         }
@@ -282,6 +299,9 @@ pub(super) async fn inspection(
         });
         if heads.len() > 1 {
             summary["observed_membership_head"] = latest.head().to_json();
+        }
+        if !components.is_empty() {
+            summary["service_components"] = json!(components);
         }
         summaries.push(summary);
     }

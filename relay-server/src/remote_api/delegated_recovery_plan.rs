@@ -18,6 +18,8 @@ pub(crate) mod reporting_history;
 pub(crate) mod stops;
 #[path = "delegated_service_drafts.rs"]
 mod service_drafts;
+#[path = "delegated_service_components.rs"]
+pub(crate) mod service_components;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]

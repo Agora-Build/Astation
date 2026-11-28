@@ -1114,6 +1114,17 @@ completed records with the shared membership verifier. Recovery preparation
 continues to return unsigned bodies. The final publisher must supply its
 verified participant cut and retain the records atomically.
 
+Recovery keeps each committed service batch under its plan and original draft
+source hash. Its receipt identifies the reviewed bodies, exact signed records,
+and membership head at acceptance. An operator can recover that receipt from
+`known_history.checkpoints[].service_components` after a lost response,
+including after the independent clock advances and a replica prepares a new
+draft. The original records also remain available when a plan is abandoned.
+Station verifies each signature at its acceptance head, carries signed
+revocations and interrupts into the next review, and accounts for each key's
+highest observed signature. A retained receipt alone grants no publication
+authority.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run
