@@ -145,9 +145,13 @@ async fn has_delegated_history(
     signing: Option<&SigningCeilings>,
 ) -> Result<bool, sqlx::Error> {
     // As with retained feeds, changing the public origin cannot turn a restored
-    // Station into a fresh installation. Plans and observations reference the fence.
+    // Station into a fresh installation. Recovery archives can outlive the
+    // live journal and remain under the previous origin's fence.
     let retained: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM station_delegated_reporting)
+             OR EXISTS (SELECT 1 FROM station_delegated_reporting_history)
+             OR EXISTS (SELECT 1 FROM station_delegated_recovery_plans)
+             OR EXISTS (SELECT 1 FROM station_delegated_observed_reservations WHERE highest_ms > 0)
              OR EXISTS (SELECT 1 FROM station_applied_binding_releases)
              OR EXISTS (SELECT 1 FROM station_native_binding_transitions)
              OR EXISTS (SELECT 1 FROM station_verifier_rosters)

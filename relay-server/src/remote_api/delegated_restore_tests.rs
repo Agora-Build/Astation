@@ -389,6 +389,38 @@ async fn postgres_delegated_bootstrap_recognizes_independent_recovery_history() 
 }
 
 #[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_new_origin_recognizes_archived_recovery_evidence() {
+    let old = "https://old-station.example";
+    let genesis = fixture().log.genesis_hash().to_hex();
+    for (evidence, expected_ready) in [
+        ("INSERT INTO station_delegated_reporting_history(origin,binding,first_generation,evidence_hash,journal)
+          VALUES ($1,'report',1,'saved','{}')", false),
+        ("INSERT INTO station_delegated_recovery_plans(origin,generation,genesis_hash,plan_id,candidate_feed_id,source_hash,retained)
+          SELECT $1,1,genesis_hash,'plan','candidate','source','{}' FROM remote_recovery_roots", false),
+        ("INSERT INTO station_delegated_observed_reservations(origin,account_id,genesis_hash,service_id,key_hash,highest_ms)
+          SELECT $1,'account',genesis_hash,'svc-a','key-a',42 FROM remote_recovery_roots", false),
+        ("INSERT INTO station_delegated_observed_reservations(origin,account_id,genesis_hash,service_id,key_hash,highest_ms)
+          SELECT $1,'account',genesis_hash,'svc-a','key-a',0 FROM remote_recovery_roots", true),
+    ] {
+        let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+        Binding::new(old, 1).unwrap().initialize(&db.pool, true).await.unwrap();
+        sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'alice','{}')")
+            .bind(&genesis).execute(&db.pool).await.unwrap();
+        sqlx::query(evidence).bind(old).execute(&db.pool).await.unwrap();
+        let replica = db.reconnect(2).await;
+        let new = Binding::new(ORIGIN, 1).unwrap();
+        for pool in [&db.pool, &replica] {
+            let status = new.initialize(pool, false).await.unwrap();
+            assert_eq!(status.ready, expected_ready, "{evidence}");
+            assert_eq!(status.reason, if expected_ready { "initialized" } else { "history_missing" });
+        }
+        replica.close().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires two independent local PostgreSQL clusters"]
 async fn postgres_delegated_bootstrap_distinguishes_registration_from_a_signing_reservation() {
     use crate::service_signing_ceilings::SigningCeilings;
