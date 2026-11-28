@@ -3,8 +3,10 @@ use super::{checkpoint_for_owner, invalid, review_source_evidence, source_hash, 
 use atem_client::member_report::{
     verify_signer_report, SignerReportChallenge, VerifiedSignerReport,
 };
+use atem_client::membership::{Head, Membership};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
+use std::collections::BTreeMap;
 
 pub(crate) enum SubmitError {
     Changed,
@@ -154,10 +156,10 @@ pub(crate) async fn submit(
 pub(super) async fn visit(
     db: &mut PgConnection,
     plan: &super::Prepared,
-    log: &atem_client::membership::Membership,
+    heads: &BTreeMap<u64, Membership>,
     origin: &str,
     generation: i64,
-    mut accept: impl FnMut(VerifiedSignerReport, String) -> Result<(), sqlx::Error>,
+    mut accept: impl FnMut(VerifiedSignerReport, String, &Membership) -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
     use futures_util::TryStreamExt;
     let mut rows = sqlx::query_as::<_, (i64, Value, Value, String, i64)>(
@@ -196,6 +198,8 @@ pub(super) async fn visit(
             .iter()
             .map(Value::to_string)
             .collect();
+        let head = Head::from_json(&input["report"]["body"]["head"]).ok_or_else(invalid)?;
+        let log = heads.get(&head.seq).ok_or_else(invalid)?;
         let verified = verify_signer_report(
             log,
             input["report"].to_string().as_bytes(),
@@ -207,7 +211,7 @@ pub(super) async fn visit(
         if !verified.at_head {
             return Err(invalid());
         }
-        accept(verified, hash)?;
+        accept(verified, hash, log)?;
     }
     Ok(())
 }
