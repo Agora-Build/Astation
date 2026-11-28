@@ -1031,6 +1031,10 @@ even when membership already removed the service.
 The ordinary integration feed, cursor-zero snapshot and recovery checkpoint
 can provide the original `revokedAt` for the first signed revoke. A later
 interrupt preserves that time. A legacy row may have no recorded time.
+For an explicitly undated legacy revocation, Station can use the first
+`integration_revoked` change's `at` if it observed the feed from cursor zero.
+It retains that event across restarts. An interrupt, a repeated revoke or the
+current state attached to an older event cannot supply a missing first event.
 
 A signed membership removal ends the cover requirement. A verified revoke for
 the service and its key also ends it once Station stages that revoke in the

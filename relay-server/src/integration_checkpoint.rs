@@ -202,7 +202,7 @@ impl PortalCheckpoint {
                 return Err(());
             }
             // Keep one timestamp in the existing durable checkpoint format.
-            let revoked_at = policy.revoked_at.take();
+            let revoked_at = policy.revoked_at.take().flatten();
             if integrations
                 .insert(id.into(), CheckpointIntegration { policy, revoked_at })
                 .is_some()
