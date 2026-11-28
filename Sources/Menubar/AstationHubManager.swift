@@ -724,7 +724,7 @@ class AstationHubManager: ObservableObject {
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
     var sendDirectChannel: ((Data, String, @escaping (Error?) -> Void) -> Void)?
-    var sendDirectStationProxy: ((Data, String, @escaping (Error?) -> Void) -> Void)?
+    var sendDirectStationProxy: ((Data, String, Bool, @escaping (Error?) -> Void) -> Void)?
     var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
@@ -2691,11 +2691,11 @@ class AstationHubManager: ObservableObject {
                     throw RemoteChannelError.staleLink
                 }
                 return text
-            }, writeLocal: { [weak self] bytes, completion in
+            }, writeLocal: { [weak self] bytes, retryChallenge, completion in
                 guard let self, current(), let send = self.sendDirectStationProxy else {
                     completion(RemoteChannelError.staleLink); return
                 }
-                send(bytes, id, completion)
+                send(bytes, id, retryChallenge, completion)
             }, closeLocal: { [weak self] bytes in
                 self?.sendDirectChannel?(bytes, id) { _ in }
             })

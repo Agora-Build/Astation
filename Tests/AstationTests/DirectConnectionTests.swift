@@ -240,12 +240,15 @@ final class DirectConnectionTests: XCTestCase {
             return auth($0)
         }).wait()
         let firstChallenge = expectation(description: "First proof challenge follows authentication")
+        let retryChallenge = #"{"type":"relay","op":"host_challenge","v":1,"nonce":"after-suspension"}"#
+        let receivedRetry = expectation(description: "Fresh proof challenge reaches the original local generation")
         let reauthenticated = expectation(description: "Fresh authentication on the same socket")
         let nextChallenge = expectation(description: "New generation gets its own challenge")
         let closedOldChannel = expectation(description: "Old channel closes before reauthentication")
         var sawOldClose = false
         try socket.eventLoop.submit { socket.onText { socket, text in
             if text == "first-proxy-challenge" { firstChallenge.fulfill(); return }
+            if text == retryChallenge { XCTAssertFalse(sawOldClose); receivedRetry.fulfill(); return }
             if text == "next-proxy-challenge" { nextChallenge.fulfill(); return }
             if let fields = try? AtemSessionJSON.validatePacket(Data(text.utf8)), fields["type"]?.string == "channel",
                fields["channel"]?.string == "old_1", fields["event"]?.string == "close" {
@@ -268,6 +271,11 @@ final class DirectConnectionTests: XCTestCase {
             fixture.server.sendChannel(Data("first-proxy-challenge".utf8), clientID: firstID) { XCTAssertNil($0) }
         }
         wait(for: [firstChallenge], timeout: 3)
+        fixture.server.sendStationProxy(Data(retryChallenge.utf8), clientID: firstID, retryChallenge: true) {
+            XCTAssertNil($0)
+        }
+        wait(for: [receivedRetry], timeout: 3)
+        XCTAssertTrue(nextID.isEmpty)
         fixture.server.sendStationProxy(challenge, clientID: firstID) { error in
             XCTAssertEqual(error as? RemoteChannelError, .staleLink)
         }

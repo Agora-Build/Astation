@@ -161,9 +161,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
             guard let webSocketServer else { completion(CocoaError(.fileNoSuchFile)); return }
             webSocketServer.sendChannel(bytes, clientID: clientId, completion: completion)
         }
-        hubManager.sendDirectStationProxy = { [weak webSocketServer] bytes, clientId, completion in
+        hubManager.sendDirectStationProxy = { [weak webSocketServer] bytes, clientId, retryChallenge, completion in
             guard let webSocketServer else { completion(RemoteChannelError.staleLink); return }
-            webSocketServer.sendStationProxy(bytes, clientID: clientId, completion: completion)
+            webSocketServer.sendStationProxy(bytes, clientID: clientId, retryChallenge: retryChallenge, completion: completion)
         }
         hubManager.disconnectDirectClient = { [weak webSocketServer] clientId in
             webSocketServer?.disconnectClientForSessionReset(clientId)

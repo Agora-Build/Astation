@@ -500,14 +500,15 @@ class AstationWebSocketServer {
         }
     }
 
-    func sendStationProxy(_ bytes: Data, clientID: String, completion: @escaping (Error?) -> Void) {
+    func sendStationProxy(_ bytes: Data, clientID: String, retryChallenge: Bool = false,
+                          completion: @escaping (Error?) -> Void) {
         executeOnStateEventLoop {
             guard self.hasCurrentSession(clientID) else { completion(RemoteChannelError.staleLink); return }
             if let fields = try? AtemSessionJSON.validatePacket(bytes), fields["type"]?.string == "relay",
                fields["op"]?.string == "host_challenge" {
-                // Atem signs once per authentication generation. A new Station
-                // nonce requires fresh local authentication, never proof replay.
-                if !self.proxyChallenged.insert(clientID).inserted {
+                // A delivered suspension verdict permits one paced fresh
+                // challenge on this authenticated socket.
+                if !self.proxyChallenged.insert(clientID).inserted && !retryChallenge {
                     self.reauthenticate(clientID)
                     completion(RemoteChannelError.staleLink); return
                 }
