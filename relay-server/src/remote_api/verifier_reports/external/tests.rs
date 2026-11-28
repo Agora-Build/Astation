@@ -3,7 +3,9 @@ use crate::account_identity::tests::Fixture as Issuer;
 use crate::integration_checkpoint::PortalCheckpoint;
 use crate::station_integrations::tests::{fixture_at_station, ID, OWNER, PRINCIPAL};
 use atem_client::{
-    membership::{service_add, service_key_fingerprint_of, sign_entry, ServiceScope},
+    membership::{
+        service_add, service_key_fingerprint_of, sign_entry, Action, Role, RolesChange, ServiceScope,
+    },
     KeyId, KeyProvider,
 };
 
@@ -50,6 +52,16 @@ async fn exercise_inbox(origin: &str) {
         store
             .append_test_entry(&genesis, PRINCIPAL, entry, f.log.head())
             .await,
+        StatusCode::OK
+    );
+    let ancestor = runtime.recovery_log(&genesis, OWNER).await.unwrap();
+    let roles = Action::SetRoles {
+        device_id: "phone".into(),
+        change: RolesChange::Native([Role::Control, Role::Manage, Role::View].into_iter().collect()),
+    };
+    let entry = sign_entry(&f.keys, &KeyId::new("manager"), ancestor.draft("phone", f.created, &roles)).unwrap();
+    assert_eq!(
+        store.append_test_entry(&genesis, PRINCIPAL, entry, ancestor.head()).await,
         StatusCode::OK
     );
     let log = runtime.recovery_log(&genesis, OWNER).await.unwrap();
@@ -264,11 +276,11 @@ async fn exercise_inbox(origin: &str) {
     assert_eq!(read(&other, "sdk").await.0, StatusCode::NOT_FOUND);
     let answered = make(4).await;
     let answer_nonce = URL_SAFE_NO_PAD.encode(answered.nonce());
-    let signed = |process: u8| {
+    let signed = |process: u8, reporter_log: &Membership| {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let signer = format!("service:{member}");
         let mut body = atem_client::member_report::verifier_report_body(
-            &log, &answered, &signer, "sdk", origin, now,
+            reporter_log, &answered, &signer, "sdk", origin, now,
         )
         .unwrap()
         .to_json();
@@ -293,8 +305,9 @@ async fn exercise_inbox(origin: &str) {
         call(reqwest::Method::GET, &read_path, &raw, None).await.0,
         StatusCode::UNAUTHORIZED
     );
-    let one = signed(1);
-    let two = signed(2);
+    let one = signed(1, &ancestor);
+    let caught_up = signed(1, &log);
+    let two = signed(2, &ancestor);
     assert_eq!(submit(&one).await.0, StatusCode::NOT_FOUND);
     assert_eq!(
         http(&raw).await.1["challenges"].as_array().unwrap().len(),
@@ -316,11 +329,14 @@ async fn exercise_inbox(origin: &str) {
     let accepted = (StatusCode::OK, json!({"accepted":true}));
     assert_eq!(submit(&one).await, accepted);
     assert_eq!(submit(&one).await, accepted);
+    assert_ne!(one, caught_up);
+    assert_eq!(submit(&caught_up).await, accepted);
     assert_eq!(native_read().await.1["reports"], json!([one]));
     assert_eq!(http(&raw).await.1["challenges"], json!([first.to_json()]));
     let conflict = (StatusCode::CONFLICT, json!({"error":{"code":"verifier_process_conflict"}}));
     assert_eq!(submit(&two).await, conflict);
     assert_eq!(submit(&one).await, conflict);
+    assert_eq!(submit(&caught_up).await, conflict);
     assert_eq!(submit(&two).await, conflict);
     let mut foreign = claims.clone();
     foreign["client_id"] = json!("i-11234567890123456789012345");

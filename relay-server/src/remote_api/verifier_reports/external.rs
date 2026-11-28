@@ -314,12 +314,11 @@ fn answer(
     let proof =
         verify_verifier_report(log, bytes.as_bytes(), &challenge, now).map_err(|_| invalid())?;
     let process = URL_SAFE_NO_PAD.encode(proof.process);
-    let stored = record.reports.get(&process);
-    if stored.is_some_and(|previous| previous != &report) {
-        return Err(changed());
-    }
-    let write = stored.is_none() || !record.external_answered;
-    if stored.is_none() {
+    // A process can re-sign or catch up its log during the same challenge.
+    // Keep its first verified answer, including its original membership head.
+    let new_process = !record.reports.contains_key(&process);
+    let write = new_process || !record.external_answered;
+    if new_process {
         if record.reports.len() >= MAX_REPORTS {
             return Err(error(
                 StatusCode::TOO_MANY_REQUESTS,

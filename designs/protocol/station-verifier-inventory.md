@@ -400,8 +400,10 @@ carry `Cache-Control: no-store`.
 After a successful fetch, the integration posts `{"report":<signed SDK report>}`
 to `/agora-build/v1/logs/{genesis}/verifier-reports/{nonce}`. Station checks the
 token, original grant, signed membership and SDK proof again. A successful
-commit returns `{"accepted":true}`. A retry of the same signed report uses
-the same receipt and original deadline. A native manager reading or retrying
+commit returns `{"accepted":true}`. A valid retry from the same signed process
+gets the same receipt within the original deadline, including when its log has
+advanced or its signature bytes differ. Station retains the first report and
+its original head. A native manager reading or retrying
 the challenge must still have access to its original Portal grant.
 
 If two SDK processes answered the same fetched challenge, Station retains both
