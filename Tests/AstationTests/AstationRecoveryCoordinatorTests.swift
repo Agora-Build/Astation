@@ -590,10 +590,21 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
               environment["ASTATION_TEST_OWNER_PRESENCE"] == "1" else {
             throw XCTSkip("Run the provisioned test with ASTATION_TEST_OWNER_PRESENCE=1 and the owner present.")
         }
+        let account = "station-transfer-test-" + UUID().uuidString
+        let storage = AtemIdentityKeychainStorage(astationId: account)
+        defer {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "build.agora.astation.atem-e2e-v1", kSecAttrAccount as String: account,
+                kSecUseDataProtectionKeychain as String: true]
+            let status = SecItemDelete(query as CFDictionary)
+            XCTAssertTrue(status == errSecSuccess || status == errSecItemNotFound)
+        }
         let h = RecoveryCoordinatorHarness()
-        h.identity = AtemE2EIdentity(storage: h.identityStorage)
+        h.identity = AtemE2EIdentity(storage: storage)
         try await verifyStationTransfer(h) { review in
-            await withCheckedContinuation { continuation in
+            // The proof must use the same protected manager identity after a reload.
+            h.identity = AtemE2EIdentity(storage: storage)
+            return await withCheckedContinuation { continuation in
                 DeviceOwnerAuth.authenticate(reason: "Local Astation test with a disposable account. " + review.confirmation) {
                     continuation.resume(returning: $0)
                 }
