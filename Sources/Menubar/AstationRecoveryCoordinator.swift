@@ -129,9 +129,10 @@ final class AstationRecoveryCoordinator {
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
         accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil) throws {
+        let station = try RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken)
         try self.init(accountID: accountID, managerID: managerID, identity: identity, relayURL: relayURL,
             store: RemoteRecoveryStore(accountID: accountID),
-            transport: RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken),
+            transport: station,
             dataKeys: DataEncryptionKeyManager.shared, allowNewDataKey: allowNewDataKey,
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in
@@ -161,7 +162,8 @@ final class AstationRecoveryCoordinator {
                         continuation.resume(returning: $0)
                     }
                 }
-            }, retainedControlTransport: retainedControlTransport, confirmVerifierRoster: { _ in
+            }, controlRecoveryAuthority: RemoteStationRecoveryCopyAuthority(station: station),
+            retainedControlTransport: retainedControlTransport, confirmVerifierRoster: { _ in
                 await withCheckedContinuation { continuation in
                     DeviceOwnerAuth.authenticate(reason: "confirm the reviewed Station server list") {
                         continuation.resume(returning: $0)
@@ -2433,13 +2435,21 @@ extension AstationRecoveryCoordinator {
         } else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
         let recovery = try recoveryControls(origin: context.stationOrigin)
-        if let prior = try recovery.reviews().first(where: { $0.context == context && $0.originalRecordID == recordID }) {
+        var replacing: String?
+        if let prior = try recovery.reviews().last(where: { $0.context == context && $0.originalRecordID == recordID }) {
             guard prior.body.signer == "member:" + managerID, try canonicalJson(json: prior.originalRecordJSON) == canonicalJson(json: original) else {
                 throw RemoteRecoveryError.requiresReview
             }
-            try authority.authorize(prior, log: log)
+            do {
+                try await authority.revalidate(prior, log: log)
+            } catch RemoteRecoveryCopyReservationError.changed {
+                // A later signed stop may have passed this reservation. A new
+                // draft requires the Station to confirm the obligation again.
+                replacing = prior.body.recordId
+            }
             guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
-            return prior
+            try requireDurableRecoveryCheckpoint()
+            if replacing == nil { return prior }
         }
         let time = try await authority.reserve(originalRecordJSON: original, context: context,
             managerID: managerID, log: log)
@@ -2451,7 +2461,7 @@ extension AstationRecoveryCoordinator {
         guard current(), !Task.isCancelled, latest.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
         try requireDurableRecoveryCheckpoint()
         return try recovery.prepare(originalRecordJSON: original, context: context, managerID: managerID,
-            issuedAt: time, log: latest, authority: authority)
+            issuedAt: time, log: latest, authority: authority, replacingRecordID: replacing)
     }
 
     /// Owner confirmation signs only the protected recovery draft. No live feed,
@@ -2476,7 +2486,9 @@ extension AstationRecoveryCoordinator {
             throw RemoteChannelError.staleLink
         }
         try requireDurableRecoveryCheckpoint()
-        try authority.authorize(retained, log: before)
+        try await authority.revalidate(retained, log: before)
+        guard current(), !Task.isCancelled, membershipLog?.head() == before.head() else { throw RemoteChannelError.staleLink }
+        try requireDurableRecoveryCheckpoint()
         var confirmedAt: UInt64 = 0
         if !retained.signed {
             try requireControlChange(retained.request)
@@ -2490,7 +2502,8 @@ extension AstationRecoveryCoordinator {
         try requireManager(latest)
         try requireDelegatedControl(latest)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-        try authority.authorize(retained, log: latest)
+        try await authority.revalidate(retained, log: latest)
+        guard current(), !Task.isCancelled, membershipLog?.head() == latest.head() else { throw RemoteChannelError.staleLink }
         try requireDurableRecoveryCheckpoint()
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)

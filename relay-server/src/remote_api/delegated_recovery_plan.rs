@@ -28,6 +28,8 @@ mod memberships;
 pub(crate) mod native;
 #[path = "delegated_recovery_signatures.rs"]
 pub(crate) mod signatures;
+#[path = "delegated_copy_reservations.rs"]
+pub(crate) mod copy_reservations;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
