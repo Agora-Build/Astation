@@ -85,7 +85,7 @@ impl Availability {
                 self.complete = change.kind == "accounts_baseline";
             }
         }
-        self.caught_up = changes.len() < super::PAGE_LIMIT && to >= self.cursor;
+        self.caught_up = !super::may_have_another_page(from, to) && to >= self.cursor;
         self.cursor = self.cursor.max(to);
         Ok(())
     }

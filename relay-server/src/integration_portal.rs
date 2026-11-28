@@ -1,5 +1,5 @@
 //! Station report identity and bounded HTTPS client for the published Portal API.
-use crate::integration_feed::{FeedBinding, FeedPage, PolicyStore, PAGE_LIMIT};
+use crate::integration_feed::{may_have_another_page, FeedBinding, FeedPage, PolicyStore};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::{
     rand::SystemRandom,
@@ -349,7 +349,7 @@ impl PortalReportClient {
         let read_started_ms = chrono::Utc::now().timestamp_millis();
         match self.changes(cursor).await {
             Ok(page) => {
-                let full = page.changes.len() == PAGE_LIMIT;
+                let full = may_have_another_page(cursor, page.cursor);
                 let received = chrono::Utc::now();
                 let mut next = old
                     .apply(cursor, page, received.timestamp())

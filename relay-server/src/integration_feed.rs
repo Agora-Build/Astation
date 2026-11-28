@@ -5,6 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub(crate) const PAGE_LIMIT: usize = 500;
+
+/// Portal paginates before hiding its internal Station-removal event. Global
+/// cursor distance bounds the number of rows it could have read.
+pub(super) fn may_have_another_page(from: u64, to: u64) -> bool {
+    to.saturating_sub(from) >= PAGE_LIMIT as u64
+}
 pub(crate) const MAX_POLICY_AGE_SECS: i64 = 120;
 
 #[path = "integration_availability.rs"]
@@ -363,7 +369,6 @@ impl PolicyCheckpoint {
         for change in &page.changes {
             // Event IDs are global: gaps between this Station's events are valid.
             if change.id <= previous
-                || change.id > page.cursor
                 || change.kind.is_empty()
                 || change.kind.len() > 128
             {
@@ -419,7 +424,8 @@ impl PolicyCheckpoint {
                 return Err(());
             }
         }
-        if page.cursor != previous {
+        // The authenticated cursor can advance past the final visible change.
+        if previous > page.cursor {
             return Err(());
         }
         for (id, policy) in &next.integrations {
@@ -1041,10 +1047,44 @@ mod tests {
         assert!(denied.current(ID, OWNER, 101).is_err());
     }
     #[test]
+    fn a_hidden_removal_event_advances_the_cursor_and_commits_the_visible_revoke() {
+        let mut row = policy("revoking");
+        row["id"] = json!(ID);
+        row["interruptRunning"] = json!(false);
+        let removal = json!({"integrations":[row],"cursor":12,"changes":[
+            {"id":11,"kind":"integration_revoked","integrationId":ID,"state":"revoking","integration":row}
+        ]});
+        let store = PolicyCheckpoint::empty(binding()).unwrap();
+        let accepted = store.apply(0, FeedPage::parse(&serde_json::to_vec(&removal).unwrap()).unwrap(), 100).unwrap();
+        assert_eq!(accepted.cursor, 12);
+        assert_eq!(accepted.integrations[ID].state, "revoking");
+        let mut before_marker = accepted.clone();
+        before_marker.cursor = 11;
+        let page = FeedPage::parse(br#"{"cursor":12,"changes":[]}"#).unwrap();
+        let after_marker = before_marker.apply(11, page, 101).unwrap();
+        assert_eq!(after_marker.cursor, 12);
+        assert_eq!(after_marker.integrations, accepted.integrations);
+    }
+
+    #[test]
+    fn a_hidden_row_cannot_make_a_full_raw_page_look_caught_up() {
+        let mut availability = Availability::from_checkpoint(10, &crate::integration_checkpoint::Accounts {
+            complete: true, disabled: vec![],
+        });
+        let to = 10 + PAGE_LIMIT as u64;
+        assert!(may_have_another_page(10, to));
+        availability.advance(10, to, &[]).unwrap();
+        assert!(!availability.enabled_at(to, OWNER));
+        assert!(!may_have_another_page(to, to));
+        availability.advance(to, to, &[]).unwrap();
+        assert!(availability.enabled_at(to, OWNER));
+    }
+
+    #[test]
     fn malformed_and_ambiguous_feed_pages_never_advance_a_checkpoint() {
         let saved = PolicyCheckpoint::empty(binding()).unwrap();
         for value in [
-            json!({"changes":[],"cursor":1,"integrations":[]}),
+            json!({"changes":[{"id":2,"kind":"x"}],"cursor":1,"integrations":[]}),
             json!({"changes":[{"id":1,"kind":"x"},{"id":1,"kind":"x"}],"cursor":1,"integrations":[]}),
             json!({"changes":[{"id":2,"kind":"x"},{"id":1,"kind":"x"}],"cursor":2,"integrations":[]}),
             json!({"changes":[],"cursor":9_007_199_254_740_992_u64,"integrations":[]}),
