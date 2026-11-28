@@ -373,11 +373,12 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         return RemoteStationSignerChallenge(context: context, json: json, challenge: challenge)
     }
 
-    static func submissionBytes(report: String, records: [String]) throws -> Data {
-        guard records.reduce(report.utf8.count, { $0 + $1.utf8.count }) <= 262_144 else {
+    static func submissionBytes(report: String, records: [String], processes: [String]) throws -> Data {
+        let recordSize = records.reduce(report.utf8.count, { $0 + $1.utf8.count })
+        guard processes.reduce(recordSize, { $0 + $1.utf8.count }) <= 262_144 else {
             throw RemoteControlPublicationError.full
         }
-        let bytes = try Self.encode(["report": Self.object(report), "records": records.map { try Self.object($0) }])
+        let bytes = try Self.encode(["report": Self.object(report), "records": records.map { try Self.object($0) }, "processes": processes])
         guard bytes.count <= 262_144 else { throw RemoteControlPublicationError.full }
         return bytes
     }
@@ -388,7 +389,7 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         let context = submission.context
         try context.validate()
         guard context.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
-        let bytes = try Self.submissionBytes(report: submission.report, records: submission.records)
+        let bytes = try Self.submissionBytes(report: submission.report, records: submission.records, processes: submission.processes)
         let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         let (status, reply) = try await perform(url: path(context.genesisHash, "control/recovery/signer-reports"),
             method: "POST", body: bytes, allowConflict: true)

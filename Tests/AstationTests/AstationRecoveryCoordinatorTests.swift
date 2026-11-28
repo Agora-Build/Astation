@@ -3399,7 +3399,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     }
                     let records = try XCTUnwrap(input["records"] as? [Any]).map(json)
                     let checked = try verifySignerReport(log: log, reportJson: json(XCTUnwrap(input["report"])),
-                        expectedChallengeJson: challenge, exportedRecordsJson: records, nowMs: wall)
+                        expectedChallengeJson: challenge, exportedRecordsJson: records,
+                        exportedProcesses: XCTUnwrap(input["processes"] as? [String]), nowMs: wall)
                     XCTAssertTrue(checked.atHead)
                     XCTAssertEqual(checked.slot, "truck")
                     XCTAssertEqual(checked.process, verifierReportProcess())

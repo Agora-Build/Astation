@@ -226,7 +226,7 @@ pub(super) async fn inspection(
         signer_reports::visit(connection, &checkpoint, &heads, &binding.origin, generation, |verified, hash, accepted_log| {
             if operator_review {
                 author_round.observe(&verified, current_plan);
-                journals.observe(&verified.signer, &verified.journal, generation, current_plan,
+                journals.observe(&verified.signer, &verified.journal, &verified.processes, generation, current_plan,
                     verified.records.iter().map(ControlRecord::record_id));
             }
             if current_plan {
@@ -255,6 +255,7 @@ pub(super) async fn inspection(
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
                     "connection": verified.connection, "slot": verified.slot,
                     "process": atem_client::encoding::b64u(&verified.process), "journal": verified.journal.to_json(),
+                    "attached_processes": verified.processes.iter().map(|p| atem_client::encoding::b64u(p)).collect::<Vec<_>>(),
                     "missing_early_range": verified.journal.since > first, "submission_hash": hash,
                     "signed_head": verified.head.to_json(),
                     "signed_evidence_hash": verified.recovery.evidence_hash().to_hex(),

@@ -120,6 +120,7 @@ struct JournalObservations {
     prior_revision: Option<u64>,
     current_revision: Option<u64>,
     revisions: BTreeMap<u64, FrozenSets>,
+    process_rosters: BTreeMap<u64, BTreeSet<[u8; 16]>>,
     generations: BTreeMap<i64, PlanObservations>,
     first_export_generation: BTreeMap<String, i64>,
     missing_record_ids: BTreeSet<String>,
@@ -132,6 +133,7 @@ impl JournalHistory {
         &mut self,
         member: &str,
         journal: &JournalSummary,
+        processes: &[[u8; 16]],
         generation: i64,
         current: bool,
         record_ids: impl IntoIterator<Item = &'a str>,
@@ -152,6 +154,7 @@ impl JournalHistory {
                 prior_revision: None,
                 current_revision: None,
                 revisions: BTreeMap::new(),
+                process_rosters: BTreeMap::new(),
                 generations: BTreeMap::new(),
                 first_export_generation: BTreeMap::new(),
                 missing_record_ids: BTreeSet::new(),
@@ -162,6 +165,12 @@ impl JournalHistory {
         // Every accepted report remains evidence. A later matching report cannot
         // erase a fork at one revision or changes to a plan's held inventory.
         row.revision_conflict |= *row.revisions.entry(revision).or_insert(sets) != sets;
+        let roster: BTreeSet<_> = processes.iter().copied().collect();
+        if let Some(prior) = row.process_rosters.get(&revision) {
+            row.revision_conflict |= *prior != roster;
+        } else {
+            row.process_rosters.insert(revision, roster);
+        }
         let plan = row.generations.entry(generation).or_insert(PlanObservations {
             sets, lowest_revision: revision, highest_revision: revision,
         });
@@ -194,6 +203,10 @@ impl JournalHistory {
             if row.since_changed { reasons.push("creation_sequence_changed"); }
             if row.revision_conflict { reasons.push("conflicting_revision_contents"); }
             if row.barrier_conflict { reasons.push("held_inventory_changed"); }
+            if row.process_rosters.values().zip(row.process_rosters.values().skip(1))
+                .any(|(earlier, later)| !earlier.is_subset(later)) {
+                reasons.push("process_roster_shrank");
+            }
             if !row.missing_record_ids.is_empty() { reasons.push("previous_export_missing"); }
             if row.prior_revision.is_some() && row.current_revision.is_none() {
                 reasons.push("missing_current_report");
@@ -237,6 +250,8 @@ mod tests {
             records_hash: Hash32::of(b"records"),
             drafts: 0,
             drafts_hash: Hash32::of(b"drafts"),
+            processes: 1,
+            processes_hash: Hash32::of(b"processes"),
         }
     }
 
@@ -246,15 +261,15 @@ mod tests {
         let frozen = summary(1, 1, 3);
         let mut changed = frozen.clone();
         changed.drafts_hash = Hash32::of(b"other drafts");
-        history.observe("member:a", &frozen, 1, false, []);
-        history.observe("member:a", &changed, 2, true, []);
-        history.observe("member:a", &frozen, 2, true, []);
+        history.observe("member:a", &frozen, &[[1; 16]], 1, false, []);
+        history.observe("member:a", &changed, &[[1; 16]], 2, true, []);
+        history.observe("member:a", &frozen, &[[1; 16]], 2, true, []);
         changed.revision += 1;
-        history.observe("member:b", &frozen, 1, false, []);
-        history.observe("member:b", &changed, 2, true, []);
-        history.observe("member:c", &frozen, 1, false, []);
-        history.observe("member:c", &changed, 1, false, []);
-        history.observe("member:c", &changed, 2, true, []);
+        history.observe("member:b", &frozen, &[[1; 16]], 1, false, []);
+        history.observe("member:b", &changed, &[[1; 16]], 2, true, []);
+        history.observe("member:c", &frozen, &[[1; 16]], 1, false, []);
+        history.observe("member:c", &changed, &[[1; 16]], 1, false, []);
+        history.observe("member:c", &changed, &[[1; 16]], 2, true, []);
         let gaps = history.gaps();
         assert_eq!(gaps.len(), 2);
         assert_eq!(gaps[0]["signer"], "member:a");
@@ -267,25 +282,48 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_roster_can_grow_but_cannot_lose_an_attachment_or_fork() {
+        let a = [1; 16];
+        let b = [2; 16];
+        let mut history = JournalHistory::default();
+        for (member, rev, processes) in [
+            ("member:growing", 2, vec![a, b]),
+            ("member:growing", 1, vec![a]),
+            ("member:shrinking", 1, vec![a, b]),
+            ("member:shrinking", 2, vec![b]),
+            ("member:fork", 2, vec![a]),
+            ("member:fork", 2, vec![b]),
+        ] {
+            history.observe(member, &summary(1, 1, rev), &processes, 1, true, []);
+        }
+        let gaps = history.gaps();
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0]["signer"], "member:fork");
+        assert_eq!(gaps[0]["reasons"], json!(["conflicting_revision_contents"]));
+        assert_eq!(gaps[1]["signer"], "member:shrinking");
+        assert_eq!(gaps[1]["reasons"], json!(["process_roster_shrank"]));
+    }
+
+    #[test]
     fn a_new_plan_can_add_stops_and_drop_drafts_but_cannot_erase_an_older_signed_stop() {
         let mut history = JournalHistory::default();
         let mut journal = summary(1, 1, 3);
         journal.records = 1;
         journal.drafts = 2;
-        history.observe("member:a", &journal, 1, false, ["a"]);
+        history.observe("member:a", &journal, &[[1; 16]], 1, false, ["a"]);
         journal.revision = 4;
         journal.records = 2;
         journal.drafts = 0;
-        history.observe("member:a", &journal, 2, false, ["a", "b"]);
+        history.observe("member:a", &journal, &[[1; 16]], 2, false, ["a", "b"]);
         journal.revision = 5;
         // A different member and a separately identified journal have independent histories.
-        history.observe("member:b", &journal, 3, true, ["x", "y"]);
+        history.observe("member:b", &journal, &[[1; 16]], 3, true, ["x", "y"]);
         let other = JournalSummary { id: [2; 16], ..journal.clone() };
-        history.observe("member:a", &other, 3, true, ["x", "y"]);
-        history.observe("member:a", &journal, 3, false, ["b", "c"]);
+        history.observe("member:a", &other, &[[1; 16]], 3, true, ["x", "y"]);
+        history.observe("member:a", &journal, &[[1; 16]], 3, false, ["b", "c"]);
         journal.revision = 6;
         journal.records = 3;
-        history.observe("member:a", &journal, 4, true, ["a", "b", "c"]);
+        history.observe("member:a", &journal, &[[1; 16]], 4, true, ["a", "b", "c"]);
         let gaps = history.gaps();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0]["reasons"], json!(["previous_export_missing"]));
@@ -297,7 +335,7 @@ mod tests {
         for last_plan in [2, 3] {
             let mut history = JournalHistory::default();
             let mut report = |plan, revision| {
-                history.observe("member:a", &summary(1, 1, revision), plan, plan == last_plan, []);
+                history.observe("member:a", &summary(1, 1, revision), &[[1; 16]], plan, plan == last_plan, []);
             };
             // Concurrent reports from one plan can arrive in either order.
             report(1, 8);
@@ -314,7 +352,7 @@ mod tests {
         }
         let mut in_order = JournalHistory::default();
         for (plan, revision) in [(1, 8), (1, 6), (2, 12), (2, 8)] {
-            in_order.observe("member:a", &summary(1, 1, revision), plan, plan == 2, []);
+            in_order.observe("member:a", &summary(1, 1, revision), &[[1; 16]], plan, plan == 2, []);
         }
         assert!(in_order.gaps().is_empty());
     }
@@ -322,13 +360,13 @@ mod tests {
     #[test]
     fn journal_gaps_preserve_prior_revisions_and_distinguish_members_and_replaced_journals() {
         let mut history = JournalHistory::default();
-        history.observe("member:a", &summary(1, 2, 11), 1, false, []);
-        history.observe("member:a", &summary(1, 2, 8), 1, false, []);
-        history.observe("member:a", &summary(1, 3, 10), 2, true, []);
-        history.observe("member:a", &summary(2, 2, 12), 2, true, []);
-        history.observe("member:b", &summary(1, 2, 0), 1, false, []);
-        history.observe("member:c", &summary(3, 1, 6), 1, false, []);
-        history.observe("member:c", &summary(3, 1, 6), 2, true, []);
+        history.observe("member:a", &summary(1, 2, 11), &[[1; 16]], 1, false, []);
+        history.observe("member:a", &summary(1, 2, 8), &[[1; 16]], 1, false, []);
+        history.observe("member:a", &summary(1, 3, 10), &[[1; 16]], 2, true, []);
+        history.observe("member:a", &summary(2, 2, 12), &[[1; 16]], 2, true, []);
+        history.observe("member:b", &summary(1, 2, 0), &[[1; 16]], 1, false, []);
+        history.observe("member:c", &summary(3, 1, 6), &[[1; 16]], 1, false, []);
+        history.observe("member:c", &summary(3, 1, 6), &[[1; 16]], 2, true, []);
         let gaps = history.gaps();
         assert_eq!(gaps.len(), 2);
         assert_eq!(

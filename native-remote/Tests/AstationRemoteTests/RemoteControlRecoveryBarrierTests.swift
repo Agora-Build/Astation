@@ -56,6 +56,9 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
             format: nil) as? [String: Any])
         saved["version"] = 2
         saved.removeValue(forKey: "processAttachments")
+        var barriers = try XCTUnwrap(saved["barriers"] as? [String: [String: Any]])
+        barriers[f.origin]?.removeValue(forKey: "processes")
+        saved["barriers"] = barriers
         f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
         let migrated = try f.readAuthorJournal("manager")
         XCTAssertEqual(migrated.id, original.id)
@@ -64,18 +67,13 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let stored = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
             format: nil) as? [String: Any])
         XCTAssertEqual(stored["processAttachments"] as? [String: UInt64], [verifierReportProcess(): original.revision + 1])
-        let attachment = migrated.revision
         XCTAssertThrowsError(try migrated.finishReport(context: c, reviewed: reviewed, log: f.log,
             nowMs: { now }, current: { true }, sign: f.keys.sign))
+        XCTAssertNil(try migrated.exposedSubmission(for: c, log: f.log))
+        XCTAssertThrowsError(try migrated.holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: []))
         XCTAssertEqual(f.keys.signs, 0)
-        let fresh = try migrated.holdForReport(context: c, challengeJSON: ch, log: f.log,
-            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
-        XCTAssertNotEqual(fresh, reviewed)
-        let report = try migrated.finishReport(context: c, reviewed: fresh, log: f.log,
-            nowMs: { now }, current: { true }, sign: f.keys.sign)
-        let verified = try verifySignerReport(log: f.log, reportJson: report.report, expectedChallengeJson: ch,
-            exportedRecordsJson: [], nowMs: now)
-        XCTAssertGreaterThanOrEqual(verified.journal.revision, attachment)
+        XCTAssertThrowsError(try f.readAuthorJournal("manager").requireStopChange(origin: f.origin))
     }
 
     func testAnotherProcessAttachmentPreservesExposedRetryAndAdvancesNextReport() throws {
@@ -90,7 +88,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let first = try journal.finishReport(context: c, reviewed: reviewed, log: f.log, nowMs: { now },
             current: { true }, sign: f.keys.sign)
         let before = try verifySignerReport(log: f.log, reportJson: first.report, expectedChallengeJson: ch,
-            exportedRecordsJson: [record], nowMs: now)
+            exportedRecordsJson: [record], exportedProcesses: first.processes, nowMs: now)
 
         // A second SDK process acquires the same journal while the first is still alive.
         var saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
@@ -105,6 +103,8 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let retained = try XCTUnwrap(reopened.exposedSubmission(for: c, log: f.log))
         XCTAssertEqual(retained.report, first.report)
         XCTAssertEqual(retained.records, [record])
+        XCTAssertEqual(retained.processes, first.processes)
+        XCTAssertEqual(first.processes, [verifierReportProcess()])
         let retry = try reopened.holdForReport(context: c, challengeJSON: ch, log: f.log,
             slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
         XCTAssertEqual(retry, reviewed)
@@ -119,7 +119,8 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let result = try reopened.finishReport(context: c, reviewed: fresh, log: f.log, nowMs: { now + 1 },
             current: { true }, sign: f.keys.sign)
         let after = try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: next,
-            exportedRecordsJson: [record], nowMs: now + 1)
+            exportedRecordsJson: [record], exportedProcesses: result.processes, nowMs: now + 1)
+        XCTAssertEqual(Set(after.processes), [verifierReportProcess(), other])
         XCTAssertGreaterThanOrEqual(after.journal.revision, attachment)
         XCTAssertEqual(after.journal.recordsHash, before.journal.recordsHash)
         XCTAssertEqual(after.journal.draftsHash, before.journal.draftsHash)
@@ -147,7 +148,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
             nowMs: { now }, current: { true }, sign: { _ in XCTFail("a retry must use the retained signature"); return Data() })
         XCTAssertEqual(retried.report, signed)
         let verified = try verifySignerReport(log: f.log, reportJson: signed, expectedChallengeJson: ch,
-            exportedRecordsJson: [record], nowMs: now)
+            exportedRecordsJson: [record], exportedProcesses: result.processes, nowMs: now)
         XCTAssertEqual(verified.journal.records, 1)
         XCTAssertEqual(verified.journal.drafts, 2)
         XCTAssertEqual(verified.journal.revision + 1, writer.revision)
@@ -191,7 +192,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
                 nowMs: { now }, current: { true }, sign: f.keys.sign)
             XCTAssertEqual(result.records, [record])
             return try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: ch,
-                exportedRecordsJson: result.records, nowMs: now)
+                exportedRecordsJson: result.records, exportedProcesses: result.processes, nowMs: now)
         }
 
         let firstReport = try confirm(first)
@@ -267,7 +268,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let result = try reopened.finishReport(context: c, reviewed: retry, log: f.log, nowMs: { now },
             current: { true }, sign: { _ in XCTFail("exposure was already committed"); return Data() })
         _ = try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: ch,
-            exportedRecordsJson: [], nowMs: now)
+            exportedRecordsJson: [], exportedProcesses: result.processes, nowMs: now)
         XCTAssertEqual(f.keys.signs, 1)
     }
 

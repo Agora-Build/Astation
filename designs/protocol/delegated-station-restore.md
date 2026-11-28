@@ -74,8 +74,8 @@ The first draft or signing attempt persists a new journal. Opening an
 existing journal persists any new attachment before returning it to the
 caller. An older journal keeps its identity, signed entries and barriers
 on migration. Its first tracked process has a positive revision, leaving
-earlier processes unknown. Station still requires signed roster evidence
-from the shared SDK to account for a displaced process.
+earlier processes unknown. A migrated journal with an untracked prefix keeps
+its signing hold and records. It cannot attest to a complete process roster.
 
 While held, the barrier refuses the plan's new drafts and signatures before
 any prompt and at the key boundary: service stops at that origin, plus
@@ -136,16 +136,19 @@ count and draft count. The owner consents to the signing hold before the Mac
 takes it. The journal checks the reviewed inventory again under the key lock.
 Fresh owner authentication approves use of the member key for that SDK request.
 If authentication is cancelled after consent, the hold continues. A delivery
-retry reads only the already exposed report and records from protected storage.
+retry reads the exposed report, records and frozen process IDs from protected storage.
 
-The account client posts `{"report": <signed report>, "records": [<signed records>]}`
+The account client posts `{"report": <signed v2 report>, "records": [<signed records>], "processes": [<process IDs>]}`
 to `POST /api/remote/v1/logs/{genesis}/control/recovery/signer-reports`.
 Under the closed fence and locked owner root, Station verifies the SDK report
 and exports against the saved challenge, exact head, plan, current evidence
 and database time. The round's evidence hash includes the distinct signed records
 discovered through current author reports. A first report with an empty journal,
 a record already in the base, or a journal revision with the same signed records
-can confirm that round. Each accepted report commits its full submission hash to
+can confirm that round. The SDK checks the process count, digest and inclusion
+of the reporting process. A v1 submission lacks this evidence. An archived v1
+submission prevents verification of the plan and remains in storage.
+Each accepted report commits its full submission hash to
 the reconstruction review, including drafts and journal metadata. Conflicting
 journal observations remain visible to the operator.
 
@@ -248,8 +251,13 @@ selected signed copy. `recovery_signatures.pending_copy_exports` lists the
 original and selected copy IDs still awaiting that evidence. The final verifier
 also receives the rebuilt review and its process comparison for each list.
 Station installs the feeds and receipts only after every list passes.
-Checking a displaced process's signed journal attachment, the final
-replacement signatures and complete service coverage still needs the shared SDK.
+For each reviewed process the Station requires a signed attachment in the
+same member's latest report for its journal, at the current membership head
+and evidence hash. A known gap before journal creation prevents publication.
+The shared SDK also checks each selected replacement against its original
+and checks the snapshot against the independently recovered service enrollment.
+Authenticating the independent process exports is still required before the
+operator can publish.
 
 When the Mac has a pinned verifier journal, the export also reads its saved
 process conflicts for this Station and device list. A missing pinned journal

@@ -380,7 +380,7 @@ final class AtemE2EIdentity {
     func signRecoveryReport(_ reviewed: RemoteControlSigningJournal.ReportKeyRequest, expectedPublicKey: Data) throws -> Data {
         let request = reviewed.request
         lock.lock(); defer { lock.unlock() }
-        guard request.purpose == .signerReport, request.freshConfirmation, request.label == "atem-signer-report-v1",
+        guard request.purpose == .signerReport, request.freshConfirmation, request.label == "atem-signer-report-v2",
               let record = try read(create: false),
               try crypto.signingPublicKey(record.material) == expectedPublicKey else { throw AtemIdentityError.identityChanged }
         return try crypto.sign(request.input, material: record.material)

@@ -340,13 +340,15 @@ impl Publication {
                 "conflicted_author_slots",
                 "ambiguous_selected_processes",
                 "reported_outside_review",
+                "reviewed_without_signed_attachment",
+                "reports_missing_early_range",
             ] {
                 if !comparison[field].as_array().is_some_and(Vec::is_empty) {
                     return Err(invalid());
                 }
             }
-            // Displaced processes, early journal ranges, replacement signatures
-            // and service coverage still need the final verifier.
+            // Matching signed journals cannot establish the provenance and
+            // completeness of the independent protected process lists.
             verify(&log, &review, &comparison).await?;
         }
         Ok(())
@@ -487,6 +489,7 @@ mod tests {
             revision: 1,
             records: vec![],
             drafts: vec![],
+            processes: vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation())],
         };
         let body = signer_report_body(
             &fixture.log,
@@ -504,7 +507,7 @@ mod tests {
             fence,
             &genesis,
             PRINCIPAL,
-            &json!({"report":signed.to_json(),"records":[]}),
+            &json!({"report":signed.to_json(),"records":[],"processes":journal.processes}),
         )
         .await
         .ok()
@@ -938,6 +941,25 @@ mod tests {
         .await
         .is_err());
         assert_eq!(verified, [initial[0].0.clone()]);
+
+        // A reviewed but disconnected process needs an attachment signed by
+        // its member. The other list must remain closed if that proof is absent.
+        let mut missing_attachment = cuts(&reviews);
+        let mut last = missing_attachment.last_entry().unwrap();
+        let bytes = &mut last.get_mut().process_lists[0];
+        let mut roster: Value = serde_json::from_slice(bytes).unwrap();
+        let mut retired = roster["slots"][0].clone();
+        retired["selected"] = json!(false);
+        retired["process"] = json!(atem_client::encoding::b64u(&[9; 16]));
+        roster["slots"].as_array_mut().unwrap().push(retired);
+        *bytes = serde_json::to_vec(&roster).unwrap();
+        assert!(publish_after_verification(
+            &db.pool, &fence, &runtime.binding, signing, &runtime.vault, missing_attachment,
+            async |_, _, _| Ok(())
+        ).await.is_err());
+        for i in 0..2 {
+            assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
+        }
 
         // Refuse the second list in the final verifier, after both real signed
         // reports and both process exports matched the freshly rebuilt reviews.

@@ -2,7 +2,7 @@
 use super::{checkpoint, invalid, review_evidence, source_hash, Binding, Prepared};
 use atem_client::{
     control::{
-        check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlPrincipal,
+        check_resigned_copy, check_snapshot_consistency, verify_control, ControlAction, ControlCheck, ControlPrincipal,
         ControlRecord, RefusalReason, SnapshotConsistency, SnapshotInput,
     },
     membership::Membership,
@@ -20,6 +20,7 @@ impl StopSources {
     fn select(
         &self,
         log: &Membership,
+        candidate_feed_id: &str,
     ) -> Result<Option<(Vec<ControlRecord>, Vec<ControlRecord>)>, sqlx::Error> {
         let mut originals = Vec::new();
         let mut selected_records = BTreeMap::new();
@@ -40,6 +41,13 @@ impl StopSources {
                     let Some(copy) = self.copies.get(id) else {
                         return Ok(None);
                     };
+                    if check_resigned_copy(
+                        log, &serde_json::to_vec(value).map_err(|_| invalid())?,
+                        &serde_json::to_vec(&copy.object().to_json()).map_err(|_| invalid())?,
+                        candidate_feed_id,
+                    ).is_err() {
+                        return Ok(None);
+                    }
                     copy.clone()
                 }
                 _ => return Ok(None),
@@ -58,7 +66,7 @@ impl StopSources {
         origin: &str,
         plan: &Prepared,
     ) -> Result<Vec<ControlRecord>, sqlx::Error> {
-        let (originals, snapshot) = self.select(log)?.ok_or_else(invalid)?;
+        let (originals, snapshot) = self.select(log, &plan.candidate_feed_id)?.ok_or_else(invalid)?;
         let input = SnapshotInput {
             list: log,
             origin,
@@ -69,6 +77,7 @@ impl StopSources {
             // coverage belong to the subsequent complete-snapshot check.
             marks: &Default::default(),
             covered: &Default::default(),
+            provisioned: &Default::default(),
         };
         if check_snapshot_consistency(&input).map_err(|_| invalid())?
             != SnapshotConsistency::Consistent
@@ -89,7 +98,7 @@ impl StopSources {
         provisioned: &BTreeMap<String, String>,
         marks: &BTreeMap<String, u64>,
     ) -> Result<Option<Vec<ControlRecord>>, sqlx::Error> {
-        let Some((retained, stops)) = self.select(log)? else {
+        let Some((retained, stops)) = self.select(log, &plan.candidate_feed_id)? else {
             return Ok(None);
         };
         let mut covered = BTreeSet::new();
@@ -136,6 +145,7 @@ impl StopSources {
             snapshot: &snapshot,
             marks,
             covered: &covered,
+            provisioned: &provisioned.keys().map(|id| ControlPrincipal::Service(id.clone()).name()).collect(),
         };
         if check_snapshot_consistency(&input).map_err(|_| invalid())?
             != SnapshotConsistency::Consistent

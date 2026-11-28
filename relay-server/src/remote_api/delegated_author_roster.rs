@@ -252,10 +252,14 @@ fn compare_members(
     }
     let mut missing_early_ranges = Vec::new();
     let mut latest = BTreeMap::new();
+    let mut attached = BTreeSet::new();
     let current_head = log.head().to_json();
     for (signer, member) in authors["members"].as_object().ok_or_else(invalid)? {
         let id = signer.strip_prefix("member:").ok_or_else(invalid)?;
+        let mut latest_journals = BTreeMap::new();
         for report in member["reports"].as_array().ok_or_else(invalid)? {
+            let journal = report["journal"]["id"].as_str().ok_or_else(invalid)?;
+            latest_journals.insert(journal, report);
             // Reports are read in ascending Station connection order within this plan.
             let process = (
                 id.to_owned(),
@@ -272,6 +276,14 @@ fn compare_members(
                     "process": report["process"], "submission_hash": report["submission_hash"]}));
             }
         }
+        for report in latest_journals.values() {
+            if report["signed_head"] != current_head || report["signed_evidence_hash"] != evidence_hash {
+                continue;
+            }
+            for process in report["attached_processes"].as_array().ok_or_else(invalid)? {
+                attached.insert((id, process.as_str().ok_or_else(invalid)?));
+            }
+        }
     }
     let confirmed: BTreeSet<_> = latest
         .into_iter()
@@ -279,6 +291,9 @@ fn compare_members(
         .collect();
     Ok(json!({
         "conflicted_author_slots": conflicted_authors,
+        "reviewed_without_signed_attachment": reviewed.iter()
+            .filter(|(member, _, process)| !attached.contains(&(member.as_str(), process.as_str())))
+            .map(describe).collect::<Vec<_>>(),
         "reviewed_without_current_confirmation": reviewed.difference(&confirmed).map(describe).collect::<Vec<_>>(),
         "matching_evidence_confirmations": reviewed.intersection(&confirmed).map(describe).collect::<Vec<_>>(),
         "missing_current_roster": managers.difference(&current_rosters).collect::<Vec<_>>(),

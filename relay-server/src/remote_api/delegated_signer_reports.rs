@@ -23,6 +23,10 @@ impl From<sqlx::Error> for SubmitError {
 
 const MAX_REPORTS: usize = 256;
 
+fn exported_processes(input: &Value) -> Option<Vec<&str>> {
+    input.get("processes")?.as_array()?.iter().map(Value::as_str).collect()
+}
+
 pub(crate) async fn submit(
     pool: &PgPool,
     binding: &Binding,
@@ -32,9 +36,10 @@ pub(crate) async fn submit(
 ) -> Result<Value, SubmitError> {
     let object = input
         .as_object()
-        .filter(|v| v.len() == 2)
+        .filter(|v| v.len() == 3)
         .ok_or(SubmitError::Invalid)?;
     let report = object.get("report").ok_or(SubmitError::Invalid)?;
+    let processes = exported_processes(input).ok_or(SubmitError::Invalid)?;
     let records = object
         .get("records")
         .and_then(Value::as_array)
@@ -118,6 +123,7 @@ pub(crate) async fn submit(
         report.to_string().as_bytes(),
         &challenge,
         &exported,
+        &processes,
         wall,
     )
     .map_err(|_| SubmitError::Invalid)?;
@@ -172,7 +178,7 @@ pub(super) async fn visit(
     while let Some((connection, raw, input, hash, accepted)) = rows.try_next().await? {
         count += 1;
         if count > MAX_REPORTS
-            || input.as_object().is_none_or(|object| object.len() != 2)
+            || input.as_object().is_none_or(|object| object.len() != 3)
             || source_hash(&input)? != hash
         {
             return Err(invalid());
@@ -205,6 +211,7 @@ pub(super) async fn visit(
             input["report"].to_string().as_bytes(),
             &challenge,
             &exported,
+            &exported_processes(&input).ok_or_else(invalid)?,
             when,
         )
         .map_err(|_| invalid())?;

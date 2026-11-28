@@ -17,6 +17,7 @@ public final class RemoteControlSigningJournal {
         let records: [String]
         let drafts: [String]
         let signedRecords: [String]
+        let processes: [String]?
         let challengeJSON: String
         let slot: String
         var exposedReport: String?
@@ -27,9 +28,10 @@ public final class RemoteControlSigningJournal {
         var isHeld: Bool { supersededBy == nil && !hasTerminalReceipt }
 
         func request(log: MembershipLog, id: Data, since: UInt64, member: String, nowMs: UInt64) throws -> SignerReportRequest {
-            try SignerReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + member,
+            guard let processes else { throw RemoteControlPublicationError.requiresReview }
+            return try SignerReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + member,
                 slot: slot, origin: context.stationOrigin, journal: SignerJournalView(id: RemoteRecoveryKit.base64URL(id),
-                    since: since, revision: revision, records: records, drafts: drafts), keyId: member, nowMs: nowMs)
+                    since: since, revision: revision, records: records, drafts: drafts, processes: processes), keyId: member, nowMs: nowMs)
         }
     }
 
@@ -76,6 +78,12 @@ public final class RemoteControlSigningJournal {
     public var id: Data { saved.id }
     public var revision: UInt64 { saved.revision }
     private var latestAttachmentRevision: UInt64 { saved.processAttachments?.values.max() ?? 0 }
+    private func attachedProcesses(at revision: UInt64) throws -> [String] {
+        guard let attachments = saved.processAttachments, attachments.values.contains(0) else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        return attachments.filter { $0.value <= revision }.keys.sorted()
+    }
     /// Draft preparation can attach several processes before the first signing
     /// pin. A missing pin must still refuse a journal with any signing history.
     public var canEstablishInitialPin: Bool {
@@ -190,8 +198,13 @@ public final class RemoteControlSigningJournal {
         let challenge = try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)
         guard challenge.slot == barrier.slot, challenge.signer == "member:" + saved.member, challenge.origin == origin,
               challenge.recovery == context.signerReportRecovery else { throw RemoteControlPublicationError.invalidCheckpoint }
-        if let report = barrier.exposedReport {
-            try verifySignedObject(json: report, key: key)
+        // Older holds still fence signing until their plan ends or the manager
+        // confirms a new report. Only a v2 hold has a signed process roster.
+        if let processes = barrier.processes {
+            guard processes == (try attachedProcesses(at: barrier.revision)) else {
+                throw RemoteControlPublicationError.invalidCheckpoint
+            }
+            if let report = barrier.exposedReport { try verifySignedObject(json: report, key: key) }
         }
         var bodies: [String: String] = [:]
         for group in [barrier.records, barrier.drafts] {
@@ -299,6 +312,7 @@ public final class RemoteControlSigningJournal {
         public let context: RemoteControlRecoveryContext
         let report: String
         let records: [String]
+        let processes: [String]
     }
 
     public func reviewReport(_ issued: RemoteStationSignerChallenge, log: MembershipLog,
@@ -313,7 +327,7 @@ public final class RemoteControlSigningJournal {
         current: () -> Bool, sign: (ReportKeyRequest) throws -> Data) throws -> Submission {
         let result = try finishReport(context: review.context, reviewed: review.request, log: log,
             nowMs: nowMs, current: current, sign: { try sign(ReportKeyRequest($0)) })
-        return Submission(context: review.context, report: result.report, records: result.records)
+        return Submission(context: review.context, report: result.report, records: result.records, processes: result.processes)
     }
 
     /// A lost HTTP reply may be recovered after lease expiry. Only already exposed bytes
@@ -321,7 +335,7 @@ public final class RemoteControlSigningJournal {
     public func exposedSubmission(for context: RemoteControlRecoveryContext, log: MembershipLog) throws -> Submission? {
         try checkStorage()
         guard let barrier = saved.barriers?[context.stationOrigin], barrier.isHeld,
-              let report = barrier.exposedReport, barrier.context.planID == context.planID,
+              let processes = barrier.processes, let report = barrier.exposedReport, barrier.context.planID == context.planID,
               barrier.context.generation == context.generation, barrier.context.candidateFeedID == context.candidateFeedID,
               barrier.context.sourceHash == context.sourceHash, barrier.context.accountID == context.accountID,
               barrier.context.genesisHash == context.genesisHash, log.accountId() == context.accountID,
@@ -329,10 +343,10 @@ public final class RemoteControlSigningJournal {
               barrier.context.membershipHead == log.head() else { return nil }
         let challenge = try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)
         let checked = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: barrier.challengeJSON,
-            exportedRecordsJson: barrier.signedRecords, nowMs: challenge.issuedAt)
+            exportedRecordsJson: barrier.signedRecords, exportedProcesses: processes, nowMs: challenge.issuedAt)
         guard checked.atHead, checked.journal.revision == barrier.revision, checked.journal.id == RemoteRecoveryKit.base64URL(id),
               checked.journal.since == saved.since else { throw RemoteControlPublicationError.invalidCheckpoint }
-        return Submission(context: barrier.context, report: report, records: barrier.signedRecords)
+        return Submission(context: barrier.context, report: report, records: barrier.signedRecords, processes: processes)
     }
 
     /// Called under the member-key lock with every outbox from the locked account.
@@ -380,7 +394,7 @@ public final class RemoteControlSigningJournal {
                 // The stop sets stay frozen. A new signature must also cover
                 // every attached process, including one that joined during review.
                 let cut = max(prior.revision, latestAttachmentRevision)
-                if prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON,
+                if prior.processes != nil, prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON,
                    prior.exposedReport != nil || cut == prior.revision {
                     return try prior.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs).signRequest()
                 }
@@ -392,15 +406,17 @@ public final class RemoteControlSigningJournal {
             throw RemoteControlPublicationError.full
         }
         let revision = saved.revision + 1
-        let barrier = Barrier(context: context, revision: heldRevision ?? revision, records: records, drafts: drafts,
-            signedRecords: evidence.signedRecords, challengeJSON: challengeJSON, slot: slot)
+        let cutRevision = heldRevision ?? revision
+        let processes = try attachedProcesses(at: cutRevision)
+        let barrier = Barrier(context: context, revision: cutRevision, records: records, drafts: drafts,
+            signedRecords: evidence.signedRecords, processes: processes, challengeJSON: challengeJSON, slot: slot)
         // Reject malformed, expired or unauthorized requests before acquiring a hold.
         let request = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs)
         // Both supported algorithms produce 64-byte signatures. Size the canonical
         // HTTP body before committing a hold that this Station could never accept.
         let signature = RemoteRecoveryKit.base64URL(Data(repeating: 0, count: 64))
         let report = #"{"body":\#(request.bodyJson()),"sig":"\#(signature)"}"#
-        _ = try RemoteRecoveryHTTP.submissionBytes(report: report, records: barrier.signedRecords)
+        _ = try RemoteRecoveryHTTP.submissionBytes(report: report, records: barrier.signedRecords, processes: processes)
         operating = true
         defer { operating = false }
         var next = saved
@@ -415,12 +431,13 @@ public final class RemoteControlSigningJournal {
     /// exact reviewed request. No signed bytes leave before exposure is durable.
     func finishReport(context: RemoteControlRecoveryContext, reviewed: SignRequest, log: MembershipLog,
                       nowMs: () -> UInt64, current: () -> Bool,
-                      sign: (SignRequest) throws -> Data) throws -> (report: String, records: [String]) {
+                      sign: (SignRequest) throws -> Data) throws -> (report: String, records: [String], processes: [String]) {
         guard !operating else { throw RemoteControlPublicationError.busy }
         operating = true
         defer { operating = false }
         try checkStorage()
-        guard current(), let barrier = saved.barriers?[context.stationOrigin], barrier.context == context, barrier.isHeld,
+        guard current(), let barrier = saved.barriers?[context.stationOrigin], let processes = barrier.processes,
+              barrier.context == context, barrier.isHeld,
               context.accountID == log.accountId(), context.genesisHash == log.genesisHash(),
               context.membershipHead == log.head(), log.member(deviceId: saved.member)?.authKey == key else {
             throw RemoteControlPublicationError.requiresReview
@@ -434,7 +451,7 @@ public final class RemoteControlSigningJournal {
         if let exposed = barrier.exposedReport { report = exposed }
         else { report = try request.finish(signature: sign(reviewed)) }
         let checked = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: barrier.challengeJSON,
-            exportedRecordsJson: barrier.signedRecords, nowMs: nowMs())
+            exportedRecordsJson: barrier.signedRecords, exportedProcesses: processes, nowMs: nowMs())
         guard current(), log.head() == context.membershipHead, checked.journal.revision == barrier.revision,
               try signedObjectInfo(json: report).bodyJcs == request.bodyJson() else {
             throw RemoteControlPublicationError.requiresReview
@@ -451,7 +468,7 @@ public final class RemoteControlSigningJournal {
               nowMs() < (try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)).expiresAt else {
             throw RemoteControlPublicationError.requiresReview
         }
-        return (report, barrier.signedRecords)
+        return (report, barrier.signedRecords, processes)
     }
 
     /// Only the HTTPS transport can attest the origin of the prepared successor.
