@@ -978,6 +978,12 @@ async fn postgres_delegated_empty_candidate_is_identical_across_replicas() {
     let (primary, runtime, fixture) = fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
     let genesis = fixture.log.genesis_hash().to_hex();
     let fence = Binding::new(&runtime.binding.station_origin, 2).unwrap();
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(&fence.origin, 1).await.unwrap();
+    assert_eq!(recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0, StatusCode::OK);
+    let old_events = vec![ReportControlEvent::Resume(runtime.binding.report_client_id.clone()),
+        ReportControlEvent::Stop(runtime.binding.report_client_id.clone())];
+    assert_eq!(recovery.delegated_operation(&genesis, PRINCIPAL, Command::ReportingControl(old_events.clone())).await.0, StatusCode::OK);
     fence.initialize(&primary.pool, true).await.unwrap();
     let previous = runtime.policies.load(&runtime.binding).await.unwrap();
     let source = json!({"changes":[],"cursor":previous.cursor,
@@ -987,14 +993,78 @@ async fn postgres_delegated_empty_candidate_is_identical_across_replicas() {
     runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
     let clock = runtime.app.recovery.signing_ceilings.get().unwrap();
     let replica = primary.reconnect(2).await;
+    let report_binding = runtime.binding.report_control_binding();
+    let events = json!(old_events);
+    let prepare = |pool| plan::prepare_with_sources(pool, &fence, &genesis,
+        Some(clock), Some(&runtime.binding), Some(&runtime.vault));
+    let missing_journal = prepare(&replica).await.unwrap();
+    assert_eq!(missing_journal["replacement_feed"]["status"], "awaiting_reporting_history");
+    // Model a restored reservation whose owner never returned a signed copy.
+    sqlx::query("INSERT INTO station_delegated_copy_reservations(plan_id,original_id,manager,principal,review_hash,issued_at)
+        VALUES($1,$2,'phone','host:host-a',$3,4500)")
+        .bind(missing_journal["plan_id"].as_str().unwrap()).bind(uuid::Uuid::new_v4().to_string())
+        .bind(missing_journal["evidence_hash"].as_str().unwrap()).execute(&primary.pool).await.unwrap();
+    sqlx::query("INSERT INTO station_delegated_reporting(binding,events,in_flight) VALUES ($1,$2,'lost-response')")
+        .bind(&report_binding).bind(&events).execute(&primary.pool).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION refuse_image() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'commit failed'; END; $$ LANGUAGE plpgsql;
+        CREATE CONSTRAINT TRIGGER refuse_image AFTER INSERT ON station_delegated_replacement_feeds
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_image()").execute(&primary.pool).await.unwrap();
+    assert!(prepare(&replica).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_delegated_replacement_feeds")
+        .fetch_one(&primary.pool).await.unwrap();
+    assert_eq!(count,0);
+    sqlx::query("DROP TRIGGER refuse_image ON station_delegated_replacement_feeds").execute(&primary.pool).await.unwrap();
+    let mut exact = None;
     for pool in [&primary.pool, &replica] {
-        let review = plan::prepare_with_sources(pool, &fence, &genesis,
-            Some(clock), Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+        let review = prepare(pool).await.unwrap();
         assert_eq!(review["candidate_snapshot"], json!({"status":"assembled","record_count":0,
             "records_hash":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}));
         assert_eq!(review["snapshot_complete"], false);
         assert_eq!(review["recovery_ready"], false);
+        let staged = &review["replacement_feed"];
+        assert_eq!(staged["status"], "staged");
+        let image: Value = sqlx::query_scalar("SELECT feed FROM station_delegated_replacement_feeds WHERE plan_id=$1")
+            .bind(review["plan_id"].as_str().unwrap()).fetch_one(pool).await.unwrap();
+        assert_eq!(image["feed_id"], review["candidate_feed_id"]);
+        assert_eq!(image["records"], json!([]));
+        assert_eq!(image["signing_high_water"]["host:host-a"], 4500);
+        assert_eq!(image["ledger"]["stopped"], runtime.binding.report_client_id);
+        assert_eq!(image["report_control_seq"], 2);
+        assert_eq!(image["ledger"]["done"], json!([]));
+        if let Some(previous) = &exact { assert_eq!(previous, staged); }
+        exact = Some(staged.clone());
     }
+    sqlx::query("DELETE FROM station_delegated_reporting WHERE binding=$1")
+        .bind(&report_binding).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"]["status"], "awaiting_reporting_history");
+    sqlx::query("INSERT INTO station_delegated_reporting(binding,events,in_flight) VALUES ($1,$2,'lost-response')")
+        .bind(&report_binding).bind(&events).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"], exact.unwrap());
+    sqlx::query("UPDATE station_delegated_replacement_feeds SET feed=jsonb_set(feed,'{records}', '[{}]')")
+        .execute(&replica).await.unwrap();
+    assert!(prepare(&primary.pool).await.is_err());
+    let claim: String = sqlx::query_scalar("SELECT in_flight FROM station_delegated_reporting WHERE binding=$1")
+        .bind(&report_binding).fetch_one(&primary.pool).await.unwrap();
+    assert_eq!(claim, "lost-response");
+
+    // A restored Resume event must have its operator ID. Replacing the outstanding
+    // claim while the client is enabled also requires another explicit resume.
+    let resume = json!([ReportControlEvent::Resume(runtime.binding.report_client_id.clone())]);
+    sqlx::query("UPDATE station_delegated_reporting SET events=events || $2, in_flight='delivery-a' WHERE binding=$1")
+        .bind(&report_binding).bind(resume).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"]["status"], "awaiting_reporting_history");
+    let record_resume = "INSERT INTO station_delegated_report_resumptions(binding,resume_id) VALUES ($1,$2::uuid)";
+    sqlx::query(record_resume).bind(&report_binding).bind(uuid::Uuid::new_v4().to_string()).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"]["status"], "staged");
+    sqlx::query("UPDATE station_delegated_reporting SET in_flight='delivery-b' WHERE binding=$1")
+        .bind(&report_binding).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"]["status"], "awaiting_reporting_history");
+    let restart = json!([ReportControlEvent::Stop(runtime.binding.report_client_id.clone()),
+        ReportControlEvent::Resume(runtime.binding.report_client_id.clone())]);
+    sqlx::query("UPDATE station_delegated_reporting SET events=events || $2, in_flight=NULL WHERE binding=$1")
+        .bind(&report_binding).bind(restart).execute(&primary.pool).await.unwrap();
+    sqlx::query(record_resume).bind(&report_binding).bind(uuid::Uuid::new_v4().to_string()).execute(&primary.pool).await.unwrap();
+    assert_eq!(prepare(&replica).await.unwrap()["replacement_feed"]["status"], "staged");
     replica.close().await;
     drop(runtime);
     primary.cleanup().await;
@@ -1108,6 +1178,13 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     let retried = plan::prepare_with_sources(&other, &fence, &genesis, Some(clock),
         Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
     assert_eq!(retried["candidate_snapshot"], superseding["candidate_snapshot"]);
+    assert_eq!(retried["replacement_feed"], superseding["replacement_feed"]);
+    let read_feed = "SELECT feed FROM station_delegated_replacement_feeds WHERE plan_id=$1 AND cut_hash=$2";
+    let image: Value = sqlx::query_scalar(read_feed).bind(review["plan_id"].as_str().unwrap())
+        .bind(retried["replacement_feed"]["cut_hash"].as_str().unwrap()).fetch_one(&other).await.unwrap();
+    assert_eq!(image["records"], json!(records.iter().map(|r| r.object().to_json()).collect::<Vec<_>>()));
+    assert_eq!(image["signing_high_water"][&principal], records.last().unwrap().issued_at());
+    assert_eq!(image["ledger"]["done"],json!([]));
     assert_eq!(superseding["evidence_hash"], review["evidence_hash"],
         "Station's own service signatures must preserve the native author round that authorized them");
     assert_ne!(superseding["reconstruction_hash"], review["reconstruction_hash"]);
@@ -1190,6 +1267,13 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     assert_eq!(after_revoke["candidate_snapshot"], json!({"status":"assembled",
         "record_count":stop_only["stop_count"],"records_hash":stop_only["records_hash"]}));
     assert_eq!(after_revoke["snapshot_complete"], false);
+    let replaced: Value = sqlx::query_scalar(read_feed).bind(rev["plan_id"].as_str().unwrap())
+        .bind(after_revoke["replacement_feed"]["cut_hash"].as_str().unwrap()).fetch_one(&other).await.unwrap();
+    assert_ne!(retried["replacement_feed"]["cut_hash"], after_revoke["replacement_feed"]["cut_hash"]);
+    assert!(replaced["records"].as_array().unwrap().contains(&interrupt));
+    for stop in &stops { assert!(replaced["records"].as_array().unwrap().contains(&stop.object().to_json())); }
+    assert!(replaced["ledger"]["records"].as_object().unwrap().contains_key(interrupt["body"]["record_id"].as_str().unwrap()));
+    assert_eq!(replaced["ledger"]["done"], json!([]));
     plan::outcome::abandon(&other, &fence, &genesis, receipt["plan_id"].as_str().unwrap()).await.unwrap();
     let next_fence = Binding::new(origin, 3).unwrap();
     next_fence.initialize(&primary.pool, true).await.unwrap();

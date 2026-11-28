@@ -191,11 +191,15 @@ impl Stored {
     }
 
     fn new(origin: &str, log: &Membership) -> Result<Self, Fault> {
+        Self::empty(origin, log, uuid::Uuid::new_v4().to_string())
+    }
+
+    fn empty(origin: &str, log: &Membership, feed_id: String) -> Result<Self, Fault> {
         let ledger = AckLedger::new(origin, log.account_id(), log.genesis_hash())
             .map_err(|_| Fault::Unavailable)?;
         Ok(Self {
             version: 1,
-            feed_id: uuid::Uuid::new_v4().to_string(),
+            feed_id,
             records: Vec::new(),
             ledger: ledger.to_json(),
             signing_high_water: BTreeMap::new(),
@@ -435,16 +439,10 @@ impl Stored {
         if events.len() < self.report_control_seq {
             return Err(Fault::Unavailable);
         }
-        let digest = |events: &[ReportControlEvent]| {
-            atem_client::Hash32::of(
-                &serde_json::to_vec(events).expect("serializable report control events"),
-            )
-            .to_hex()
-        };
         if self
             .report_control_hash
             .as_ref()
-            .is_some_and(|prior| prior != &digest(&events[..self.report_control_seq]))
+            .is_some_and(|prior| prior != &report_events_hash(&events[..self.report_control_seq]))
         {
             return Err(Fault::Unavailable);
         }
@@ -458,7 +456,7 @@ impl Stored {
             .next;
         }
         self.report_control_seq = events.len();
-        self.report_control_hash = Some(digest(events));
+        self.report_control_hash = Some(report_events_hash(events));
         self.ledger = ledger.to_json();
         self.update_ledger(origin, log, LedgerUpdate::Tick, now)
     }
@@ -492,10 +490,15 @@ impl Stored {
                 };
             }
         }
-        let next = self
-            .ledger(origin, log)?
-            .record(record, revoked_at, covered, now)
+        self.check_page(origin, record, now)?;
+        let next = self.ledger(origin, log)?.record(record, revoked_at, covered, now)
             .map_err(|_| Fault::Invalid)?;
+        self.push_verified(record);
+        self.ledger = next.next.to_json();
+        Ok(true)
+    }
+
+    fn check_page(&self, origin: &str, record: &ControlRecord, now: u64) -> Result<(), Fault> {
         // Prove that the full signed record fits a page before making it visible.
         ControlSyncResult {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -507,13 +510,41 @@ impl Stored {
             records: vec![FeedEntry::new(self.records.len() as u64 + 1, record)],
         }
         .to_json()
-        .map_err(|_| Fault::Invalid)?;
+        .map(|_| ()).map_err(|_| Fault::Invalid)
+    }
+
+    fn push_verified(&mut self, record: &ControlRecord) {
         let principal = record.principal().name();
         let watermark = self.signing_high_water.entry(principal).or_default();
         *watermark = (*watermark).max(record.issued_at());
         self.records.push(record.object().to_json());
-        self.ledger = next.next.to_json();
-        Ok(true)
+    }
+
+    /// The shared snapshot checker has already classified carried stops and
+    /// fresh controls. New acknowledgments start with a fresh ledger.
+    pub(super) fn recovered(
+        origin: &str, log: &Membership, feed_id: &str, records: &[ControlRecord],
+        floors: BTreeMap<String, u64>, revocations: &BTreeMap<(String, String), u64>,
+        events: &[ReportControlEvent], now: u64,
+    ) -> Result<Self, Fault> {
+        let mut feed = Self::empty(origin, log, feed_id.to_owned())?;
+        feed.signing_high_water = floors;
+        feed.reporting_control(origin, log, events, now)?;
+        let mut ledger = feed.ledger(origin, log)?;
+        for record in records {
+            feed.check_page(origin, record, now)?;
+            let revoked_at = match (record.signer(), record.principal(), record.action()) {
+                (ControlSigner::Principal, ControlPrincipal::Service(id), ControlAction::Revoke { .. }) =>
+                    revocations.get(&(id.clone(), record.principal_key().ok_or(Fault::Invalid)?.to_hex()))
+                        .copied().unwrap_or(record.issued_at()),
+                _ => record.issued_at(),
+            };
+            ledger = ledger.record(record, revoked_at, &covered_hosts(log, record.principal()), now)
+                .map_err(|_| Fault::Invalid)?.next;
+            feed.push_verified(record);
+        }
+        feed.ledger = ledger.to_json();
+        Ok(feed)
     }
 
     fn plan_service(
@@ -972,6 +1003,10 @@ fn owner(
 pub(crate) enum ReportControlEvent {
     Stop(String),
     Resume(String),
+}
+
+pub(super) fn report_events_hash(events: &[ReportControlEvent]) -> String {
+    atem_client::Hash32::of(&serde_json::to_vec(events).expect("serializable report control events")).to_hex()
 }
 
 pub(crate) enum LedgerUpdate {

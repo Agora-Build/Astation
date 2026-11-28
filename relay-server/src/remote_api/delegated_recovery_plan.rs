@@ -22,6 +22,8 @@ mod service_drafts;
 pub(crate) mod service_components;
 #[path = "delegated_candidate_snapshot.rs"]
 mod candidate_snapshot;
+#[path = "delegated_replacement_feed.rs"]
+mod replacement_feed;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
@@ -128,6 +130,15 @@ pub(crate) async fn prepare_with_sources(
     let observed = observe_reservations(
         &mut tx, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
     ).await?;
+    if ceilings.is_some() {
+        let copy_floors: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT r.principal,MAX(r.issued_at) FROM station_delegated_copy_reservations r
+             JOIN station_delegated_recovery_plans p USING(plan_id)
+             WHERE p.origin=$1 AND p.genesis_hash=$2 GROUP BY r.principal ORDER BY r.principal LIMIT 4097",
+        ).bind(&binding.origin).bind(genesis).fetch_all(&mut *tx).await?;
+        if copy_floors.len() > history::MAX_RECORDS { return Err(invalid()); }
+        report["reserved_copy_times"] = json!(copy_floors.into_iter().collect::<BTreeMap<_,_>>());
+    }
     let clock_evidence = match reservations.as_deref() {
         Some(rows) => Some(crate::service_signing_ceilings::SigningCeilings::recovery_evidence(
             rows, &observed, &report,
@@ -160,6 +171,7 @@ pub(crate) async fn prepare_with_sources(
             "source": source,
         }))?.into();
         report["portal_service_evidence"] = source;
+        report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
         if vault.is_some() && ceilings.is_some() {
             report["service_drafts"] = if covered {
                 service_drafts::prepare(&mut tx, &prepared, &log, binding, &report).await?
@@ -167,12 +179,12 @@ pub(crate) async fn prepare_with_sources(
                 json!({"status":"membership_history_unresolved"})
             };
             if covered {
-                report["candidate_snapshot"] = candidate_snapshot::inspect(
+                let candidate = candidate_snapshot::assemble(
                     &mut tx, &prepared, &log, &binding.origin, &report, &stops,
                 ).await?;
+                replacement_feed::stage(&mut tx, &prepared, &log, portal, &mut report, candidate).await?;
             }
         }
-        report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
     }
     tx.commit().await?;
     Ok(report)

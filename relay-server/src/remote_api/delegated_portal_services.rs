@@ -238,10 +238,23 @@ pub(super) async fn observe(
         if let Some(end) = coverage_end {
             reconstruction["coverage_end"] = end;
         }
-        rows.push(
-            json!({"service_id":id,"key_fingerprint":key,"observation":observation(id,key),
-            "snapshot_review":reconstruction}),
-        );
+        let mut row = json!({"service_id":id,"key_fingerprint":key,"observation":observation(id,key),
+            "snapshot_review":reconstruction});
+        if let Some(checkpoint) = integration(id, key).filter(|s| matches!(s.policy.state.as_str(), "revoking" | "revoked")) {
+            let integration_id = id.strip_prefix("svc-").ok_or_else(invalid)?;
+            let from_feed = if policy.integrations.get(integration_id).is_some_and(|live|
+                live.owner_account == *owner && live.r9_svc.as_deref() == Some(key)) {
+                policy.known_revocation_ms(integration_id).map_err(|_| invalid())?
+            } else { None };
+            let from_checkpoint = checkpoint.revoked_at.as_ref().map(|at| {
+                let date = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| invalid())?;
+                u64::try_from(date.timestamp_millis()).map_err(|_| invalid())
+            }).transpose()?;
+            if let Some(time) = from_checkpoint.or(from_feed) {
+                row["revoked_at_ms"] = time.into();
+            }
+        }
+        rows.push(row);
     }
 
     // A registration may outlive an enrollment or its failed provisioning transaction.
