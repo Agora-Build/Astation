@@ -2300,12 +2300,20 @@ extension AstationRecoveryCoordinator {
                 try append(slot, seq: old.sequence, hash: old.headHash, selected: false)
             }
         }
-        let value: [String: Any] = ["version": 1, "account_id": accountID, "genesis_hash": context.genesisHash,
+        var value: [String: Any] = ["version": 1, "account_id": accountID, "genesis_hash": context.genesisHash,
             "origin": relayURL, "generation": String(context.generation), "plan_id": context.planID,
             "candidate_feed_id": context.candidateFeedID, "source_hash": context.sourceHash,
             "evidence_hash": context.evidenceHash, "reconstruction_hash": plan.reconstructionHash,
             "membership_head": ["seq": context.membershipHead.seq, "hash": context.membershipHead.hash],
             "slots": rows]
+        if let pinned = saved.verifierHistoryRoots?[relayURL] {
+            guard pinned == context.genesisHash else { throw RemoteRecoveryError.invalidCheckpoint }
+            let journal = try verifierHistory(log, relayURL, false)
+            let conflicts = try journal.nativeConflicts(log: log, origin: relayURL)
+            if !conflicts.isEmpty {
+                value["conflicted_slots"] = conflicts.map { ["member": $0.member, "slot": $0.slot] }
+            }
+        }
         let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
         guard data.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
         return String(decoding: data, as: UTF8.self)

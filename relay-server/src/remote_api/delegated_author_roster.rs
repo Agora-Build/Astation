@@ -23,6 +23,13 @@ struct Slot {
     selected: bool,
 }
 
+#[derive(Deserialize, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct ConflictedSlot {
+    member: String,
+    slot: String,
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Export {
@@ -38,17 +45,25 @@ struct Export {
     reconstruction_hash: String,
     membership_head: Value,
     slots: Vec<Slot>,
+    #[serde(default)]
+    conflicted_slots: Vec<ConflictedSlot>,
 }
 
 fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
     let mut remaining = INPUT_LIMIT;
     let mut scope = None;
     let mut members = BTreeMap::<String, Vec<Slot>>::new();
+    let mut conflicts = BTreeSet::new();
     for bytes in inputs {
         remaining = remaining.checked_sub(bytes.len()).ok_or_else(invalid)?;
         let strict = StrictValue::parse(bytes, INPUT_LIMIT).map_err(|_| invalid())?;
         let mut export: Export =
             serde_json::from_value(strict.into_value()).map_err(|_| invalid())?;
+        let rows = std::mem::take(&mut export.conflicted_slots);
+        let count = rows.len();
+        let reported: BTreeSet<_> = rows.into_iter().collect();
+        if count > 4096 || reported.len() != count { return Err(invalid()); }
+        conflicts.extend(reported);
         let mut reviewed = BTreeMap::<String, Vec<Slot>>::new();
         for row in std::mem::take(&mut export.slots) {
             reviewed.entry(row.member.clone()).or_default().push(row);
@@ -77,6 +92,7 @@ fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
     }
     let mut export = scope.ok_or_else(invalid)?;
     export.slots = members.into_values().flatten().collect();
+    export.conflicted_slots = conflicts.into_iter().collect();
     Ok(export)
 }
 
@@ -118,6 +134,7 @@ pub(crate) async fn compare(
         &report["known_authors"],
         &export.evidence_hash,
         export.slots,
+        export.conflicted_slots,
     )?;
     comparison["origin"] = json!(binding.origin);
     comparison["genesis_hash"] = json!(genesis);
@@ -157,6 +174,7 @@ fn compare_members(
     authors: &Value,
     evidence_hash: &str,
     slots: Vec<Slot>,
+    conflicts: Vec<ConflictedSlot>,
 ) -> Result<Value, sqlx::Error> {
     let mut managers = BTreeSet::new();
     let mut current = BTreeSet::new();
@@ -164,6 +182,17 @@ fn compare_members(
     let mut observed = current.clone();
     for prior in authors["prior_plans"].as_array().ok_or_else(invalid)? {
         observations(&prior["members"], &mut managers, &mut observed)?;
+    }
+    let mut conflicted_authors = Vec::new();
+    for row in conflicts {
+        if !is_opaque_id(&row.member) || !is_opaque_id(&row.slot)
+            || !log.member(&row.member).is_some_and(|m| matches!(
+                m.member.kind, atem_client::membership::MemberKind::Native { .. }
+            ))
+        {
+            return Err(invalid());
+        }
+        if managers.contains(&row.member) { conflicted_authors.push(row); }
     }
     let mut reviewed = BTreeSet::new();
     let mut current_rosters = BTreeSet::new();
@@ -244,6 +273,7 @@ fn compare_members(
         .filter_map(|(p, hash)| (hash == evidence_hash).then_some(p))
         .collect();
     Ok(json!({
+        "conflicted_author_slots": conflicted_authors,
         "reviewed_without_current_confirmation": reviewed.difference(&confirmed).map(describe).collect::<Vec<_>>(),
         "matching_evidence_confirmations": reviewed.intersection(&confirmed).map(describe).collect::<Vec<_>>(),
         "missing_current_roster": managers.difference(&current_rosters).collect::<Vec<_>>(),
