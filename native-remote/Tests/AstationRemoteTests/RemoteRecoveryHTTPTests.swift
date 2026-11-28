@@ -42,7 +42,7 @@ final class RemoteRecoveryHTTPTests: XCTestCase {
         return (try RemoteRecoveryHTTP(relayURL: "https://" + host, configuration: config, accessToken: { "test-account-token" }), host)
     }
 
-    private static func requestBody(_ request: URLRequest) throws -> [String: Any] {
+    static func requestBody(_ request: URLRequest) throws -> [String: Any] {
         var data = request.httpBody ?? Data()
         if data.isEmpty, let stream = request.httpBodyStream {
             stream.open(); defer { stream.close() }

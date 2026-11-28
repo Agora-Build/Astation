@@ -137,6 +137,17 @@ pub(crate) async fn signer_report(
     state.recovery.submit_signer_report(&genesis, &owner, value.value()).await
 }
 
+pub(crate) async fn copy_reservation(
+    State(state): State<AppState>, Path(genesis): Path<String>, headers: HeaderMap, body: Body,
+) -> Reply {
+    let owner = match subject(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    if !super::delegated_recovery::canonical_genesis(&genesis) { return invalid(); }
+    let Ok(bytes) = axum::body::to_bytes(body, 4096).await else { return invalid() };
+    let Ok(value) = StrictValue::parse(&bytes, 4096) else { return invalid() };
+    let Some(request) = super::delegated_recovery::plan::copy_reservations::Request::parse(value.value()) else { return invalid() };
+    state.recovery.reserve_control_copy(&genesis, &owner, request).await
+}
+
 pub(crate) async fn retain_recovery_copies(
     State(state): State<AppState>,
     Path((genesis, plan)): Path<(String, String)>,

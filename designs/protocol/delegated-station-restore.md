@@ -452,9 +452,8 @@ genesis or membership head, noncanonical IDs/numbers, unknown/duplicate/null
 fields, oversize replies and any assertion of completion/readiness. The
 coordinator checks its protected checkpoint before and after the fetch and
 discards replies after account/Station/window changes. Opening the window and
-exporting saved signatures remain local operations. Loading a plan installs no
-authority and enables no confirmation button; complete authoritative collection,
-reservation, preparation and publication still require the provider below.
+exporting saved signatures remain local operations. A manager uses **Prepare
+Copy** to reserve a timestamp for one verified original.
 
 The screen lists signed stops saved on this Mac. Loading the review also reads
 `GET /api/remote/v1/logs/<genesis>/control/recovery/<plan>/originals` from the
@@ -476,8 +475,7 @@ Membership refresh rechecks protected state before writing and after each networ
 page, so a reply cannot recreate a missing or changed journal from memory.
 Signing also rechecks it before and after owner confirmation and at the key boundary.
 An account/Station change or closed window retires pending preparation. A spent
-reservation does not authorize a late draft. No additional production provider
-is installed by this UI.
+reservation does not authorize a late draft.
 
 Successful preparation saves an unsigned draft and selects it for review; it
 does not sign or show an owner prompt. **Confirm Copy** is the separate existing
@@ -518,10 +516,11 @@ stop effects, snapshot publication or reopening. These still require the
 production authority and joint checks.
 
 The explicit recovery-review startup mode also permits this signed-copy
-retention endpoint; its GET remains read-only. The mode still requires the
+retention endpoint and the native copy reservation described below. Its GET
+remains read-only. The mode still requires the
 opt-in delegated build, durable store and already closed exact-generation
-fence. It does not permit unsigned preparation, new signing, live feed writes,
-reporting or reopening. Ordinary deployments remain disabled for this path.
+fence. The manager's Mac prepares and confirms its own signatures. Station
+keeps live feed writes, reporting and reopening behind their separate gates.
 
 ## Durable recovery preparation
 
@@ -850,9 +849,29 @@ signer report and entering its signing hold. Complete participant history and
 the service signing clock are required for snapshot publication. Requiring either
 to sign a native copy would make recovery wait for its own result.
 
-The production coordinator still has no recovery-authority provider. Viewing
-verified originals works while signing is gated. A configured provider must
-also enforce the protected author journal and the owner-confirmed signing request.
+With delegated signing authorized, the Mac obtains a timestamp from
+`POST /api/remote/v1/logs/<genesis>/control/recovery/copy-reservations`.
+The native bearer identifies the owner. The request names the closed plan,
+membership head, current manager, original record ID and SHA-256 of the
+canonical signed original. Station checks that the original still needs a
+new manager signature. It stores one elapsed timestamp for this review in
+shared PostgreSQL, above the retained principal's observed times and its
+previous native copy reservations. Concurrent replicas return the same
+reservation for the same request. When the Mac has already saved a draft for
+the same principal, it sends that journal's most recent timestamp as
+`after_issued_at` on a new reservation. If an earlier reply was lost, Station
+can replace its unseen reservation with an elapsed timestamp above this floor.
+An exact `issued_at` recheck and a new reservation are distinct requests.
+The independent service signing clock is used only for service signatures.
+
+The Mac rechecks the exact saved `issued_at` before showing owner confirmation
+and after the owner responds. This request can only verify an existing
+reservation. A changed plan, original, membership or elapsed signing floor
+requires a new review. If a later retained stop passes the draft's time,
+choosing **Prepare Copy** again can reserve a newer timestamp. The protected
+journal retains the earlier draft and any signature, with a separate record
+ID for the new confirmation. The Station records a copy only when it receives
+and verifies its signature. A reservation alone leaves the fence closed.
 
 Control Activity's **Review Recovery Copies** opens a separate protected local
 review. It lists only drafts already prepared through that trusted adapter and
