@@ -32,7 +32,7 @@ struct ConflictedSlot {
 
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Export {
+pub(super) struct Export {
     version: u8,
     account_id: String,
     genesis_hash: String,
@@ -49,7 +49,7 @@ struct Export {
     conflicted_slots: Vec<ConflictedSlot>,
 }
 
-fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
+pub(super) fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
     let mut remaining = INPUT_LIMIT;
     let mut scope = None;
     let mut members = BTreeMap::<String, Vec<Slot>>::new();
@@ -104,44 +104,48 @@ pub(crate) async fn compare(
     inputs: &[Vec<u8>],
 ) -> Result<Value, sqlx::Error> {
     let export = combine(inputs)?;
-    if export.version != 1
-        || export.origin != binding.origin
-        || export.genesis_hash != genesis
-        || export.plan_id != plan
-        || export.generation != binding.generation.to_string()
-        || export.slots.len() > 8192
-    {
-        return Err(invalid());
-    }
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, false).await?;
-    if prepared.plan_id != plan
+    if prepared.plan_id != plan { return Err(invalid()); }
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    let comparison = compare_at_review(export, binding, &log, &report)?;
+    tx.commit().await?;
+    Ok(comparison)
+}
+
+pub(super) fn compare_at_review(
+    export: Export,
+    binding: &Binding,
+    log: &Membership,
+    report: &Value,
+) -> Result<Value, sqlx::Error> {
+    if export.version != 1
+        || export.origin != binding.origin
+        || export.genesis_hash != log.genesis_hash().to_hex()
+        || report["plan_id"] != export.plan_id
+        || export.generation != binding.generation.to_string()
+        || export.slots.len() > 8192
         || export.account_id != log.account_id()
         || export.membership_head != log.head().to_json()
-        || export.source_hash != prepared.source_hash
-        || export.candidate_feed_id != prepared.candidate_feed_id
-    {
-        return Err(invalid());
-    }
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
-    if report["evidence_hash"] != export.evidence_hash
+        || report["source_hash"] != export.source_hash
+        || report["candidate_feed_id"] != export.candidate_feed_id
+        || report["evidence_hash"] != export.evidence_hash
         || report["reconstruction_hash"] != export.reconstruction_hash
     {
         return Err(invalid());
     }
     let mut comparison = compare_members(
-        &log,
+        log,
         &report["known_authors"],
         &export.evidence_hash,
         export.slots,
         export.conflicted_slots,
     )?;
     comparison["origin"] = json!(binding.origin);
-    comparison["genesis_hash"] = json!(genesis);
-    comparison["plan_id"] = json!(plan);
+    comparison["genesis_hash"] = json!(export.genesis_hash);
+    comparison["plan_id"] = json!(export.plan_id);
     comparison["reconstruction_hash"] = json!(export.reconstruction_hash);
     comparison["pending_final_reports"] = report["known_authors"]["pending_final_reports"].clone();
-    tx.commit().await?;
     Ok(comparison)
 }
 

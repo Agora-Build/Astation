@@ -3,17 +3,18 @@ use super::{invalid, source_hash, Binding, MAX_STATE};
 use crate::integration_feed::FeedBinding;
 use crate::service_keys::ServiceKeyVault;
 use crate::service_signing_ceilings::SigningCeilings;
+use atem_client::membership::Membership;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::collections::BTreeMap;
 
-/// The verifier must establish the final participant, policy and independent
-/// clock evidence under the publication locks before handing a cut to storage.
+/// The staged feed and process lists the operator reviewed for this root.
 pub(super) struct AccountCut {
     pub plan_id: String,
     pub cut_hash: String,
     pub feed_hash: String,
     pub membership_head: Value,
+    pub process_lists: Vec<Vec<u8>>,
 }
 
 struct Publication<'a> {
@@ -72,14 +73,15 @@ pub(super) async fn publish_after_verification(
     portal: &FeedBinding,
     signing: &SigningCeilings,
     vault: &ServiceKeyVault,
-    verify: impl AsyncFnOnce(&mut PgConnection) -> Result<BTreeMap<String, AccountCut>, sqlx::Error>,
+    cuts: BTreeMap<String, AccountCut>,
+    verify: impl AsyncFnMut(&Membership, &Value, &Value) -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
     if portal.station_origin != binding.origin || portal.validate().is_err() {
         return Err(invalid());
     }
     reconcile_signing_hold(pool, binding, signing).await?;
     let result = async {
-        let mut publication = Publication::begin(pool, binding).await?;
+        let publication = Publication::begin(pool, binding).await?;
         signing
             .hold_for_publication(
                 &binding.origin,
@@ -87,8 +89,9 @@ pub(super) async fn publish_after_verification(
                 &publication.primary_store,
             )
             .await?;
-        let cuts = verify(&mut publication.tx).await?;
-        publication.commit(cuts, portal, signing, vault).await
+        publication
+            .commit(cuts, portal, signing, vault, verify)
+            .await
     }
     .await;
     // An uncertain primary commit can still be running. Reacquiring its
@@ -130,6 +133,7 @@ impl Publication<'_> {
         portal: &FeedBinding,
         signing: &SigningCeilings,
         vault: &ServiceKeyVault,
+        mut verify: impl AsyncFnMut(&Membership, &Value, &Value) -> Result<(), sqlx::Error>,
     ) -> Result<(), sqlx::Error> {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM remote_recovery_roots")
             .fetch_one(&mut *self.tx)
@@ -172,7 +176,7 @@ impl Publication<'_> {
             if !staged {
                 return Err(invalid());
             }
-            let review = super::prepare_in_transaction(
+            let (log, review) = super::prepare_in_transaction(
                 &mut self.tx,
                 &self.binding,
                 genesis,
@@ -200,6 +204,25 @@ impl Publication<'_> {
             {
                 return Err(invalid());
             }
+            let comparison = super::author_roster::compare_at_review(
+                super::author_roster::combine(&cut.process_lists)?,
+                &self.binding,
+                &log,
+                &review,
+            )?;
+            for field in [
+                "missing_current_roster",
+                "conflicted_author_slots",
+                "ambiguous_selected_processes",
+                "reported_outside_review",
+            ] {
+                if !comparison[field].as_array().is_some_and(Vec::is_empty) {
+                    return Err(invalid());
+                }
+            }
+            // Displaced processes, early journal ranges, replacement signatures
+            // and service coverage still need the final verifier.
+            verify(&log, &review, &comparison).await?;
         }
         for (genesis, cut) in &cuts {
             self.install(genesis, cut).await?;
@@ -278,14 +301,24 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    /// A storage fixture supplies the result of final verification. Both feed
-    /// images themselves come from the actual fenced preparation workflow.
+    /// The test manager reviews the local SDK process for both fixture lists.
     fn cuts(reviews: &[Value]) -> BTreeMap<String, AccountCut> {
         reviews
             .iter()
             .map(|r| {
                 let image = &r["replacement_feed"];
                 assert_eq!(image["status"], "staged");
+                let mut roster = json!({
+                    "version":1, "account_id":"account-test",
+                    "generation":r["generation"].as_i64().unwrap().to_string(),
+                    "slots":[{"member":"phone","slot":"native","selected":true,
+                        "review_head":r["membership_head"],
+                        "process":atem_client::encoding::b64u(&atem_client::member_report::process_generation())}]
+                });
+                for key in ["origin","genesis_hash","plan_id","candidate_feed_id",
+                    "source_hash","evidence_hash","reconstruction_hash","membership_head"] {
+                    roster[key] = r[key].clone();
+                }
                 (
                     r["genesis_hash"].as_str().unwrap().into(),
                     AccountCut {
@@ -293,6 +326,7 @@ mod tests {
                         cut_hash: image["cut_hash"].as_str().unwrap().into(),
                         feed_hash: image["feed_hash"].as_str().unwrap().into(),
                         membership_head: r["membership_head"].clone(),
+                        process_lists: vec![serde_json::to_vec(&roster).unwrap()],
                     },
                 )
             })
@@ -519,7 +553,8 @@ mod tests {
                 &runtime.binding,
                 signing,
                 &runtime.vault,
-                async move |_| Ok(unconfirmed)
+                unconfirmed,
+                async |_, _, _| Ok(())
             )
             .await
             .is_err(),
@@ -567,7 +602,8 @@ mod tests {
                 &runtime.binding,
                 signing,
                 &runtime.vault,
-                async move |_| Ok(old_cuts)
+                old_cuts,
+                async |_, _, _| Ok(())
             )
             .await
             .is_err(),
@@ -609,7 +645,8 @@ mod tests {
             &runtime.binding,
             signing,
             &runtime.vault,
-            async move |_| Ok(subset)
+            subset,
+            async |_, _, _| Ok(())
         )
         .await
         .is_err());
@@ -632,7 +669,8 @@ mod tests {
             &runtime.binding,
             signing,
             &runtime.vault,
-            async move |_| Ok(all_primary)
+            all_primary,
+            async |_, _, _| Ok(())
         )
         .await
         .is_err());
@@ -649,7 +687,8 @@ mod tests {
             &runtime.binding,
             signing,
             &runtime.vault,
-            async move |_| Ok(stale)
+            stale,
+            async |_, _, _| Ok(())
         )
         .await
         .is_err());
@@ -662,6 +701,83 @@ mod tests {
         );
         assert_eq!(receipt(0).await.unwrap()["outcome"], "pending");
 
+        let mut changed_roster = cuts(&reviews);
+        let mut last = changed_roster.last_entry().unwrap();
+        let bytes = &mut last.get_mut().process_lists[0];
+        let mut changed: Value = serde_json::from_slice(bytes).unwrap();
+        changed["slots"][0]["slot"] = json!("another-process-slot");
+        *bytes = serde_json::to_vec(&changed).unwrap();
+        let mut verified = Vec::new();
+        assert!(publish_after_verification(
+            &db.pool,
+            &fence,
+            &runtime.binding,
+            signing,
+            &runtime.vault,
+            changed_roster,
+            async |log, _, _| {
+                verified.push(log.genesis_hash().to_hex());
+                Ok(())
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(verified, [initial[0].0.clone()]);
+
+        // Refuse the second list in the final verifier, after both real signed
+        // reports and both process exports matched the freshly rebuilt reviews.
+        let expected: Vec<_> = initial.iter().map(|(genesis, _)| genesis.clone()).collect();
+        verified.clear();
+        let failed = publish_after_verification(
+            &db.pool,
+            &fence,
+            &runtime.binding,
+            signing,
+            &runtime.vault,
+            cuts(&reviews),
+            async |log, review, comparison| {
+                let genesis = log.genesis_hash().to_hex();
+                assert_eq!(review["genesis_hash"], genesis);
+                assert_eq!(comparison["plan_id"], review["plan_id"]);
+                assert_eq!(
+                    comparison["matching_evidence_confirmations"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                verified.push(genesis);
+                if verified.len() == 2 {
+                    return Err(sqlx::Error::Protocol(
+                        "second list lacks final evidence".into(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(sqlx::Error::Protocol(message)) if message == "second list lacks final evidence")
+        );
+        assert_eq!(verified, expected);
+        assert_eq!(
+            sqlx::query_as::<_, (String, Value)>(read_roots)
+                .fetch_all(&replica)
+                .await
+                .unwrap(),
+            initial
+        );
+        assert!(
+            !inspect(&replica, &fence.origin)
+                .await
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        for i in 0..2 {
+            assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
+        }
+
         sqlx::raw_sql("CREATE FUNCTION fail_publication() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'commit failed'; END; $$ LANGUAGE plpgsql;
             CREATE CONSTRAINT TRIGGER fail_publication AFTER UPDATE ON station_delegated_recovery
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_publication()")
@@ -673,7 +789,8 @@ mod tests {
             &runtime.binding,
             signing,
             &runtime.vault,
-            async move |_| Ok(checked)
+            checked,
+            async |_, _, _| Ok(())
         )
         .await
         .is_err());
@@ -706,7 +823,8 @@ mod tests {
             &runtime.binding,
             signing,
             &runtime.vault,
-            async |_| {
+            checked,
+            async |_, _, _| {
                 assert!(
                     signing
                         .register_new_key(
@@ -731,7 +849,7 @@ mod tests {
                 .await
                 .is_err());
                 writer.rollback().await?;
-                Ok(checked)
+                Ok(())
             },
         )
         .await

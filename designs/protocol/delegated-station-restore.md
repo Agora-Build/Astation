@@ -238,6 +238,16 @@ stale file refuses the combined comparison. A retried receipt retains its origin
 scope. Comparing exported files cannot attest their provenance, establish complete history,
 release a signing hold or reopen a feed.
 
+During publication Station rebuilds each device list's review while holding
+the primary recovery fence and the independent signing store. It compares that
+list's process exports against the rebuilt membership, plan and evidence. A
+missing manager roster, conflicting slot, ambiguous selected process, or a
+reported process outside the review stops the transaction. The final verifier
+also receives the rebuilt review and its process comparison for each list.
+Station installs the feeds and receipts only after every list passes.
+Checking a displaced process's signed journal attachment, the final
+replacement signatures and complete service coverage still needs the shared SDK.
+
 When the Mac has a pinned verifier journal, the export also reads its saved
 process conflicts for this Station and device list. A missing pinned journal
 requires recovery before the Mac can export. Station lists reported conflicts

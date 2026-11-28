@@ -123,7 +123,7 @@ pub(crate) async fn prepare_with_sources(
     vault: Option<&crate::service_keys::ServiceKeyVault>,
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let report = prepare_in_transaction(&mut tx, binding, genesis, ceilings, portal, vault).await?;
+    let (_, report) = prepare_in_transaction(&mut tx, binding, genesis, ceilings, portal, vault).await?;
     tx.commit().await?;
     Ok(report)
 }
@@ -135,7 +135,7 @@ async fn prepare_in_transaction(
     ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
     portal: Option<&crate::integration_feed::FeedBinding>,
     vault: Option<&crate::service_keys::ServiceKeyVault>,
-) -> Result<Value, sqlx::Error> {
+) -> Result<(Membership, Value), sqlx::Error> {
     let (prepared, log, mut report) = checkpoint(connection, binding, genesis, true).await?;
     let stops = review_evidence(connection, &prepared, &log, binding, &mut report, true).await?;
     let reservations = match ceilings {
@@ -201,7 +201,7 @@ async fn prepare_in_transaction(
             }
         }
     }
-    Ok(report)
+    Ok((log, report))
 }
 
 async fn observe_reservations(
