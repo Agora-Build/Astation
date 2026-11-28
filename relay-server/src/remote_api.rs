@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/channels", get(channels::connect))
         .route("/logs/:genesis/entries", get(recovery::entries).post(recovery::append))
         .route("/logs/:genesis/control", get(recovery::delegated_http::heads))
+        .route("/logs/:genesis/control/recovery/:plan/originals", get(recovery::delegated_http::recovery_originals))
         .route("/logs/:genesis/control/recovery/:plan/outcome", axum::routing::get(recovery::delegated_http::plan_outcome))
         .route("/logs/:genesis/control/recovery/signer-reports", axum::routing::post(recovery::delegated_http::signer_report))
         .route("/logs/:genesis/control/recovery/signer-challenges", axum::routing::post(recovery::delegated_http::signer_challenge))
@@ -161,6 +162,7 @@ mod tests {
         for (method, suffix) in [(Method::GET, "entries"), (Method::POST, "entries"),
             (Method::GET, "backups/1"), (Method::PUT, "backups/1"), (Method::POST, "probes/host-a"),
             (Method::GET, "control/recovery"),
+            (Method::GET, "control/recovery/165ec51c-9b59-433a-b43b-fbc6ca805db4/originals"),
             (Method::POST, "control/recovery/165ec51c-9b59-433a-b43b-fbc6ca805db4/signatures")] {
             let response = app().oneshot(Request::builder().method(method)
                 .uri(format!("/api/remote/v1/logs/{root}/{suffix}"))

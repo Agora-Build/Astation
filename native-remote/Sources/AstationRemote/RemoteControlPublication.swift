@@ -442,6 +442,19 @@ public final class RemoteControlPublication {
             portalRefusal: operation.portalRefusal, additionalStations: operation.additionalStations ?? [:])
     }
 
+    /// A Station original may be absent locally. A conflicting signature or unsigned local
+    /// operation with the same ID must be resolved before it can be used for recovery.
+    public func checkRecoveryOriginal(_ recordJSON: String) throws {
+        try available()
+        let id = try parseControlRecord(recordJson: recordJSON).recordId
+        if let operation = try saved.operations.first(where: { try Self.body($0.bodyJSON).recordId == id }) {
+            guard let local = operation.recordJSON,
+                  try canonicalJson(json: local) == canonicalJson(json: recordJSON) else {
+                throw RemoteControlPublicationError.requiresReview
+            }
+        }
+    }
+
     func collectAuthorEvidence(into inventory: inout RemoteControlAuthorInventory) throws {
         try available()
         guard saved.accountID == inventory.account, saved.genesisHash == inventory.genesis else {
