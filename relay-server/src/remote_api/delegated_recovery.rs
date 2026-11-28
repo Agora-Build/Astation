@@ -201,10 +201,18 @@ pub(crate) async fn list_roots(
     for genesis in retained {
         roots.insert(genesis, (true, 0, 0));
     }
-    let binding_discovery = match portal {
-        Some(scope) if scope.station_origin != binding.origin || scope.validate().is_err() => {
+    if let Some(scope) = portal {
+        if scope.station_origin != binding.origin || scope.validate().is_err() {
             return Err(invalid_root());
         }
+        for genesis in crate::service_keys::list_recovery_roots(&mut tx, scope, after, limit).await? {
+            if !canonical_genesis(&genesis) {
+                return Err(invalid_root());
+            }
+            roots.entry(genesis).or_insert((false, 0, 0));
+        }
+    }
+    let binding_discovery = match portal {
         _ if !crate::account_identity::built_in_station(&binding.origin) => "not_applicable",
         None => "reporting_unconfigured",
         Some(scope) => {
@@ -231,7 +239,8 @@ pub(crate) async fn list_roots(
     let next = page.last().filter(|_| more).map(|row| &row["genesis_hash"]);
     tx.commit().await?;
     Ok(json!({"origin":binding.origin, "generation":binding.generation.to_string(),
-        "binding_discovery":binding_discovery, "roots":page, "next_after":next}))
+        "binding_discovery":binding_discovery, "checked_service_contexts":portal.is_some(),
+        "roots":page, "next_after":next}))
 }
 
 /// Inspect one retained account root and its fence in the same database snapshot,

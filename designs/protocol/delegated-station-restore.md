@@ -340,6 +340,15 @@ historical evidence only. A list missing from every available source still
 requires independent evidence. Each page is a fresh observation. Restart
 from the first page after restoring rows.
 
+On custom and built-in Stations, `checked_service_contexts` is true when
+reporting is configured and the command also read retained service-key
+metadata. An interrupted enrollment can leave a provisioning request before
+a key is registered. Its issuer, Portal and Station identify the scope across
+report credential rotation. A surviving key envelope independently names its
+issuer and Station in its public context. The inventory reads that label
+without opening the envelope. Its presence says nothing about key usability
+or the current owner, and leaves the independent registration count unchanged.
+
 `inspect` reads one account root and the configured origin's fence in a single
 read-only, repeatable-read Postgres transaction. It works while the fence is
 closed and never advances the saved membership clock, ticks the ACK ledger,
