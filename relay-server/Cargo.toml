@@ -33,7 +33,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 base64 = "0.22"
 # Proxy-kind verification uses the reviewed shared core; native forwards proofs opaquely.
-atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "1821adad6ba02db389476389ea4559b8d3ee0e4e" }
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "f59e083385cd33e7c899788f0444778c2981b976" }
 # Astation relay-identity proofs (ECDSA P-256); already in the tree via rustls.
 ring = "0.17"
 zeroize = "1"
@@ -46,7 +46,7 @@ libc = "0.2"
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa"] }
-atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "1821adad6ba02db389476389ea4559b8d3ee0e4e", features = ["software-keys"] }
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "f59e083385cd33e7c899788f0444778c2981b976", features = ["software-keys"] }
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

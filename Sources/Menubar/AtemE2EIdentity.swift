@@ -421,7 +421,9 @@ final class AtemE2EIdentity {
         }
         let record = try existingVerifierIdentity(log: log, memberID: proof.managerID)
         let sig = try crypto.sign(proof.input, material: record.material)
-        try verifyRawSignature(key: member.authKey, message: proof.input, signature: sig)
+        guard AtemE2ECrypto.verifyP256Signature(sig, message: proof.input, publicKey: member.authKey.raw) else {
+            throw AtemIdentityError.identityChanged
+        }
         return sig
     }
 
