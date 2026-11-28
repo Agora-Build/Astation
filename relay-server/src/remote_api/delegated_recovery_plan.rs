@@ -123,21 +123,34 @@ pub(crate) async fn prepare_with_sources(
     vault: Option<&crate::service_keys::ServiceKeyVault>,
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    let stops = review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    let report = prepare_in_transaction(&mut tx, binding, genesis, ceilings, portal, vault).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+async fn prepare_in_transaction(
+    connection: &mut PgConnection,
+    binding: &Binding,
+    genesis: &str,
+    ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
+    portal: Option<&crate::integration_feed::FeedBinding>,
+    vault: Option<&crate::service_keys::ServiceKeyVault>,
+) -> Result<Value, sqlx::Error> {
+    let (prepared, log, mut report) = checkpoint(connection, binding, genesis, true).await?;
+    let stops = review_evidence(connection, &prepared, &log, binding, &mut report, true).await?;
     let reservations = match ceilings {
         Some(store) => Some(store.reservations(log.account_id(), genesis).await.map_err(|_| invalid())?),
         None => None,
     };
     let observed = observe_reservations(
-        &mut tx, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
+        connection, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
     ).await?;
     if ceilings.is_some() {
         let copy_floors: Vec<(String, i64)> = sqlx::query_as(
             "SELECT r.principal,MAX(r.issued_at) FROM station_delegated_copy_reservations r
              JOIN station_delegated_recovery_plans p USING(plan_id)
              WHERE p.origin=$1 AND p.genesis_hash=$2 GROUP BY r.principal ORDER BY r.principal LIMIT 4097",
-        ).bind(&binding.origin).bind(genesis).fetch_all(&mut *tx).await?;
+        ).bind(&binding.origin).bind(genesis).fetch_all(&mut *connection).await?;
         if copy_floors.len() > history::MAX_RECORDS { return Err(invalid()); }
         report["reserved_copy_times"] = json!(copy_floors.into_iter().collect::<BTreeMap<_,_>>());
     }
@@ -160,35 +173,34 @@ pub(crate) async fn prepare_with_sources(
         let covered = covers_retained_membership(&report);
         let revokes = if covered {
             snapshot_stops::staged_service_revokes(
-                &mut tx, &stops, &prepared, &log, &binding.origin,
+                connection, &stops, &prepared, &log, &binding.origin,
                 report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
             ).await?
         } else {
             BTreeMap::new()
         };
-        let source = portal_services::observe(&mut tx, binding, portal, vault, subject, &log,
+        let source = portal_services::observe(connection, binding, portal, vault, subject, &log,
             reservations.as_deref(), &observed, &report, &revokes).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,
         }))?.into();
         report["portal_service_evidence"] = source;
-        report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
+        report["reporting_history"] = reporting_history::retain(connection, binding, portal).await?;
         if vault.is_some() && ceilings.is_some() {
             report["service_drafts"] = if covered {
-                service_drafts::prepare(&mut tx, &prepared, &log, binding, &report).await?
+                service_drafts::prepare(connection, &prepared, &log, binding, &report).await?
             } else {
                 json!({"status":"membership_history_unresolved"})
             };
             if covered {
                 let candidate = candidate_snapshot::assemble(
-                    &mut tx, &prepared, &log, &binding.origin, &report, &stops,
+                    connection, &prepared, &log, &binding.origin, &report, &stops,
                 ).await?;
-                replacement_feed::stage(&mut tx, &prepared, &log, portal, &mut report, candidate).await?;
+                replacement_feed::stage(connection, &prepared, &log, portal, &mut report, candidate).await?;
             }
         }
     }
-    tx.commit().await?;
     Ok(report)
 }
 

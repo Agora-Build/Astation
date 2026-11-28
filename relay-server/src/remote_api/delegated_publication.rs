@@ -1,6 +1,7 @@
 //! Storage for the final verifier. No HTTP or operator input authorizes this transaction.
 use super::{invalid, source_hash, Binding, MAX_STATE};
 use crate::integration_feed::FeedBinding;
+use crate::service_keys::ServiceKeyVault;
 use crate::service_signing_ceilings::SigningCeilings;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
@@ -70,6 +71,7 @@ pub(super) async fn publish_after_verification(
     binding: &Binding,
     portal: &FeedBinding,
     signing: &SigningCeilings,
+    vault: &ServiceKeyVault,
     verify: impl AsyncFnOnce(&mut PgConnection) -> Result<BTreeMap<String, AccountCut>, sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
     if portal.station_origin != binding.origin || portal.validate().is_err() {
@@ -86,7 +88,7 @@ pub(super) async fn publish_after_verification(
             )
             .await?;
         let cuts = verify(&mut publication.tx).await?;
-        publication.commit(cuts, portal, signing).await
+        publication.commit(cuts, portal, signing, vault).await
     }
     .await;
     // An uncertain primary commit can still be running. Reacquiring its
@@ -127,6 +129,7 @@ impl Publication<'_> {
         cuts: BTreeMap<String, AccountCut>,
         portal: &FeedBinding,
         signing: &SigningCeilings,
+        vault: &ServiceKeyVault,
     ) -> Result<(), sqlx::Error> {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM remote_recovery_roots")
             .fetch_one(&mut *self.tx)
@@ -155,6 +158,36 @@ impl Publication<'_> {
                 super::super::binding_inventory::list(&mut self.tx, portal, None, limit as usize)
                     .await?;
             if bound.iter().any(|genesis| !cuts.contains_key(genesis)) {
+                return Err(invalid());
+            }
+        }
+        // Repeat the same reconstruction used by operator preparation. Read
+        // every list before replacing any feed, including lists used to
+        // attribute a Portal integration belonging to the same owner.
+        for (genesis, cut) in &cuts {
+            let staged: bool = sqlx::query_scalar("SELECT EXISTS(
+                SELECT 1 FROM station_delegated_replacement_feeds WHERE plan_id=$1 AND cut_hash=$2 AND feed_hash=$3)")
+                .bind(&cut.plan_id).bind(&cut.cut_hash).bind(&cut.feed_hash)
+                .fetch_one(&mut *self.tx).await?;
+            if !staged {
+                return Err(invalid());
+            }
+            let review = super::prepare_in_transaction(
+                &mut self.tx,
+                &self.binding,
+                genesis,
+                Some(signing),
+                Some(portal),
+                Some(vault),
+            )
+            .await?;
+            let feed = &review["replacement_feed"];
+            if review["plan_id"] != cut.plan_id
+                || review["membership_head"] != cut.membership_head
+                || feed["status"] != "staged"
+                || feed["cut_hash"] != cut.cut_hash
+                || feed["feed_hash"] != cut.feed_hash
+            {
                 return Err(invalid());
             }
         }
@@ -415,6 +448,47 @@ mod tests {
                 .unwrap(),
             );
         }
+        // An authenticated Portal checkpoint can advance after staging without
+        // changing the membership head, the old feed or the signing inventory.
+        let before = runtime.policies.load(&runtime.binding).await.unwrap();
+        let updated = json!({"changes":[],"cursor":before.cursor,
+            "checkpoint":{"at":"2026-11-27T10:01:00.000Z","integrations":[]}});
+        let newer =
+            PortalCheckpoint::parse(&serde_json::to_vec(&updated).unwrap(), &runtime.binding)
+                .unwrap();
+        let after = before.apply_checkpoint(newer, before.received_at).unwrap();
+        runtime
+            .policies
+            .commit_for_recovery(&before, &after, Some(&fence))
+            .await
+            .unwrap();
+        let old_cuts = cuts(&reviews);
+        let signing = recovery.signing_ceilings.get().unwrap();
+        assert!(
+            publish_after_verification(
+                &db.pool,
+                &fence,
+                &runtime.binding,
+                signing,
+                &runtime.vault,
+                async move |_| Ok(old_cuts)
+            )
+            .await
+            .is_err(),
+            "published a superseded Portal checkpoint"
+        );
+        for review in &mut reviews {
+            *review = plan::prepare_with_sources(
+                &db.pool,
+                &fence,
+                review["genesis_hash"].as_str().unwrap(),
+                Some(signing),
+                Some(&runtime.binding),
+                Some(&runtime.vault),
+            )
+            .await
+            .unwrap();
+        }
         let replica = db.reconnect(2).await;
         let read_roots =
             "SELECT genesis_hash,state FROM remote_recovery_roots ORDER BY genesis_hash";
@@ -432,13 +506,13 @@ mod tests {
             )
         };
 
-        let signing = recovery.signing_ceilings.get().unwrap();
         let subset = cuts(&reviews[..1]);
         assert!(publish_after_verification(
             &db.pool,
             &fence,
             &runtime.binding,
             signing,
+            &runtime.vault,
             async move |_| Ok(subset)
         )
         .await
@@ -461,6 +535,7 @@ mod tests {
             &fence,
             &runtime.binding,
             signing,
+            &runtime.vault,
             async move |_| Ok(all_primary)
         )
         .await
@@ -477,6 +552,7 @@ mod tests {
             &fence,
             &runtime.binding,
             signing,
+            &runtime.vault,
             async move |_| Ok(stale)
         )
         .await
@@ -500,6 +576,7 @@ mod tests {
             &fence,
             &runtime.binding,
             signing,
+            &runtime.vault,
             async move |_| Ok(checked)
         )
         .await
@@ -527,33 +604,40 @@ mod tests {
             .unwrap();
 
         let checked = cuts(&reviews);
-        publish_after_verification(&db.pool, &fence, &runtime.binding, signing, async |_| {
-            assert!(
-                signing
-                    .register_new_key(
-                        first.log.account_id(),
-                        &missing,
-                        "late-service",
-                        &"e".repeat(64)
-                    )
-                    .await
-                    .is_err(),
-                "registration changed the signing inventory during publication"
-            );
-            for i in 0..2 {
-                assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
-            }
-            // A new root cannot appear after the verifier enumerates this generation.
-            let mut writer = replica.begin().await?;
-            assert!(
-                sqlx::query("LOCK TABLE remote_recovery_roots IN ROW EXCLUSIVE MODE NOWAIT")
-                    .execute(&mut *writer)
-                    .await
-                    .is_err()
-            );
-            writer.rollback().await?;
-            Ok(checked)
-        })
+        publish_after_verification(
+            &db.pool,
+            &fence,
+            &runtime.binding,
+            signing,
+            &runtime.vault,
+            async |_| {
+                assert!(
+                    signing
+                        .register_new_key(
+                            first.log.account_id(),
+                            &missing,
+                            "late-service",
+                            &"e".repeat(64)
+                        )
+                        .await
+                        .is_err(),
+                    "registration changed the signing inventory during publication"
+                );
+                for i in 0..2 {
+                    assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
+                }
+                // A new root cannot appear after the verifier enumerates this generation.
+                let mut writer = replica.begin().await?;
+                assert!(sqlx::query(
+                    "LOCK TABLE remote_recovery_roots IN ROW EXCLUSIVE MODE NOWAIT"
+                )
+                .execute(&mut *writer)
+                .await
+                .is_err());
+                writer.rollback().await?;
+                Ok(checked)
+            },
+        )
         .await
         .unwrap();
         let live: Vec<(String, Value)> = sqlx::query_as(read_roots)
