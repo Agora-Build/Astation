@@ -89,6 +89,21 @@ pub(in crate::remote_api::recovery) async fn bind(
     nonce: &str,
     id: &str,
 ) -> Result<(), sqlx::Error> {
+    let bound = native_grant(db, portal, principal, genesis, root, id).await?;
+    if let Some(record) = root.verifier_reports.get_mut(nonce) {
+        record.external_grant = bound;
+    }
+    Ok(())
+}
+
+async fn native_grant(
+    db: &mut PgConnection,
+    portal: &FeedBinding,
+    principal: &str,
+    genesis: Hash32,
+    root: &Root,
+    id: &str,
+) -> Result<Option<Grant>, sqlx::Error> {
     let owner: Option<String> = sqlx::query_scalar(
         "SELECT subject FROM account_identities WHERE issuer=$1 AND principal=$2",
     )
@@ -96,25 +111,69 @@ pub(in crate::remote_api::recovery) async fn bind(
     .bind(principal)
     .fetch_optional(&mut *db)
     .await?;
-    let Some(owner) = owner else { return Ok(()) };
+    let Some(owner) = owner else { return Ok(None) };
     let log = Membership::from_stored(&root.account, &genesis, &root.membership)
         .map_err(|_| sqlx::Error::Protocol("invalid verifier membership".into()))?;
-    if let Some(record) = root.verifier_reports.get_mut(nonce) {
-        record.external_grant = grant(db, portal, &owner, &log, id).await?;
-    }
-    Ok(())
+    grant(db, portal, &owner, &log, id).await
+}
+
+/// A native retry or read can return a previously stored integration answer.
+/// Recheck its original grant before disclosing any report from that round.
+pub(in crate::remote_api::recovery) async fn readable(
+    db: &mut PgConnection,
+    portal: Option<&FeedBinding>,
+    principal: &str,
+    hash: Hash32,
+    root: &Root,
+    command: &Command,
+) -> Result<bool, sqlx::Error> {
+    let nonce = match command {
+        Command::Create { challenge, .. } => URL_SAFE_NO_PAD.encode(challenge.nonce()),
+        Command::Read { nonce } | Command::Publish { nonce, .. } => nonce.clone(),
+        Command::Inbox { .. } | Command::Close { .. } => return Ok(true),
+    };
+    let Some(record) = root
+        .verifier_reports
+        .get(&nonce)
+        .filter(|r| r.external_answered)
+    else {
+        return Ok(true);
+    };
+    let Some(saved) = &record.external_grant else {
+        return Ok(false);
+    };
+    let Some(portal) = portal.filter(|portal| **portal == saved.source) else {
+        return Ok(false);
+    };
+    let Some(id) = record.challenge["signer"]
+        .as_str()
+        .and_then(|s| s.strip_prefix("service:svc-"))
+    else {
+        return Ok(false);
+    };
+    Ok(native_grant(db, portal, principal, hash, root, id)
+        .await?
+        .as_ref()
+        == Some(saved))
+}
+
+pub(crate) enum ExternalVerifierRequest {
+    Inbox { slot: String, expected: Head },
+    Answer { nonce: String, report: Value },
+}
+
+fn hidden() -> Reply {
+    error(StatusCode::NOT_FOUND, "verifier_requests_not_found")
 }
 
 impl RecoveryStore {
-    pub(crate) async fn external_verifier_requests(
+    pub(crate) async fn external_verifier(
         &self,
         portal: &FeedBinding,
         genesis: &str,
         token: &VerifiedServiceToken,
-        slot: &str,
-        expected: Head,
+        request: ExternalVerifierRequest,
     ) -> Result<Reply, sqlx::Error> {
-        let hidden = || error(StatusCode::NOT_FOUND, "verifier_requests_not_found");
         let unavailable = || {
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -168,43 +227,114 @@ impl RecoveryStore {
         let now_ms = u64::try_from(now.timestamp_millis())
             .map_err(|_| sqlx::Error::Protocol("invalid verifier clock".into()))?;
         let signer = format!("service:svc-{}", token.client_id);
-        let challenges = match inbox_challenges(
-            &root.verifier_reports,
-            &log,
-            &portal.station_origin,
-            &signer,
-            slot,
-            expected,
-            now_ms,
-            Some(&grant),
-        ) {
-            Ok(challenges) => challenges,
-            Err(reply) => return Ok(reply),
-        };
-        let mut changed = false;
-        for challenge in &challenges {
-            let nonce = URL_SAFE_NO_PAD.encode(challenge.nonce());
-            let record = root
-                .verifier_reports
-                .get_mut(&nonce)
-                .ok_or_else(|| sqlx::Error::Protocol("verifier nonce mismatch".into()))?;
-            if record.first_external_fetch_ms.is_none() {
-                record.first_external_fetch_ms = Some(now_ms);
-                changed = true;
+        let (reply, changed) = match request {
+            ExternalVerifierRequest::Inbox { slot, expected } => {
+                fetch(&mut root, &log, &grant, &signer, &slot, expected, now_ms)
+            }
+            ExternalVerifierRequest::Answer { nonce, report } => {
+                answer(&mut root, &log, &grant, &signer, &nonce, report, now_ms)
             }
         }
+        .unwrap_or_else(|refusal| (refusal, false));
         if changed {
             Self::save_root(&mut tx, genesis, &principal, root).await?;
         }
-        let reply = (
-            StatusCode::OK,
-            Json(
-                json!({"challenges":challenges.iter().map(ReportChallenge::to_json).collect::<Vec<_>>()}),
-            ),
-        );
         tx.commit().await?;
         Ok(reply)
     }
+}
+
+fn fetch(
+    root: &mut Root,
+    log: &Membership,
+    grant: &Grant,
+    signer: &str,
+    slot: &str,
+    expected: Head,
+    now: u64,
+) -> Result<(Reply, bool), Reply> {
+    let challenges = inbox_challenges(
+        &root.verifier_reports,
+        log,
+        &grant.source.station_origin,
+        signer,
+        slot,
+        expected,
+        now,
+        Some(grant),
+    )?;
+    let mut changed = false;
+    for challenge in &challenges {
+        let nonce = URL_SAFE_NO_PAD.encode(challenge.nonce());
+        let record = root
+            .verifier_reports
+            .get_mut(&nonce)
+            .ok_or_else(super::changed)?;
+        if record.first_external_fetch_ms.is_none() {
+            record.first_external_fetch_ms = Some(now);
+            changed = true;
+        }
+    }
+    Ok((
+        (
+            StatusCode::OK,
+            Json(json!({"challenges":challenges.iter()
+        .map(ReportChallenge::to_json).collect::<Vec<_>>()})),
+        ),
+        changed,
+    ))
+}
+
+fn answer(
+    root: &mut Root,
+    log: &Membership,
+    grant: &Grant,
+    signer: &str,
+    nonce: &str,
+    report: Value,
+    now: u64,
+) -> Result<(Reply, bool), Reply> {
+    let record = root
+        .verifier_reports
+        .get_mut(nonce)
+        .filter(|r| r.external_grant.as_ref() == Some(grant) && r.first_external_fetch_ms.is_some())
+        .ok_or_else(hidden)?;
+    let challenge =
+        ReportChallenge::parse(record.challenge.to_string().as_bytes()).map_err(|_| changed())?;
+    if challenge.signer() != signer || challenge.origin() != grant.source.station_origin {
+        return Err(hidden());
+    }
+    if record.closed || now >= challenge.expires_at() {
+        return Err(closed());
+    }
+    if challenge.issued_at() > now || record.head != log.head().to_json() {
+        return Err(changed());
+    }
+    let bytes = jcs(&report).map_err(|_| invalid())?;
+    let proof =
+        verify_verifier_report(log, bytes.as_bytes(), &challenge, now).map_err(|_| invalid())?;
+    let process = URL_SAFE_NO_PAD.encode(proof.process);
+    let stored = record.reports.get(&process);
+    if stored.is_some_and(|previous| previous != &report) {
+        return Err(changed());
+    }
+    let write = stored.is_none() || !record.external_answered;
+    if stored.is_none() {
+        if record.reports.len() >= MAX_REPORTS {
+            return Err(error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "verifier_report_limit",
+            ));
+        }
+        record.reports.insert(process, report);
+    }
+    record.external_answered = true;
+    let reply = if record.reports.len() > 1 {
+        error(StatusCode::CONFLICT, "verifier_process_conflict")
+    } else {
+        (StatusCode::OK, Json(json!({"accepted":true})))
+    };
+    Ok((reply, write))
 }
 
 #[cfg(all(test, feature = "delegated-host-work"))]
