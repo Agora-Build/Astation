@@ -52,7 +52,11 @@ public struct RemoteStationBindingApproval {
             default:
                 operation = "Bind " + accountID + " to Agora.Build account " + subject + "?"
             }
-            return operation + " This decides which Agora.Build account's state controls whether " + origin + " serves this account's hosts."
+            let detail = " This decides which Agora.Build account's state controls whether " + origin + " serves this account's hosts."
+            if case (.bind, .neverBound) = (action, previous) {
+                return operation + detail + " Rooms owned by other Agora.Build accounts move only with their owners' consent."
+            }
+            return operation + detail
         }
     }
 

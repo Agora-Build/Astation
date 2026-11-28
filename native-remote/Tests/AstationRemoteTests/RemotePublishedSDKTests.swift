@@ -205,6 +205,17 @@ final class RemotePublishedSDKTests: XCTestCase {
         }
     }
 
+    func testFirstBindingConfirmationExplainsOtherRoomOwnersConsent() {
+        func prompt(_ action: BindingAction, _ previous: ExpectedBinding) -> String {
+            RemoteStationBindingApproval.Review(action: action, origin: "https://station-dev.agora.build",
+                accountID: "device-list", subject: "owner", previous: previous).confirmation
+        }
+        let notice = "Rooms owned by other Agora.Build accounts move only with their owners' consent."
+        XCTAssertTrue(prompt(.bind, .neverBound).contains(notice))
+        XCTAssertFalse(prompt(.bind, .released(bindingId: "test", version: 2, owner: "prior")).contains(notice))
+        XCTAssertFalse(prompt(.transfer, .bound(bindingId: "test", version: 1, owner: "prior")).contains(notice))
+    }
+
     @MainActor
     func testNativeBindingSignsOnlyTheTransferReviewedAgainstTheLoginAndLocalHead() async throws {
         let source = try fixture("r9-vectors-station-binding")
