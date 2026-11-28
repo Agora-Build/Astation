@@ -68,13 +68,19 @@ struct FrozenSets {
     drafts_hash: Hash32,
 }
 
+struct PlanObservations {
+    sets: FrozenSets,
+    lowest_revision: u64,
+    highest_revision: u64,
+}
+
 struct JournalObservations {
     first_since: u64,
     since_changed: bool,
     prior_revision: Option<u64>,
     current_revision: Option<u64>,
     revisions: BTreeMap<u64, FrozenSets>,
-    generations: BTreeMap<i64, FrozenSets>,
+    generations: BTreeMap<i64, PlanObservations>,
     first_export_generation: BTreeMap<String, i64>,
     missing_record_ids: BTreeSet<String>,
     revision_conflict: bool,
@@ -116,7 +122,12 @@ impl JournalHistory {
         // Every accepted report remains evidence. A later matching report cannot
         // erase a fork at one revision or changes to a plan's held inventory.
         row.revision_conflict |= *row.revisions.entry(revision).or_insert(sets) != sets;
-        row.barrier_conflict |= *row.generations.entry(generation).or_insert(sets) != sets;
+        let plan = row.generations.entry(generation).or_insert(PlanObservations {
+            sets, lowest_revision: revision, highest_revision: revision,
+        });
+        row.barrier_conflict |= plan.sets != sets;
+        plan.lowest_revision = plan.lowest_revision.min(revision);
+        plan.highest_revision = plan.highest_revision.max(revision);
         // Signed stops survive a plan ending. Unsigned drafts can be cancelled.
         let exported: BTreeSet<_> = record_ids.into_iter().collect();
         for (id, first) in &row.first_export_generation {
@@ -144,13 +155,21 @@ impl JournalHistory {
             if row.revision_conflict { reasons.push("conflicting_revision_contents"); }
             if row.barrier_conflict { reasons.push("held_inventory_changed"); }
             if !row.missing_record_ids.is_empty() { reasons.push("previous_export_missing"); }
-            if let Some(prior) = row.prior_revision {
-                match row.current_revision {
-                    None => reasons.push("missing_current_report"),
-                    Some(current) if current < prior => reasons.push("revision_below_prior_plan"),
-                    _ => {}
-                }
+            if row.prior_revision.is_some() && row.current_revision.is_none() {
+                reasons.push("missing_current_report");
             }
+            // Reports within one plan can arrive out of order. A new generation
+            // follows every report in the earlier generations of this journal.
+            let mut earlier_highest = 0;
+            let regression = row.generations.iter().find_map(|(generation, plan)| {
+                let prior = earlier_highest;
+                earlier_highest = prior.max(plan.highest_revision);
+                (plan.lowest_revision < prior).then(|| json!({
+                    "generation": generation, "lowest_revision": plan.lowest_revision,
+                    "highest_earlier_revision": prior
+                }))
+            });
+            if regression.is_some() { reasons.push("revision_below_prior_plan"); }
             (!reasons.is_empty()).then(|| {
                 let mut gap = json!({
                     "signer": member, "journal_id": atem_client::encoding::b64u(&id), "reasons": reasons,
@@ -159,6 +178,7 @@ impl JournalHistory {
                 if !row.missing_record_ids.is_empty() {
                     gap["missing_record_ids"] = json!(row.missing_record_ids);
                 }
+                if let Some(regression) = regression { gap["revision_regression"] = regression; }
                 gap
             })
         }).collect()
@@ -230,6 +250,33 @@ mod tests {
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0]["reasons"], json!(["previous_export_missing"]));
         assert_eq!(gaps[0]["missing_record_ids"], json!(["a"]));
+    }
+
+    #[test]
+    fn a_later_report_cannot_erase_a_revision_rollback_between_plans() {
+        for last_plan in [2, 3] {
+            let mut history = JournalHistory::default();
+            let mut report = |plan, revision| {
+                history.observe("member:a", &summary(1, 1, revision), plan, plan == last_plan, []);
+            };
+            // Concurrent reports from one plan can arrive in either order.
+            report(1, 8);
+            report(1, 6);
+            report(2, 12);
+            report(2, 7);
+            if last_plan == 3 { report(3, 14); }
+            let gaps = history.gaps();
+            assert_eq!(gaps.len(), 1);
+            assert_eq!(gaps[0]["reasons"], json!(["revision_below_prior_plan"]));
+            assert_eq!(gaps[0]["revision_regression"], json!({
+                "generation": 2, "lowest_revision": 7, "highest_earlier_revision": 8
+            }));
+        }
+        let mut in_order = JournalHistory::default();
+        for (plan, revision) in [(1, 8), (1, 6), (2, 12), (2, 8)] {
+            in_order.observe("member:a", &summary(1, 1, revision), plan, plan == 2, []);
+        }
+        assert!(in_order.gaps().is_empty());
     }
 
     #[test]
