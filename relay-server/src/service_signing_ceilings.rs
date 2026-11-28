@@ -107,8 +107,8 @@ impl SigningCeilings {
 
     /// Commit independently, before inspecting any clocks. An interrupted
     /// publisher leaves the store closed until the primary transaction settles.
-    pub(crate) async fn hold_for_publication(&self, origin: &str, generation: i64, primary_store: &str) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE station_signing_publication_guard SET attempt=$1::text::uuid,origin=$2,generation=$3,primary_store=$4
+    pub(crate) async fn hold_for_publication(&self, origin: &str, generation: i64, primary_store: &str) -> Result<PublicationHold, sqlx::Error> {
+        sqlx::query_as("UPDATE station_signing_publication_guard SET attempt=$1::text::uuid,origin=$2,generation=$3,primary_store=$4
             WHERE singleton AND attempt IS NULL AND EXISTS (
                 SELECT 1 FROM pg_catalog.pg_trigger t
                 JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
@@ -117,13 +117,11 @@ impl SigningCeilings {
                   AND g.oid='station_signing_publication_guard'::regclass AND g.relpersistence='p'
                   AND t.tgname='station_check_signing_publication' AND t.tgenabled='A'
                   AND t.tgfoid='station_check_signing_publication()'::regprocedure
-                  AND t.tgtype=22 AND t.tgqual IS NULL AND t.tgattr=''::int2vector)")
+                  AND t.tgtype=22 AND t.tgqual IS NULL AND t.tgattr=''::int2vector)
+            RETURNING attempt::text,origin,generation,primary_store")
             .bind(uuid::Uuid::new_v4().to_string()).bind(origin).bind(generation).bind(primary_store)
-            .execute(&self.0).await?;
-        if result.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol("signing store cannot hold recovery publication".into()));
-        }
-        Ok(())
+            .fetch_optional(&self.0).await?
+            .ok_or_else(|| sqlx::Error::Protocol("signing store cannot hold recovery publication".into()))
     }
 
     pub(crate) async fn clear_publication_hold(&self, hold: &PublicationHold) -> Result<(), sqlx::Error> {

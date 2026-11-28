@@ -48,6 +48,11 @@ struct Publication {
     primary_store: String,
 }
 
+enum Operation {
+    Publish,
+    Review,
+}
+
 async fn lock_generation(
     db: &mut PgConnection,
     binding: &Binding,
@@ -101,11 +106,11 @@ pub(super) async fn publish_after_verification(
     cuts: BTreeMap<String, AccountCut>,
     verify: impl AsyncFnMut(&Membership, &Value, &Value) -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
-    with_publication_hold(pool, binding, portal, signing, async |mut publication| {
+    with_publication_hold(pool, binding, portal, signing, Operation::Publish, async |publication| {
         publication
             .verify_inputs(&cuts, portal, signing, vault, verify)
             .await?;
-        publication.commit(&cuts).await
+        publication.install_generation(&cuts).await
     })
     .await
 }
@@ -120,7 +125,7 @@ pub(crate) async fn review_publication(
     vault: &ServiceKeyVault,
     lists: ProcessLists,
 ) -> Result<Value, sqlx::Error> {
-    with_publication_hold(pool, binding, portal, signing, async |mut publication| {
+    with_publication_hold(pool, binding, portal, signing, Operation::Review, async |publication| {
         let mut cuts = BTreeMap::new();
         for (genesis, (_, process_lists)) in lists.0 {
             let (plan_id, cut_hash, feed_hash, membership_head) = sqlx::query_as(
@@ -165,7 +170,6 @@ pub(crate) async fn review_publication(
                 },
             )
             .await?;
-        publication.tx.rollback().await?;
         Ok(
             json!({"origin":binding.origin, "generation":binding.generation.to_string(),
             "lists":reviews, "final_verification":"pending", "published":false}),
@@ -179,28 +183,44 @@ async fn with_publication_hold<T>(
     binding: &Binding,
     portal: &FeedBinding,
     signing: &SigningCeilings,
-    action: impl AsyncFnOnce(Publication) -> Result<T, sqlx::Error>,
+    operation: Operation,
+    action: impl AsyncFnOnce(&mut Publication) -> Result<T, sqlx::Error>,
 ) -> Result<T, sqlx::Error> {
     if portal.station_origin != binding.origin || portal.validate().is_err() {
         return Err(invalid());
     }
     reconcile_signing_hold(pool, binding, signing).await?;
-    let result = async {
-        let publication = Publication::begin(pool, binding).await?;
-        signing
+    let settled = async {
+        let mut publication = Publication::begin(pool, binding).await?;
+        let hold = signing
             .hold_for_publication(
                 &binding.origin,
                 binding.generation,
                 &publication.primary_store,
             )
             .await?;
-        action(publication).await
+        let result = action(&mut publication).await;
+        // A dropped sqlx transaction only queues ROLLBACK. Wait for the
+        // primary's response before allowing the next signing reservation.
+        if matches!(operation, Operation::Publish) && result.is_ok() {
+            publication.tx.commit().await?;
+        } else {
+            publication.tx.rollback().await?;
+        }
+        Ok((hold, result))
     }
     .await;
-    // An uncertain primary commit can still be running. Reacquiring its
-    // row lock distinguishes that case from a safe cleanup on either outcome.
-    reconcile_signing_hold(pool, binding, signing).await?;
-    result
+    match settled {
+        Ok((hold, result)) => {
+            signing.clear_publication_hold(&hold).await?;
+            result
+        }
+        Err(error) => {
+            // A lost database response leaves the transaction outcome unknown.
+            reconcile_signing_hold(pool, binding, signing).await?;
+            Err(error)
+        }
+    }
 }
 
 impl Publication {
@@ -331,8 +351,10 @@ impl Publication {
         Ok(())
     }
 
-    /// Install receipts and feeds together, including on a deferred commit error.
-    async fn commit(mut self, cuts: &BTreeMap<String, AccountCut>) -> Result<(), sqlx::Error> {
+    async fn install_generation(
+        &mut self,
+        cuts: &BTreeMap<String, AccountCut>,
+    ) -> Result<(), sqlx::Error> {
         for (genesis, cut) in cuts {
             self.install(genesis, cut).await?;
         }
@@ -347,7 +369,7 @@ impl Publication {
         if updated.rows_affected() != 1 {
             return Err(invalid());
         }
-        self.tx.commit().await
+        Ok(())
     }
 
     async fn install(&mut self, genesis: &str, cut: &AccountCut) -> Result<(), sqlx::Error> {
@@ -654,6 +676,27 @@ mod tests {
             );
         }
         let signing = recovery.signing_ceilings.get().unwrap();
+        // A cancelled query can still be running when a verifier refuses the
+        // cut. Rollback must finish before the independent signer is released.
+        let refused: Result<(), _> = with_publication_hold(
+            &db.pool,
+            &fence,
+            &runtime.binding,
+            signing,
+            Operation::Publish,
+            async |publication| {
+                let busy = sqlx::query("SELECT pg_sleep(0.3)").execute(&mut *publication.tx);
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(25), busy)
+                    .await
+                    .is_err());
+                Err(sqlx::Error::Protocol("verification interrupted".into()))
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(sqlx::Error::Protocol(message)) if message == "verification interrupted")
+        );
+        assert!(signing.publication_hold().await.unwrap().is_none());
         let unconfirmed = cuts(&reviews);
         assert!(
             publish_after_verification(
