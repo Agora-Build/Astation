@@ -82,6 +82,95 @@ fn copy_input(f: &Fixture, plan: &Value, root: &Value) -> Value {
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_copy_reservation_rechecks_the_original_manager_and_clock_across_replicas() {
+    let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (_, mut f, genesis, binding) = retained(&db).await;
+    binding.initialize(&db.pool, true).await.unwrap();
+    plan::prepare(&db.pool, &binding, &genesis).await.unwrap();
+    let mut root = saved(&db.pool, &genesis).await;
+    let original = root["delegated"][ORIGIN]["records"][1].clone();
+    f.log = super::recovery_plan::demote_manager(&mut f);
+    root["membership"] = f.log.to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis).bind(&root).execute(&db.pool).await.unwrap();
+    let cut = plan::prepare(&db.pool, &binding, &genesis).await.unwrap();
+    let app_on = async |pool| {
+        let store = RecoveryStore::postgres(pool);
+        store.configure_recovery_review(ORIGIN, 1).await.unwrap();
+        make_app(store)
+    };
+    let a = app_on(db.pool.clone()).await;
+    let b = app_on(db.reconnect(2).await).await;
+    let url = format!("/api/remote/v1/logs/{genesis}/control/recovery/copy-reservations");
+    let send = async |app: &crate::AppState, owner: Option<&str>, value: &Value| {
+        post_recovery(app, &url, owner, value.to_string().into_bytes()).await
+    };
+    use ring::digest::{digest, SHA256};
+    let hash: String = digest(&SHA256, atem_client::canonical::jcs(&original).unwrap().as_bytes())
+        .as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+    let request = json!({"manager":"replacement-manager","original_record_id":original["body"]["record_id"],
+        "original_hash":hash,"expected":f.log.head().to_json(),"recovery":{"generation":"1","plan_id":cut["plan_id"],
+        "candidate_feed_id":cut["candidate_feed_id"],"source_hash":cut["source_hash"],"evidence_hash":cut["evidence_hash"]}});
+    assert_eq!(send(&a, None, &request).await.0, StatusCode::UNAUTHORIZED);
+    let foreign = send(&a, Some("bob"), &request).await;
+    assert_eq!(foreign.0, StatusCode::NOT_FOUND);
+    assert_eq!(post_recovery(&a, &url.replace(&genesis, &"a".repeat(64)), Some("alice"), request.to_string().into_bytes()).await, foreign);
+    for (key, value) in [("manager", json!("phone")), ("original_hash", json!("a".repeat(64))), ("issued_at", json!(42))] {
+        let mut stale = request.clone(); stale[key] = value;
+        assert_eq!(send(&a, Some("alice"), &stale).await.0, StatusCode::CONFLICT);
+    }
+    sqlx::raw_sql("CREATE FUNCTION reject_copy_reservation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'failed'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_copy AFTER INSERT ON station_delegated_copy_reservations DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION reject_copy_reservation()").execute(&db.pool).await.unwrap();
+    assert_eq!(send(&a, Some("alice"), &request).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    sqlx::query("DROP TRIGGER reject_copy ON station_delegated_copy_reservations").execute(&db.pool).await.unwrap();
+    let (one, two) = tokio::join!(send(&a, Some("alice"), &request), send(&b, Some("alice"), &request));
+    assert_eq!(one, two);
+    assert_eq!(one.0, StatusCode::OK);
+    let time = one.1["issued_at"].as_u64().unwrap();
+    assert!(time > original["body"]["issued_at"].as_u64().unwrap());
+    let mut exact = request.clone(); exact["issued_at"] = json!(time);
+    let mut receipt = exact.clone();
+    receipt["account_id"] = json!(f.log.account_id()); receipt["origin"] = json!(ORIGIN);
+    receipt["genesis_hash"] = json!(genesis);
+    assert_eq!(one.1, receipt);
+    assert_eq!(send(&b, Some("alice"), &exact).await, one);
+    let mut wrong_time = exact.clone(); wrong_time["issued_at"] = json!(time - 1);
+    assert_eq!(send(&a, Some("alice"), &wrong_time).await.0, StatusCode::CONFLICT);
+    // The response was lost before this draft reached the Mac's journal. Another
+    // draft for the same principal has since raised the Mac's local floor.
+    let mut newer = request.clone();
+    newer["after_issued_at"] = json!(time);
+    let advanced = send(&b, Some("alice"), &newer).await;
+    assert_eq!(advanced.0, StatusCode::OK);
+    let next = advanced.1["issued_at"].as_u64().unwrap();
+    assert!(next > time);
+    assert_eq!(send(&a, Some("alice"), &newer).await, advanced);
+    assert_eq!(send(&a, Some("alice"), &exact).await.0, StatusCode::CONFLICT);
+    exact["issued_at"] = json!(next);
+    assert_eq!(send(&a, Some("alice"), &exact).await, advanced);
+    let mut future = newer.clone();
+    future["after_issued_at"] = json!(9_007_199_254_740_991u64);
+    assert_eq!(send(&b, Some("alice"), &future).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(send(&b, Some("alice"), &exact).await, advanced);
+    let mut mixed = exact.clone();
+    mixed["after_issued_at"] = json!(time);
+    assert_eq!(send(&a, Some("alice"), &mixed).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(plan::prepare(&db.pool, &binding, &genesis).await.unwrap(), cut);
+    let mut body = ControlRecord::parse(original.to_string().as_bytes()).unwrap().body().clone();
+    body.signer = ControlSigner::Member("replacement-manager".into());
+    body.record_id = uuid::Uuid::new_v4().to_string(); body.issued_at = next;
+    let copy = build_control(&f.keys, &KeyId::new("replacement-manager"), &body).unwrap();
+    let input = json!({"evidence_hash":cut["evidence_hash"], "replacements":[{"original_record_id":request["original_record_id"],
+        "record":copy.to_json()}]});
+    assert_eq!(retain_http(&b, &genesis, cut["plan_id"].as_str().unwrap(), Some("alice"), input.to_string().into_bytes()).await.0, StatusCode::OK);
+    assert_eq!(send(&a, Some("alice"), &exact).await.0, StatusCode::CONFLICT);
+    assert!(!inspect(&db.pool, ORIGIN).await.unwrap().unwrap().ready);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_pages_only_outstanding_former_manager_originals_at_one_review() {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let (_, mut f, genesis, binding) = retained(&database).await;

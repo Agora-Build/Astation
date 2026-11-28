@@ -90,6 +90,67 @@ private final class ControlRecoveryFixture {
 
 final class RemoteControlRecoveryPublicationTests: XCTestCase {
     @MainActor
+    func testStationAuthorityRechecksTheProtectedDraftAfterRestartAndRetainsSupersededEvidence() async throws {
+        let f = try ControlRecoveryFixture(), keys = try f.source.replaceManager(), log = f.source.log
+        let context = try ControlRecoveryFixture.context(f.source), manager = "other-manager"
+        let host = try XCTUnwrap(URL(string: context.stationOrigin)?.host)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryHTTPStub.self]
+        let http = try RemoteRecoveryHTTP(relayURL: context.stationOrigin, configuration: config, accessToken: { "native-test" })
+        let firstTime = f.authority.reservedTime
+        let hash = SHA256.hash(data: Data(try canonicalJson(json: f.original).utf8)).map { String(format: "%02x", $0) }.joined()
+        func serve(time: UInt64, wrongReceipt: Bool = false, after: UInt64? = nil) {
+            RecoveryHTTPStub.install(host: host) { request in
+                XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/" + context.genesisHash + "/control/recovery/copy-reservations")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-test")
+                var reply = try RemoteRecoveryHTTPTests.requestBody(request)
+                XCTAssertEqual(reply.removeValue(forKey: "after_issued_at") as? UInt64, after)
+                XCTAssertEqual(reply["manager"] as? String, manager)
+                XCTAssertEqual(reply["original_hash"] as? String, hash)
+                if let exact = reply["issued_at"] as? UInt64, exact != time {
+                    return (409, Data(#"{"error":{"code":"recovery_plan_changed"}}"#.utf8))
+                }
+                reply["issued_at"] = time
+                reply["account_id"] = context.accountID
+                reply["genesis_hash"] = context.genesisHash
+                reply["origin"] = wrongReceipt ? "https://other.example" : context.stationOrigin
+                return (200, try JSONSerialization.data(withJSONObject: reply))
+            }
+        }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        let authority = RemoteStationRecoveryCopyAuthority(station: http)
+        serve(time: firstTime)
+        let stamp = try await authority.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log)
+        let first = try f.journal.prepare(originalRecordJSON: f.original, context: context, managerID: manager,
+            issuedAt: stamp, log: log, authority: authority)
+        try f.restore()
+        let restarted = RemoteStationRecoveryCopyAuthority(station: http)
+        XCTAssertThrowsError(try restarted.authorize(first, log: log))
+        try await restarted.revalidate(first, log: log)
+        let signed = try f.journal.sign(recordID: first.body.recordId, log: log, provider: keys,
+            authorJournal: f.source.authorJournal, authority: restarted, confirmedAt: 100, now: { 100 }, current: { true })
+        serve(time: firstTime + 1)
+        do { try await restarted.revalidate(first, log: log); XCTFail("stale reservation") }
+        catch RemoteRecoveryCopyReservationError.changed {}
+        XCTAssertThrowsError(try restarted.authorize(first, log: log))
+        serve(time: firstTime + 1, wrongReceipt: true)
+        do { _ = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log); XCTFail("wrong origin") }
+        catch RemoteRecoveryTransportError.invalidResponse {}
+        serve(time: firstTime, after: firstTime)
+        do {
+            _ = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log, after: firstTime)
+            XCTFail("accepted the Mac's previous timestamp")
+        } catch RemoteRecoveryTransportError.invalidResponse {}
+        serve(time: firstTime + 1, after: firstTime)
+        let next = try await restarted.reserve(originalRecordJSON: f.original, context: context, managerID: manager, log: log, after: firstTime)
+        let replacement = try f.journal.prepare(originalRecordJSON: f.original, context: context, managerID: manager,
+            issuedAt: next, log: log, authority: restarted, replacingRecordID: first.body.recordId)
+        try f.restore()
+        XCTAssertEqual(try f.journal.reviews().map(\.body.recordId), [first.body.recordId, replacement.body.recordId])
+        XCTAssertTrue(try f.journal.export(context: context, recordIDs: [first.body.recordId]).contains(signed))
+        XCTAssertFalse(replacement.signed)
+    }
+    @MainActor
     func testInventoryRetainsRecoveryOriginalAndDistinguishesUntouchedAndInterruptedCopies() throws {
         let f = try ControlRecoveryFixture(), review = try f.prepare()
         let request = try XCTUnwrap(review.request.bodyJson)
@@ -485,7 +546,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         XCTAssertGreaterThan(oversizedBytes.count, 2_097_152)
         var oldVersion = root, futureVersion = root
         oldVersion["version"] = 0
-        futureVersion["version"] = 3
+        futureVersion["version"] = 4
         let versionBytes = try [oldVersion, futureVersion].map {
             try PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
         }

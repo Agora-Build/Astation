@@ -284,6 +284,45 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         }
     }
 
+    func reserveRecoveryCopy(context: RemoteControlRecoveryContext, original: String,
+        manager: String, issuedAt: UInt64?, after: UInt64) async throws -> UInt64 {
+        try context.validate()
+        let body = try parseControlRecord(recordJson: original)
+        guard stationOrigin == context.stationOrigin, RemoteRecoveryKit.validID(manager),
+              body.accountId == context.accountID, body.genesisHash == context.genesisHash,
+              body.origin == nil || body.origin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let hash = SHA256.hash(data: Data(try canonicalJson(json: original).utf8)).map { String(format: "%02x", $0) }.joined()
+        var request: [String: Any] = ["manager":manager, "original_record_id":body.recordId, "original_hash":hash,
+            "expected":["seq":context.membershipHead.seq, "hash":context.membershipHead.hash] as [String: Any],
+            "recovery":["generation":String(context.generation), "plan_id":context.planID, "source_hash":context.sourceHash,
+                        "candidate_feed_id":context.candidateFeedID, "evidence_hash":context.evidenceHash]]
+        guard after <= 9_007_199_254_740_991, after == 0 || issuedAt == nil else { throw RemoteChannelError.invalidInput }
+        if let issuedAt { request["issued_at"] = issuedAt }
+        if after > 0 { request["after_issued_at"] = after }
+        let (status, bytes) = try await perform(url: path(context.genesisHash, "control/recovery/copy-reservations"),
+            method: "POST", body: Self.encode(request), allowConflict: true)
+        if status == 409 {
+            guard bytes.count <= 4096, try Self.json(Self.dictionary(bytes)) == #"{"error":{"code":"recovery_plan_changed"}}"# else {
+                throw RemoteRecoveryTransportError.invalidResponse
+            }
+            throw RemoteRecoveryCopyReservationError.changed
+        }
+        guard bytes.count <= 4096 else { throw RemoteRecoveryTransportError.invalidResponse }
+        let reply = try Self.dictionary(bytes)
+        guard let number = reply["issued_at"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.stringValue == String(number.uint64Value), number.uint64Value <= 9_007_199_254_740_991,
+              number.uint64Value > max(body.issuedAt, after), issuedAt == nil || issuedAt == number.uint64Value else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        request.removeValue(forKey: "after_issued_at")
+        request["issued_at"] = number.uint64Value
+        request["origin"] = stationOrigin
+        request["account_id"] = context.accountID
+        request["genesis_hash"] = context.genesisHash
+        guard try Self.json(request) == Self.json(reply) else { throw RemoteRecoveryTransportError.invalidResponse }
+        return number.uint64Value
+    }
+
     public func planEnd(for held: RemoteControlRecoveryContext) async throws -> RemoteStationPlanEnd? {
         try held.validate()
         guard held.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }

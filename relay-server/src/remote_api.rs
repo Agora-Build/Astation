@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/logs/:genesis/control/recovery/:plan/outcome", axum::routing::get(recovery::delegated_http::plan_outcome))
         .route("/logs/:genesis/control/recovery/signer-reports", axum::routing::post(recovery::delegated_http::signer_report))
         .route("/logs/:genesis/control/recovery/signer-challenges", axum::routing::post(recovery::delegated_http::signer_challenge))
+        .route("/logs/:genesis/control/recovery/copy-reservations", axum::routing::post(recovery::delegated_http::copy_reservation))
         .route("/logs/:genesis/control/recovery", get(recovery::delegated_http::recovery_review))
         .route("/logs/:genesis/control/recovery/:plan/signatures", axum::routing::post(recovery::delegated_http::retain_recovery_copies))
         .route("/logs/:genesis/control/sync", axum::routing::post(recovery::delegated_http::sync))
