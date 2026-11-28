@@ -859,8 +859,14 @@ mod tests {
         check_portal_revocation_time(DateArrival::WithInterrupt).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_survives_a_signing_clock_rollback() {
+        check_portal_revocation_time(DateArrival::DuringClockRollback).await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum DateArrival { AtIntake, AfterKeyRemoval, WithInterrupt }
+    enum DateArrival { AtIntake, AfterKeyRemoval, WithInterrupt, DuringClockRollback }
 
     async fn check_portal_revocation_time(arrival: DateArrival) {
         use super::super::tests::{append_body, fixture, request, signed_action};
@@ -884,6 +890,13 @@ mod tests {
         let principal = format!("service:svc-{ID}");
         let first = if arrival != DateArrival::AtIntake {
             runtime.reconcile_delegated_service(ID).await.unwrap();
+            if arrival == DateArrival::DuringClockRollback {
+                let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+                sqlx::query("UPDATE remote_recovery_roots SET state=jsonb_set(state,
+                    ARRAY['delegated',$2,'signing_high_water',$3],to_jsonb($4::bigint)) WHERE genesis_hash=$1")
+                    .bind(&genesis).bind(&runtime.binding.station_origin).bind(&principal).bind(future)
+                    .execute(&database.pool).await.unwrap();
+            }
             let feed = stored().await;
             let revoke = feed["records"].as_array().unwrap().last().unwrap();
             assert_eq!(revoke["body"]["action"], "revoke");
@@ -929,6 +942,8 @@ mod tests {
             assert!(runtime.reconcile_delegated_service(ID).await.is_err());
             sqlx::query("DROP TRIGGER refuse_interrupt ON station_service_signing_ceilings")
                 .execute(&database.pool).await.unwrap();
+        } else if arrival == DateArrival::DuringClockRollback {
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
         } else {
             runtime.reconcile_delegated_service(ID).await.unwrap();
         }
@@ -943,7 +958,11 @@ mod tests {
             assert_eq!(first["records"], learned["records"]);
             assert_eq!(first["signing_high_water"], learned["signing_high_water"]);
         }
-        runtime.reconcile_delegated_service(ID).await.unwrap();
+        if arrival == DateArrival::DuringClockRollback {
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        } else {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+        }
         let retried = stored().await;
         if arrival == DateArrival::WithInterrupt {
             let records = retried["records"].as_array().unwrap();

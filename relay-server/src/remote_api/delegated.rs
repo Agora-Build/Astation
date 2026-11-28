@@ -643,11 +643,10 @@ impl Stored {
         if actions.is_empty() {
             return Ok((bodies, previously_signed));
         }
-        let previous = self.signing_high_water.get(&principal.name()).copied().unwrap_or(0);
-        // Reserve successive elapsed milliseconds ending at the observed wall time.
-        // The whole cover/hold pair must fit before either signature is produced.
+        // The signer compares this range to the independent clock and the
+        // feed's signing floor after committing any learned revocation time.
         let first = now.checked_sub(actions.len() as u64 - 1).ok_or(Fault::Unavailable)?;
-        if first <= previous || now > atem_client::canonical::MAX_SAFE_INTEGER {
+        if now > atem_client::canonical::MAX_SAFE_INTEGER {
             return Err(Fault::Unavailable);
         }
         for (action, issued_at) in actions.into_iter().zip(first..=now) {
