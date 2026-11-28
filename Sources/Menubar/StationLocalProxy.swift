@@ -310,16 +310,17 @@ final class StationLocalProxy {
 
     private func failed() {
         guard phase != .closed, phase != .refused else { return }
-        // Once the fresh challenge leaves Station, a missing verdict cannot
-        // authorize another proof on this local authentication generation.
-        if retryAfterSuspension, phase == .proof, challengeForwarded {
+        // A host can ignore a challenge that arrives before its own timer
+        // elapses. Once it answers, a missing verdict leaves the proof pending.
+        let unansweredRetry = retryAfterSuspension && phase == .proof && challengeForwarded && !proofForwarded
+        if retryAfterSuspension, phase == .proof, proofForwarded {
             refuse()
             return
         }
         attempt = UUID(); clearTransport(suspension: current() ? queuedSuspension : nil); phase = .connecting
         guard current() else { close(); return }
         retryCount = min(retryCount + 1, 6)
-        scheduleRetry(after: min(pow(2, Double(retryCount)), 30))
+        scheduleRetry(after: unansweredRetry ? 30 : min(pow(2, Double(retryCount)), 30))
     }
 
     private func scheduleRetry(after delay: TimeInterval) {

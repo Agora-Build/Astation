@@ -857,8 +857,9 @@ challenge on the same local generation. Direct channels stay open. The host
 must verify the new route and finish its control sync before accepting delegated
 work. This path requires Atem's same-generation challenge hook for the joint check.
 
-If the fresh challenge has gone to the host and its verdict is lost, the Mac
-holds the forwarding attempt until the local authentication generation changes.
+If the host leaves a fresh challenge unanswered, the Mac waits another 30
+seconds before retrying. If the host returns a proof and the Station verdict
+is lost, the Mac holds the attempt until the local authentication generation changes.
 An ordinary proof refusal also ends the attempt. On other upstream reconnects,
 the local server's existing authentication rules apply. A replacement local
 generation closes the previous channels before issuing its authentication request.

@@ -206,14 +206,20 @@ final class StationLocalProxyTests: XCTestCase {
     }
 
     func testDeliveredSuspensionRetriesUpstreamAndRequiresFreshNativeAndHostProof() async {
-        await checkSuspensionRetry(loseVerdict: false)
+        await checkSuspensionRetry(.accepted)
     }
 
     func testLostVerdictAfterTheFreshChallengeKeepsTheDirectGeneration() async {
-        await checkSuspensionRetry(loseVerdict: true)
+        await checkSuspensionRetry(.lostVerdict)
     }
 
-    private func checkSuspensionRetry(loseVerdict: Bool) async {
+    func testUnansweredFreshChallengeWaitsAnotherFullInterval() async {
+        await checkSuspensionRetry(.unanswered)
+    }
+
+    private enum RetryOutcome { case accepted, lostVerdict, unanswered }
+
+    private func checkSuspensionRetry(_ outcome: RetryOutcome) async {
         let f = Fixture()
         f.completeRetryImmediately = true
         await f.start(); f.authenticateNative()
@@ -252,11 +258,20 @@ final class StationLocalProxyTests: XCTestCase {
         XCTAssertTrue(f.reconnected.sent.isEmpty)
         f.proxy.receiveStation(oldOK)
         XCTAssertEqual(f.proxy.phase, .proof)
+        if outcome == .unanswered {
+            f.reconnected.reader?(.failure(URLError(.networkConnectionLost)))
+            await drain()
+            XCTAssertEqual(f.retryIntervals, [30, 30])
+            XCTAssertEqual(f.connections, 3)
+            XCTAssertEqual(f.proxy.phase, .native)
+            f.proxy.close()
+            return
+        }
         let nextProof = Data(#"{"type":"relay","op":"host_route","v":1,"proof":{"sig":"second"}}"#.utf8)
         XCTAssertTrue(f.proxy.receiveHost(nextProof))
         await drain()
         XCTAssertEqual(f.reconnected.sent, [nextProof])
-        if loseVerdict {
+        if outcome == .lostVerdict {
             f.reconnected.reader?(.failure(URLError(.networkConnectionLost)))
             await drain()
             XCTAssertEqual(f.proxy.phase, .refused)
