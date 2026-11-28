@@ -86,10 +86,14 @@ pub(crate) struct IntegrationPolicy {
 }
 
 impl IntegrationPolicy {
+    pub(crate) fn grant_unexpired(&self, now: i64) -> bool {
+        self.expires_at().is_ok_and(|expiry| now < expiry)
+    }
+
     fn permits_external_verifier(&self, now: i64) -> bool {
         self.r9_svc.is_some()
             && matches!(self.state.as_str(), "provisioning" | "ready" | "waiting_for_host")
-            && self.expires_at().is_ok_and(|expiry| now < expiry)
+            && self.grant_unexpired(now)
     }
 
     fn same_verifier(&self, prior: &Self) -> bool {
@@ -403,7 +407,7 @@ impl PolicyCheckpoint {
         next.revision = next.revision.checked_add(1).ok_or(())?;
         next.verifier_grants.retain(|id, _| next.integrations.get(id).is_some_and(|row|
             self.integrations.get(id).is_some_and(|old| row.same_verifier(old)
-                && old.expires_at().is_ok_and(|expiry| now < expiry))));
+                && old.grant_unexpired(now))));
         for (id, row) in &next.integrations {
             if cfg!(feature = "delegated-host-work") && row.permits_external_verifier(now) {
                 next.verifier_grants.entry(id.clone()).or_insert(next.revision);
@@ -620,7 +624,7 @@ impl PolicyCheckpoint {
 
     pub fn current(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         let policy = self.owned(id, owner, now)?;
-        if now >= policy.expires_at()? { return Err(()); }
+        if !policy.grant_unexpired(now) { return Err(()); }
         Ok(policy)
     }
 

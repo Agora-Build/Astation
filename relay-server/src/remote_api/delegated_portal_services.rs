@@ -229,6 +229,7 @@ pub(super) async fn observe(
             integration(id, key),
             can_release,
             coverage_end.is_some(),
+            now.timestamp(),
         );
         if let Some(end) = coverage_end {
             reconstruction["coverage_end"] = end;
@@ -387,6 +388,7 @@ impl ServiceStops {
         row: Option<&CheckpointIntegration>,
         can_release: bool,
         coverage_ended: bool,
+        now: i64,
     ) -> Value {
         if !provisioned {
             return json!({"status":"provisioning_unresolved"});
@@ -420,6 +422,9 @@ impl ServiceStops {
         let actions = match desired {
             Some(ServiceDesired::Held) => json!([{"action":"cover"},{"action":"hold"}]),
             Some(ServiceDesired::Active) => {
+                if !row.policy.grant_unexpired(now) {
+                    return json!({"status":"pre_expiry_state_unresolved"});
+                }
                 if !can_release {
                     return json!({"status":"owner_availability_unresolved"});
                 }
@@ -458,6 +463,7 @@ mod tests {
                 Some(row),
                 true,
                 false,
+                100,
             )
         };
         assert_eq!(actions(&review, &row)["fresh_stop_actions"], json!([]));
@@ -488,8 +494,12 @@ mod tests {
 
         row.policy.state = "ready".into();
         assert_eq!(
-            ServiceStops::default().reconstruct(true, true, Some(&row), false, false)["status"],
+            ServiceStops::default().reconstruct(true, true, Some(&row), false, false, 100)["status"],
             "owner_availability_unresolved"
         );
+        let expiry = row.policy.expires_at().unwrap();
+        let at = |time| ServiceStops::default().reconstruct(true, true, Some(&row), true, false, time);
+        assert_eq!(at(expiry - 1)["fresh_actions"][1]["action"], "release");
+        assert_eq!(at(expiry), json!({"status":"pre_expiry_state_unresolved"}));
     }
 }

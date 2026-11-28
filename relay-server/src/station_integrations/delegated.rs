@@ -64,9 +64,13 @@ impl StationIntegrations {
         if checkpoint.binding != self.binding {
             return Err(());
         }
-        let policy = checkpoint.owned(id, &context.owner, chrono::Utc::now().timestamp())?;
+        let now = chrono::Utc::now().timestamp();
+        let policy = checkpoint.owned(id, &context.owner, now)?;
         // Expiry changes API access only and cannot release an earlier hold.
         let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
+        if desired == ServiceDesired::Active && !policy.grant_unexpired(now) {
+            return Ok(());
+        }
         let signer = crate::service_keys::load_approved_in(
             &mut tx,
             &self.vault,
@@ -877,8 +881,45 @@ mod tests {
             "expiry cannot release a hold"
         );
         policy(&runtime, "ready", fingerprint, None).await;
+        let set_expiry = async |expires: &str| {
+            let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+            let mut next = previous.clone();
+            next.revision += 1;
+            next.integrations.get_mut(ID).unwrap().expires_at = expires.into();
+            runtime.policies.commit(&previous, &next).await.unwrap();
+        };
+        let elapsed = "2000-01-01T00:00:00Z";
+        set_expiry(elapsed).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        assert_eq!(feed(&runtime, &genesis).await.len(), 2, "an elapsed ready grant must preserve the hold");
+
+        // Let the signing store finish the reservation only once the grant has expired.
+        sqlx::raw_sql("CREATE FUNCTION wait_for_grant_expiry() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE deadline timestamptz;
+            BEGIN
+                SELECT (checkpoint::jsonb->'integrations'->substring(NEW.service_id FROM 5)->>'expiresAt')::timestamptz
+                    INTO STRICT deadline FROM station_integration_policy;
+                PERFORM pg_sleep_until(LEAST(deadline, clock_timestamp() + interval '5 seconds'));
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER delay_reservation BEFORE UPDATE ON station_service_signing_ceilings
+            FOR EACH ROW EXECUTE FUNCTION wait_for_grant_expiry()")
+            .execute(&database.pool).await.unwrap();
+        let ceilings = runtime.app.recovery.signing_ceilings.get().unwrap();
+        let reservation = async || ceilings.reservations(f.log.account_id(), &genesis).await.unwrap()[0].highest_ms;
+        let before = reservation().await;
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(3);
+        set_expiry(&deadline.to_rfc3339()).await;
+        assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        assert!(reservation().await > before);
+        assert_eq!(feed(&runtime, &genesis).await.len(), 2);
+        sqlx::query("DROP TRIGGER delay_reservation ON station_service_signing_ceilings")
+            .execute(&database.pool).await.unwrap();
+
+        set_expiry("2099-01-01T00:00:00Z").await;
         runtime.reconcile_delegated_service(ID).await.unwrap();
         policy(&runtime, "revoking", fingerprint, Some(false)).await;
+        set_expiry(elapsed).await;
         runtime.reconcile_delegated_service(ID).await.unwrap();
         runtime.report_revocations().await;
         let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")
