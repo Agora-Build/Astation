@@ -75,6 +75,7 @@ public final class RemoteControlSigningJournal {
 
     public var id: Data { saved.id }
     public var revision: UInt64 { saved.revision }
+    private var latestAttachmentRevision: UInt64 { saved.processAttachments?.values.max() ?? 0 }
     /// Draft preparation can attach several processes before the first signing
     /// pin. A missing pin must still refuse a journal with any signing history.
     public var canEstablishInitialPin: Bool {
@@ -376,12 +377,14 @@ public final class RemoteControlSigningJournal {
                 guard prior.context.planID == context.planID, prior.context.generation == context.generation,
                       prior.context.candidateFeedID == context.candidateFeedID, prior.context.sourceHash == context.sourceHash,
                       prior.records == records, prior.drafts == drafts else { throw RemoteControlPublicationError.requiresReview }
-                // The held revision identifies the frozen record and draft sets.
-                // Renewing the challenge advances storage without moving that cut.
-                heldRevision = prior.revision
-                if prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON {
+                // The stop sets stay frozen. A new signature must also cover
+                // every attached process, including one that joined during review.
+                let cut = max(prior.revision, latestAttachmentRevision)
+                if prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON,
+                   prior.exposedReport != nil || cut == prior.revision {
                     return try prior.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs).signRequest()
                 }
+                heldRevision = cut
             }
         }
         guard saved.revision < 9_007_199_254_740_991,
@@ -423,7 +426,10 @@ public final class RemoteControlSigningJournal {
             throw RemoteControlPublicationError.requiresReview
         }
         let request = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs())
-        guard request.signRequest() == reviewed else { throw RemoteControlPublicationError.requiresReview }
+        guard request.signRequest() == reviewed,
+              barrier.exposedReport != nil || barrier.revision >= latestAttachmentRevision else {
+            throw RemoteControlPublicationError.requiresReview
+        }
         let report: String
         if let exposed = barrier.exposedReport { report = exposed }
         else { report = try request.finish(signature: sign(reviewed)) }

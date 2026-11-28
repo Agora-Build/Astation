@@ -1,5 +1,6 @@
 import CStationCore
 import AppKit
+import Combine
 import Foundation
 import Network
 import AtemClient
@@ -57,10 +58,14 @@ class AstationHubManager: ObservableObject {
     var needsAccountSignIn: Bool { signedInAccount == nil || accountSignInRequired || stationAccountSignInRequired }
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
-    private var accountGeneration = UUID() {
+    @Published private var accountGeneration = UUID() {
         didSet { verifierReportTasks.values.forEach { $0.cancel() } }
     }
     var integrationAccountGeneration: UUID { accountGeneration }
+    var integrationAccountChanges: AnyPublisher<Void, Never> {
+        $accountGeneration.combineLatest($signedInAccount, $accountSignInRequired)
+            .map { _ in () }.eraseToAnyPublisher()
+    }
     private struct StationRegistrationContext: Equatable {
         let socket: String
         let account: UUID

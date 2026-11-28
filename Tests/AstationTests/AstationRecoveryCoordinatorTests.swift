@@ -138,7 +138,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryOriginalsTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
     init(stationOrigin: String = "https://configured.example", controlFeedID: String = UUID().uuidString.lowercased()) {
         controlStationOrigin = stationOrigin
@@ -201,6 +201,12 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
         return RemoteControlRecoveryRetention(recordIDs: ids, reconstructionHash: String(repeating: "e", count: 64))
     }
 
+    var recoveryOriginals: [String] = []
+    func setRecoveryOriginals(_ records: [String]) { recoveryOriginals = records }
+    func controlRecoveryOriginals(for review: RemoteControlRecoveryPreparation) async throws -> [String] {
+        guard preparedRecovery == review else { throw RemoteRecoveryTransportError.unavailable }
+        return recoveryOriginals
+    }
     func setRecoveryReview(_ value: RemoteControlRecoveryPreparation) { preparedRecovery = value }
     func holdNextRecoveryReview() { holdRecoveryReview = true }
     func releaseRecoveryReview() { holdRecoveryReview = false; recoveryReviewWaiter?.resume(); recoveryReviewWaiter = nil }
@@ -1065,6 +1071,11 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let review = try await writer.prepareProcessReview(member: member, current: { true })
             try await writer.acceptProcessReview(review, lines: lines, current: { true })
         }
+        let origin = plan.context.stationOrigin
+        let log = try await writer.hostSenderMembership()
+        let journal = try RemoteMemberVerifierJournal(log: log, origin: origin,
+            read: { h.verifierHistoryBytes[origin] }, persist: { h.verifierHistoryBytes[origin] = $0 })
+        try journal.record(RemoteMemberVerifierSlot(memberID: member, slot: "offline", process: other), conflict: true)
         let restarted = try h.coordinator()
         let panel = RecoveryCopySavePanel(), url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         panel.destination = url
@@ -1085,12 +1096,17 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(rows.compactMap { $0["slot"] as? String }, ["desktop", "desktop", "offline"])
         XCTAssertEqual(rows.compactMap { $0["process"] as? String }, [other, local, other])
         XCTAssertEqual(rows.compactMap { $0["selected"] as? Bool }, [true, false, false])
+        XCTAssertEqual(object["conflicted_slots"] as? [[String: String]], [["member": member, "slot": "offline"]])
         XCTAssertEqual(object["evidence_hash"] as? String, plan.context.evidenceHash)
         XCTAssertEqual(object["reconstruction_hash"] as? String, plan.reconstructionHash)
         XCTAssertFalse(restarted.controlRecoveryAvailable)
         XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { false }))
         let foreign = try h.coordinator(relayURL: "https://another.example")
         XCTAssertThrowsError(try foreign.exportAuthorRoster(plan, current: { true }))
+        let pinned = h.verifierHistoryBytes.removeValue(forKey: origin)
+        XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
+        XCTAssertNil(h.verifierHistoryBytes[origin])
+        h.verifierHistoryBytes[origin] = pinned
         h.store.readFailure = true
         XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
     }
@@ -1767,9 +1783,20 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             views.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains(text) }
         }
         var records = try await portal.owned(stationOrigin: coordinator.relayURL)
+        let retired = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": "i-01234567890123456789012346", "name": "Retired bot", "stationOrigin": "https://retired.example",
+            "state": "revoked", "scopes": ["agent.view"], "expiresAt": "2025-01-01T00:00:00Z", "role": "owner",
+            "stationRemoved": true, "pendingHostRevocation": true, "r9Svc": String(repeating: "a", count: 64)
+        ]))
+        let retiredLabel = "Retired bot · https://retired.example"
+        try controller.presentPortalList((records, [retired]), current: { true })
+        let notice = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.stringValue.contains(retiredLabel) })
+        XCTAssertFalse(notice.isHidden)
+        XCTAssertEqual(picker.itemTitles, ["Test bot · awaiting approval"])
+        let accountEpoch = hub.integrationAccountGeneration
         let initialMembership = try await coordinator.serviceMembership()
         try controller.presentRequests(records, membership: initialMembership, coordinator: coordinator,
-            portal: portal, current: { true })
+            portal: portal, current: { hub.integrationAccountGeneration == accountEpoch })
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · awaiting approval")
         XCTAssertTrue(approve.isEnabled)
         approve.performClick(nil)
@@ -1779,6 +1806,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(load.isEnabled, "Approval must complete")
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · provisioning", "Approval must not clear the integration selector")
+        XCTAssertTrue(notice.stringValue.contains(retiredLabel), "Updating a selected integration preserves other Stations' notices")
+        XCTAssertFalse(notice.isHidden)
         XCTAssertTrue(shows("The Station is preparing this integration"))
         XCTAssertFalse(approve.isEnabled)
         XCTAssertFalse(review.isEnabled)
@@ -1787,7 +1816,16 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let posts = await transport.count()
         XCTAssertEqual(posts, 1)
 
-        controller.cancelPending()
+        // Changing the Station retires the displayed account context while the tab remains open.
+        hub._testRelayUrlOverride = "https://replacement.example"
+        try hub.configureIntegrationRelayAuth()
+        XCTAssertNotEqual(hub.integrationAccountGeneration, accountEpoch)
+        for _ in 0..<100 where !notice.isHidden { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
+        XCTAssertThrowsError(try controller.presentPortalList((records, [retired]), current: { false }))
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
         XCTAssertEqual(picker.titleOfSelectedItem, "Load requests to choose an integration")
         XCTAssertFalse(shows("The Station is preparing this integration"), "Closing clears stale status text")
         XCTAssertEqual(sessions.stringValue, "")
@@ -1795,6 +1833,12 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         await transport.setState("ready")
         records = try await portal.owned(stationOrigin: coordinator.relayURL)
         let membership = try await coordinator.serviceMembership()
+        try controller.presentPortalList(([], [retired]), current: { true })
+        XCTAssertEqual(picker.itemTitles, ["No integrations on this Station"])
+        XCTAssertTrue(notice.stringValue.contains(retiredLabel))
+        try controller.presentPortalList((records, []), current: { true })
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(notice.stringValue, "")
         try controller.presentRequests(records, membership: membership, coordinator: coordinator,
             portal: portal, current: { true }, selectedID: approval.integrationID)
         XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · ready")
@@ -3425,6 +3469,51 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let preparation = RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64))
         await h.relay.setRecoveryReview(preparation)
         return (coordinator, preparation)
+    }
+
+    func testStationOriginalFromFormerManagerCanBePreparedOnAnotherMacOnlyAtReviewedCut() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let original = try XCTUnwrap(records.first)
+        let log = try await coordinator.hostSenderMembership()
+        let context = try RemoteControlRecoveryContext(accountID: log.accountId(), genesisHash: log.genesisHash(),
+            stationOrigin: "https://configured.example", generation: 1, planID: UUID().uuidString.lowercased(),
+            sourceHash: String(repeating: "a", count: 64), evidenceHash: String(repeating: "b", count: 64),
+            candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
+        let review = RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64))
+        await h.relay.setRecoveryReview(review)
+        await h.relay.setRecoveryOriginals(records)
+        XCTAssertTrue(try coordinator.localControlRecoveryOriginals(stationOrigin: context.stationOrigin, current: { true }).isEmpty)
+        let candidates = try await coordinator.loadStationRecoveryOriginals(for: review, current: { true })
+        let candidate = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(candidate.body.signer, "member:manager-b")
+        authority.original = original
+        authority.context = context
+        await h.relay.setRecoveryReview(.init(context: context, reconstructionHash: String(repeating: "d", count: 64)))
+        do {
+            _ = try await coordinator.prepareControlRecoveryCopy(recordID: candidate.body.recordId,
+                context: context, stationOriginal: candidate, current: { true })
+            XCTFail("accepted an original from a superseded review")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(authority.reservations, 0)
+        await h.relay.setRecoveryReview(review)
+        let prompts = h.ownerRequests.count
+        let draft = try await coordinator.prepareControlRecoveryCopy(recordID: candidate.body.recordId,
+            context: context, stationOriginal: candidate, current: { true })
+        XCTAssertEqual(draft.originalRecordJSON, original)
+        XCTAssertEqual(draft.body.signer, "member:manager-a")
+        XCTAssertEqual(draft.body.revokeSeq, candidate.body.revokeSeq)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        let exported = try await coordinator.signControlRecoveryCopy(draft, current: { true })
+        XCTAssertTrue(exported.contains(draft.body.recordId))
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        let wrong = original.replacingOccurrences(of: candidate.body.recordId, with: UUID().uuidString.lowercased())
+        await h.relay.setRecoveryOriginals([original, wrong])
+        do {
+            _ = try await coordinator.loadStationRecoveryOriginals(for: review, current: { true })
+            XCTFail("a forged original must invalidate the entire response")
+        } catch {}
     }
 
     func testPreparedRecoveryAcquisitionNeverInstallsAuthorityOrChangesProtectedState() async throws {

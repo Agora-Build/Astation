@@ -15,6 +15,41 @@ use zeroize::Zeroizing;
 
 pub(crate) const SERVICE_KEY_CONTEXT: &str = "station-service-key-v1";
 
+/// Discover service lists in a restored Station before their signed membership is available.
+pub(crate) async fn list_recovery_roots(
+    db: &mut sqlx::PgConnection,
+    scope: &crate::integration_feed::FeedBinding,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    // Provisioning is tied to a Portal. An envelope's authenticated context
+    // instead identifies its issuer and Station. Read only its public label.
+    let station = serde_json::json!({"issuer":scope.issuer, "station_origin":scope.station_origin});
+    let portal = serde_json::json!({"issuer":scope.issuer, "station_origin":scope.station_origin,
+        "portal_origin":scope.portal_origin});
+    sqlx::query_scalar(
+        r#"WITH contexts AS (
+             SELECT CASE WHEN context::jsonb @> $1
+                              AND context::jsonb->>'integration_id' = integration_id
+                         THEN context::jsonb->>'genesis' END AS genesis
+             FROM station_integration_provisioning WHERE binding::jsonb @> $2
+             UNION ALL
+             SELECT context::jsonb->1->>'genesis' FROM station_service_keys
+             WHERE context::jsonb->>0 = $3 AND context::jsonb->1 @> $1
+           )
+           SELECT DISTINCT genesis COLLATE "C" FROM contexts
+           WHERE genesis IS NULL OR $4::text IS NULL OR genesis COLLATE "C" > $4
+           ORDER BY 1 NULLS FIRST LIMIT $5"#,
+    )
+    .bind(station)
+    .bind(portal)
+    .bind(SERVICE_KEY_CONTEXT)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ServiceKeyContext {
     pub issuer: String,
@@ -188,6 +223,7 @@ impl ServiceSigner {
         store: &crate::service_signing_ceilings::SigningCeilings,
         bodies: &[atem_client::control::ControlBody],
         previously_signed: u64,
+        policy_allows_signing: impl Fn() -> bool,
     ) -> Result<Vec<atem_client::control::ControlRecord>, ()> {
         use atem_client::control::{principal_key_of, ControlRecord};
         let first = bodies.first().ok_or(())?;
@@ -215,6 +251,11 @@ impl ServiceSigner {
         bodies
             .iter()
             .map(|body| {
+                // Waiting for a reservation can outlast the grant. Keep the
+                // reservation consumed even if the signature is withheld.
+                if !policy_allows_signing() {
+                    return Err(());
+                }
                 let object = self.sign_control(body).map_err(|_| ())?;
                 ControlRecord::from_signed(object).map_err(|_| ())
             })

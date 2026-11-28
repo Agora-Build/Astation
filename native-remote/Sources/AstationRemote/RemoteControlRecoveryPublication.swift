@@ -66,12 +66,9 @@ public struct RemoteControlRecoveryReview: Equatable, Sendable {
     public let signed: Bool
 }
 
-/// A trusted adapter must establish the current closed plan, exact original,
-/// complete history/clocks and a durable reservation for this exact body. These
-/// checks are required again at signing; a saved draft is never authorization.
-/// Cached context and a local journal alone cannot establish current authority
-/// or complete clocks, including after loading a legacy/empty checkpoint.
-/// There is deliberately no default or production implementation yet.
+/// Checks the closed plan, exact original, current manager and the adapter's timestamp
+/// reservation again at signing. Managers sign native copies before their final reports.
+/// Service clock reconstruction and complete author history are publication requirements.
 @MainActor
 public protocol RemoteControlRecoveryAuthorizing {
     func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
@@ -167,8 +164,7 @@ public final class RemoteControlRecoveryPublication {
         guard ids.isDisjoint(with: sources) else { throw RemoteControlPublicationError.invalidCheckpoint }
     }
 
-    /// The authority must already own a complete clock and the exact reservation.
-    /// A retained lower bound, wall clock or caller-supplied context is insufficient.
+    /// The authority must validate the reservation for this review before the draft is saved.
     public func prepare(originalRecordJSON: String, context: RemoteControlRecoveryContext,
         managerID: String, issuedAt: UInt64, log: MembershipLog,
         authority: RemoteControlRecoveryAuthorizing?) throws -> RemoteControlRecoveryReview {

@@ -73,9 +73,11 @@ pub(super) async fn inspection(
     // The caller holds the deployment fence and account root through commit;
     // every prepare/import uses these same locks, including other replicas.
     let (count, bytes): (i64, i64) = sqlx::query_as(
-        "SELECT count(*)::bigint,COALESCE(sum(octet_length(retained::text)),0)::bigint \
-         FROM station_delegated_recovery_plans \
-         WHERE origin=$1 AND genesis_hash=$2 AND generation <= $3",
+        "WITH plans AS (SELECT plan_id,octet_length(retained::text) AS bytes
+         FROM station_delegated_recovery_plans WHERE origin=$1 AND genesis_hash=$2 AND generation <= $3)
+         SELECT count(*)::bigint,COALESCE(sum(bytes),0)::bigint FROM
+         (SELECT bytes FROM plans UNION ALL SELECT octet_length(m.membership::text)
+          FROM station_delegated_recovery_memberships m JOIN plans USING(plan_id)) AS sources",
     )
     .bind(&binding.origin)
     .bind(log.genesis_hash().to_hex())
@@ -137,22 +139,24 @@ pub(super) async fn inspection(
         if old_log.frozen().is_some() {
             return Err(invalid());
         }
+        let old_review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, &old_log)?;
+        let heads = super::memberships::history(connection, &checkpoint, old_log).await?;
+        let latest = heads.last_key_value().ok_or_else(invalid)?.1;
         // Both logs have been verified. When the retained log is longer, compare
         // the overlapping entry too: length alone cannot distinguish a fork.
-        let gap = match HeadRelation::of(log, old_log.head()) {
+        let gap = match HeadRelation::of(log, latest.head()) {
             HeadRelation::Same | HeadRelation::HostBehind => None,
-            HeadRelation::HostAhead if HeadRelation::of(&old_log, log.head()) == HeadRelation::HostBehind => {
+            HeadRelation::HostAhead if HeadRelation::of(latest, log.head()) == HeadRelation::HostBehind => {
                 Some("restored_head_behind")
             }
             _ => Some("divergent_history"),
         };
         if let Some(reason) = gap {
             membership_gaps.push(json!({"generation":generation,"plan_id":checkpoint.plan_id,
-                "membership_head":old_log.head().to_json(),"reason":reason}));
+                "membership_head":latest.head().to_json(),"reason":reason}));
         }
         // Validate the historical checkpoint, then classify every obligation
         // under current authority. Removed managers never regain authority.
-        let old_review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, &old_log)?;
         let review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, log)?;
         if let Some(feed_id) = review["retained_feed_id"].as_str() {
             retained_feed_ids.insert(feed_id.to_owned());
@@ -176,7 +180,7 @@ pub(super) async fn inspection(
         if values.len() != reviews.len() || values.len() != old_reviews.len() {
             return Err(invalid());
         }
-        for entry in old_log.entries() {
+        for entry in latest.entries() {
             let member = match &entry.action {
                 Action::Add { member } | Action::RecoveryAdd { member } | Action::Genesis { member, .. }
                     if matches!(member.kind, MemberKind::Service { .. }) => member,
@@ -208,10 +212,10 @@ pub(super) async fn inspection(
             let lower = lower_bounds.entry(principal.clone()).or_default();
             *lower = (*lower).max(value.as_u64().ok_or_else(invalid)?);
         }
-        let mut authors = operator_review.then(|| super::author_history::inventory(&old_log));
+        let mut authors = operator_review.then(|| super::author_history::inventory(latest));
         let mut hashes = Vec::new();
         let current_plan = checkpoint.plan_id == prepared.plan_id;
-        signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
+        signer_reports::visit(connection, &checkpoint, &heads, &binding.origin, generation, |verified, hash, accepted_log| {
             if operator_review {
                 journals.observe(&verified.signer, &verified.journal, generation, current_plan,
                     verified.records.iter().map(ControlRecord::record_id));
@@ -227,7 +231,7 @@ pub(super) async fn inspection(
                 }
                 // Signing a journal export does not establish authority for its target.
                 // Keep the original verified clock across later membership changes.
-                if matches!(verify_control(&record, &old_log),
+                if matches!(verify_control(&record, accepted_log),
                     ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager))
                 {
                     let lower = lower_bounds.entry(record.principal().name()).or_default();
@@ -256,6 +260,9 @@ pub(super) async fn inspection(
             "generation": generation, "plan_id": checkpoint.plan_id,
             "candidate_feed_id": checkpoint.candidate_feed_id, "source_hash": checkpoint.source_hash,
         });
+        if heads.len() > 1 {
+            commitment["observed_membership"] = source_hash(&latest.to_stored())?.into();
+        }
         if checkpoint.plan_id == prepared.plan_id {
             current_authors = authors;
         } else {
@@ -264,15 +271,19 @@ pub(super) async fn inspection(
             }
             if let Some(members) = authors {
                 prior_authors.push(json!({"generation": generation, "plan_id": checkpoint.plan_id,
-                    "membership_head": old_log.head().to_json(), "members": members}));
+                    "membership_head": latest.head().to_json(), "members": members}));
             }
         }
         commitments.push(commitment);
-        summaries.push(json!({
+        let mut summary = json!({
             "generation": generation, "plan_id": checkpoint.plan_id,
-            "source_hash": checkpoint.source_hash, "membership_head": old_log.head().to_json(),
+            "source_hash": checkpoint.source_hash, "membership_head": retained.membership["head"],
             "retained_feed_id": review["retained_feed_id"], "inspection": review["inspection"],
-        }));
+        });
+        if heads.len() > 1 {
+            summary["observed_membership_head"] = latest.head().to_json();
+        }
+        summaries.push(summary);
     }
     if !found_current || retained_feed_ids.contains(&prepared.candidate_feed_id) {
         return Err(invalid());

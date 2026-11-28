@@ -153,9 +153,11 @@ A newly exported signed record changes the evidence hash. All authors then
 confirm the new round. A still-valid outstanding report for the previous round
 can arrive after another author exports a new record. Station retains the late
 response under its original challenge. A change to the checkpoint, imports or
-native archives requires a new challenge even for retention. The Mac keeps the held journal revision while renewing
-its challenge and durably advances its local checkpoint before exposing the new
-signature. Each request is bounded to 256 KiB
+native archives requires a new challenge even for retention. The Mac keeps the
+record and draft sets frozen. A renewed report keeps its revision until another
+SDK process attaches. The next signature covers that attachment and requires
+fresh review if the owner was already confirming an older revision. An exact
+retry sends the saved signed bytes. Each request is bounded to 256 KiB
 and the Station retains up to 256 submissions per plan.
 
 A successful response contains `plan_id`, `retained_only: true` and
@@ -181,11 +183,15 @@ plan. `known_authors.prior_plans` lists the authors and reports from each earlie
 retained membership head. An old report describes only its original plan.
 
 The operator review lists `known_authors.journal_gaps` when a previously
-observed member journal has no current report, its highest current revision
-falls below a prior plan's observation, or its signed creation sequence
-changes. The review also flags different signed record or draft sets at the
-same journal revision, and changes to either frozen set within one plan. These
-conflicts survive later confirmations, process replacement and plan abandonment.
+observed member journal has no current report, a signed revision falls below
+one observed in an earlier generation, or its signed creation sequence changes.
+`revision_regression` identifies the first affected generation, its lowest
+reported revision and the highest revision in earlier generations. Reports
+within one generation can arrive in any order. The discrepancy stays visible
+after the journal catches up. The review also flags different signed record
+or draft sets at the same journal revision, and changes to either frozen set
+within one plan. These conflicts survive later confirmations, process
+replacement and plan abandonment.
 A later plan's report from the same journal must still export every previously
 reported signed stop for this origin. If any are missing, `previous_export_missing`
 lists their IDs in `missing_record_ids`, even when the newer report has a higher
@@ -222,6 +228,15 @@ must agree, including prior processes and reviewed heads. A disagreement or a
 stale file refuses the combined comparison. A retried receipt retains its original
 scope. Comparing exported files cannot attest their provenance, establish complete history,
 release a signing hold or reopen a feed.
+
+When the Mac has a pinned verifier journal, the export also reads its saved
+process conflicts for this Station and device list. A missing pinned journal
+requires recovery before the Mac can export. Station lists reported conflicts
+for current and former managers in `conflicted_author_slots`, including slots
+the manager has since removed from the roster. A matching signed report can
+still describe one process's records. The conflict remains visible alongside it.
+Station combines conflicts from all supplied exports. An older export or an
+export from another Mac can add observations but cannot clear one.
 
 Recovery rechecks each retained report with the membership and challenge from
 the plan that accepted it. A signed revoke or interrupt exported only in that
@@ -278,8 +293,10 @@ both the old configuration and the old database.
 
 Migration `0015` stores the highest generation and a ready/fenced state per
 Station origin. At initial generation `1`, Station checks for retained feeds,
-delegated reporting journals, verifier rosters, recovery-stamped Portal
-checkpoints and positive reservations in the configured signing database.
+live or archived reporting journals, recovery plans, verifier rosters,
+recovery-stamped Portal checkpoints and positive signing reservations.
+An earlier origin's recorded positive reservation still counts if the
+independent signing store has since lost that row.
 A regular Portal checkpoint or unused service-key registration can precede
 first activation. Existing delegated history with no recovery row,
 a missing row at any later generation, or an increased generation closes a
@@ -317,18 +334,37 @@ A failed fence write does not prove that other replicas stopped. Keep the fleet
 drained and fix storage; never restart it with an older generation.
 
 While the replicas are drained and the configured generation is fenced,
-`list-roots` compares device-list genesis hashes in the Station database
-with registrations in its dedicated independent signing store. It returns up
-to 64 hashes in order. Pass `next_after` as the next call's argument until it
-is null. Each page reads both stores and fails if either is unavailable.
+`list-roots` compares retained device lists with registrations in the
+independent signing store. With reporting configured on a built-in Station,
+it also checks native binding transitions, administrative release requests
+and authenticated Portal checkpoints retained under any report credential
+for the configured issuer, Portal and Station. This finds native-only lists
+with zero registered service keys. A historical unbind or release still
+identifies a list whose history needs recovery.
 
-If `root_present` is false, the backup lacks the list named by the signing
-store. `registered_keys` includes unused registrations left by interrupted
-provisioning. A positive `keys_with_reservations` means the independent store
-committed signing time for at least one key. Recover the list and reconcile
-its history before reopening. A list lost from both stores requires another
-source of evidence. Each page is a fresh observation. Restart from the first
-page after restoring rows.
+Each page returns up to 64 distinct hashes in order. Pass `next_after` on the
+next call until it is null. `binding_discovery` is `retained` when the command
+checked the built-in binding sources, `reporting_unconfigured` when it could
+only check roots and registrations on a built-in Station, and `not_applicable`
+for custom Stations. Each page requires both databases. A malformed retained
+checkpoint in the selected scope fails the read.
+
+If `root_present` is false, recover the signed list and reconcile its history
+before reopening. `registered_keys` includes unused registrations left by
+interrupted provisioning. A positive `keys_with_reservations` means the
+independent store committed signing time for at least one key. Discovery uses
+historical evidence only. A list missing from every available source still
+requires independent evidence. Each page is a fresh observation. Restart
+from the first page after restoring rows.
+
+On custom and built-in Stations, `checked_service_contexts` is true when
+reporting is configured and the command also read retained service-key
+metadata. An interrupted enrollment can leave a provisioning request before
+a key is registered. Its issuer, Portal and Station identify the scope across
+report credential rotation. A surviving key envelope independently names its
+issuer and Station in its public context. The inventory reads that label
+without opening the envelope. Its presence says nothing about key usability
+or the current owner, and leaves the independent registration count unchanged.
 
 `inspect` reads one account root and the configured origin's fence in a single
 read-only, repeatable-read Postgres transaction. It works while the fence is
@@ -420,11 +456,20 @@ exporting saved signatures remain local operations. Loading a plan installs no
 authority and enables no confirmation button; complete authoritative collection,
 reservation, preparation and publication still require the provider below.
 
-The screen also lists original signed stops retained in the selected Station's
-protected local journal. These are local evidence, not a complete Station history;
-unsigned intent is never offered as an original signature. After loading a plan,
-**Prepare Copy** invokes the existing trusted recovery-authority adapter for that
-exact original and context. It requires both the delegated gate and recovery
+The screen lists signed stops saved on this Mac. Loading the review also reads
+`GET /api/remote/v1/logs/<genesis>/control/recovery/<plan>/originals` from the
+selected Station with the native account bearer. Each request names the exact
+`reconstruction_hash` in the `review` query parameter and the number of rows
+already read in `offset`. Station checks account ownership and the closed plan
+under the recovery lock. It returns up to 64 outstanding former-manager stops
+in record-ID order, within 256 KiB. A changed plan or reconstruction returns
+409. A foreign or missing account root returns the same 404. The Mac verifies
+each signed record against the pinned membership head before displaying the
+list. A failed page discards the entire Station list.
+
+**Prepare Copy** rechecks the Station review for a selected remote original,
+compares any local record with the same ID, and invokes the trusted recovery
+authority for that exact signed object. It requires both the delegated gate and recovery
 provider, rechecks the protected checkpoint before reservation and draft storage,
 and revalidates current account, Station and membership across async work.
 Membership refresh rechecks protected state before writing and after each network
@@ -504,8 +549,14 @@ times or report delivery. For a present feed, missing clocks, duplicate record I
 account/origin/feed are refused. It never initializes a missing root, feed or
 fence. Concurrent operators/replicas and retry after restart return the same
 durable plan and replacement UUID. A commit failure returns no successful plan.
-Changes to the retained membership, ownership or feed require review; retry
-never overwrites the earlier plan. A later external recovery generation gets
+When signed membership advances, run `prepare` again. Station checks the
+extension against the last head observed by any replica. The original source,
+plan and replacement feed keep their identities. The new head starts a fresh
+author report round and invalidates staging against the previous review.
+Earlier reports and copies remain verifiable at their acceptance heads. The
+latest membership determines each stop's current authority. A rollback, fork,
+change of owner or change to the retained feed refuses preparation.
+A later external recovery generation gets
 its own plan while retaining the old one. Backup blobs, routes and push state
 do not establish control history and are excluded from this checkpoint.
 
@@ -602,7 +653,8 @@ These are lower bounds, not proof that later clocks/history survived.
 The combined `evidence_hash` binds the exact prepared plan/source, all known
 checkpoint commitments and imported evidence. It changes when later evidence is
 retained; it authorizes no signature or reopening. Reconciliation is bounded to
-128 checkpoints, 16 MiB of retained checkpoint JSONB and 4,096 distinct combined
+128 checkpoints and membership observations combined, 16 MiB of their
+retained JSONB and 4,096 distinct combined
 record IDs, in addition to the import limits. Exceeding a bound or finding a
 corrupt/foreign checkpoint refuses recovery without truncation or a partial
 plan/import. Known historical feed IDs cannot become the new candidate ID.
@@ -789,20 +841,18 @@ destinations and independently approved Portal mirrors stay intact.
 
 Preparation is scoped to the exact account/genesis, Station, external generation,
 plan, source/evidence commitments, replacement feed and membership head. A saved
-draft is not authorization. The trusted `RemoteControlRecoveryAuthorizing`
-adapter must establish complete current history/clocks and durably reserve its
-timestamp before preparation, then validate that reservation and review again
-before and after owner confirmation and at signing. The journal also refuses
-times at or below any recovery draft/copy it already retained for that principal;
-these local observations still cannot establish a complete clock.
+draft records the exact signing request. The recovery adapter must establish the
+current closed plan, authenticated original and current manager, and check its
+reservation again at confirmation and signing. The local journal keeps increasing
+copy timestamps for a principal. The protocol uses native stop timestamps for
+display. A current manager signs needed copies before submitting the final
+signer report and entering its signing hold. Complete participant history and
+the service signing clock are required for snapshot publication. Requiring either
+to sign a native copy would make recovery wait for its own result.
 
-There is **no production adapter** yet.
-The coordinator defaults this provider to nil and refuses preparation/signing
-before a prompt or key operation, including when ordinary delegated control has
-an authorization provider. A caller-supplied plan, observed lower bound, restored
-database, wall clock or owner click cannot substitute for the missing authority.
-The complete history/clock reconciliation and authenticated adapter remain to
-be built before enabling the native recovery workflow.
+The production coordinator still has no recovery-authority provider. Viewing
+verified originals works while signing is gated. A configured provider must
+also enforce the protected author journal and the owner-confirmed signing request.
 
 Control Activity's **Review Recovery Copies** opens a separate protected local
 review. It lists only drafts already prepared through that trusted adapter and

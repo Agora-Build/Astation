@@ -290,6 +290,46 @@ final class RemoteMembershipPublicationTests: XCTestCase {
             stationOrigin: station, bodyJSON: body, log: f.log, managerID: "manager-a", now: f.clock)
     }
 
+    func testAccessOverviewSeparatesSelectedIntegrationsFromOutstandingRemovedStationRevocations() async throws {
+        let origin = "https://selected.example", removed = "https://retired.example"
+        let http = IntegrationApprovalTestHTTP()
+        let config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation",
+            resource: "https://portal.example", requiredScope: "integrations:read")
+        let portal = try PortalIntegrationHTTP(configuration: config, portalOrigin: config.resource,
+            ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "portal-token" })
+        func row(_ index: Int, _ overrides: [String: Any]) -> [String: Any] {
+            let fields: [String: Any] = ["id": "i-0123456789012345678901234\(index)", "name": "Integration \(index)",
+                "stationOrigin": removed, "state": "revoked", "scopes": ["agent.view"], "role": "owner",
+                "stationRemoved": true, "pendingHostRevocation": true, "r9Svc": String(repeating: "a", count: 64),
+                "expiresAt": "2025-01-01T00:00:00Z"]
+            return fields.merging(overrides) { _, new in new }
+        }
+        let rows = [row(0, ["stationOrigin": origin]), row(1, [:]), row(2, ["role": "station_owner"]),
+            row(3, ["pendingHostRevocation": false]), row(4, ["stationRemoved": false]),
+            row(5, ["r9Svc": NSNull()]), row(6, ["state": "ready"]),
+            row(7, ["stationOrigin": origin, "role": "station_owner"])]
+        try await http.set(["stale": false, "integrations": rows])
+        let result = try await portal.accessOverview(stationOrigin: origin)
+        XCTAssertEqual(result.selected.map(\.name), ["Integration 0"])
+        XCTAssertEqual(result.pendingElsewhere.map(\.name), ["Integration 1"])
+        let requests = await http.count(), last = await http.last()
+        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(last?.url?.absoluteString, "https://portal.example/api/v1/integrations")
+        XCTAssertEqual(last?.value(forHTTPHeaderField: "Authorization"), "Bearer portal-token")
+
+        try await http.set(["stale": false, "integrations": [row(1, ["pendingHostRevocation": false])]])
+        let cleared = try await portal.accessOverview(stationOrigin: origin)
+        XCTAssertTrue(cleared.pendingElsewhere.isEmpty)
+        for invalid in [["stale": true, "integrations": rows],
+                        ["stale": false, "integrations": [rows[1], rows[1]]]] {
+            try await http.set(invalid)
+            do {
+                _ = try await portal.accessOverview(stationOrigin: origin)
+                XCTFail("A stale or duplicate list must not replace the owner snapshot")
+            } catch AccountLoginError.unavailable {}
+        }
+    }
+
     @MainActor
     func testDefaultStationWithDevPortalSeparatesTokensAndStillRequiresFreshConsent() async throws {
         let origin = "https://station.agora.build"

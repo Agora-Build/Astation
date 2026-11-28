@@ -98,6 +98,17 @@ public final class RemoteMemberVerifierJournal {
         return (row?.inventory, row?.conflicted ?? false)
     }
 
+    /// Conflicts belong to a member and slot even after its reviewed process is replaced.
+    public func nativeConflicts(log: MembershipLog, origin: String) throws -> [(member: String, slot: String)] {
+        try require(log: log, origin: origin)
+        var conflicts: [(member: String, slot: String)] = []
+        for row in rows.values where row.conflicted {
+            guard let member = log.member(deviceId: row.member) else { throw RemoteVerifierGateError.staleMembership }
+            if member.kind == "native" { conflicts.append((row.member, row.slot)) }
+        }
+        return conflicts.sorted { ($0.member, $0.slot) < ($1.member, $1.slot) }
+    }
+
     func record(_ slot: RemoteMemberVerifierSlot, inventory: VerifierInventory? = nil, conflict: Bool = false) throws {
         guard !storageUncertain else { throw RemoteRecoveryError.storageUncertain }
         let key = Key(member: slot.memberID, slot: slot.slot)

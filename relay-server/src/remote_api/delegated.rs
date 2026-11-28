@@ -684,12 +684,15 @@ impl super::RecoveryStore {
         if log.frozen().is_some() {
             return Err(());
         }
-        let release_current = || {
+        let policy_allows_signing = || {
+            if desired != ServiceDesired::Active {
+                return true;
+            }
             let now = chrono::Utc::now();
-            desired != ServiceDesired::Active || (checkpoint.policy_current(now.timestamp())
-                && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis()))
+            checkpoint.current(&context.integration_id, &context.owner, now.timestamp()).is_ok()
+                && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis())
         };
-        if !release_current() || (desired == ServiceDesired::Active
+        if !policy_allows_signing() || (desired == ServiceDesired::Active
             && !checkpoint.allows_list_release_in(tx, &context.owner, log.account_id(), &context.genesis).await?)
         {
             return Err(());
@@ -723,12 +726,17 @@ impl super::RecoveryStore {
             return Err(());
         }
         let required_floor = previously_signed.max(u64::try_from(floor).map_err(|_| ())?);
-        for record in signer.sign_control_batch(store, &bodies, required_floor).await? {
+        let revoked_at = if matches!(desired, ServiceDesired::Revoked { .. }) {
+            checkpoint.known_revocation_ms(&context.integration_id)?.unwrap_or(clock.wall_ms)
+        } else {
+            clock.wall_ms
+        };
+        for record in signer.sign_control_batch(store, &bodies, required_floor, policy_allows_signing).await? {
             feed.publish(
                 origin,
                 &log,
                 &record,
-                clock.wall_ms,
+                revoked_at,
                 &covered,
                 clock.wall_ms,
             )
@@ -740,7 +748,7 @@ impl super::RecoveryStore {
             .map_err(|_| ())?;
         // A signing reservation can wait on the independent store. Returning
         // an error rolls back this publication if the feed aged out meanwhile.
-        if !release_current() {
+        if !policy_allows_signing() {
             return Err(());
         }
         Ok(true)

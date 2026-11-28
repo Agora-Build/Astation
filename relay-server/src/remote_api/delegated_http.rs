@@ -12,7 +12,7 @@ use atem_client::{
 };
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 
@@ -83,6 +83,27 @@ pub(crate) async fn recovery_review(
         return invalid();
     }
     state.recovery.control_recovery_review(&genesis, &owner).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OriginalsQuery {
+    review: String,
+    offset: usize,
+}
+
+pub(crate) async fn recovery_originals(
+    State(state): State<AppState>, Path((genesis, plan)): Path<(String, String)>,
+    headers: HeaderMap, query: Result<Query<OriginalsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Reply {
+    let owner = match subject(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    let Ok(Query(query)) = query else { return invalid() };
+    if query.offset > 4096 || !super::delegated_recovery::canonical_genesis(&genesis)
+        || !super::delegated_recovery::canonical_genesis(&query.review)
+        || !uuid::Uuid::parse_str(&plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == plan) {
+        return invalid();
+    }
+    state.recovery.control_recovery_originals(&genesis, &plan, &query.review, query.offset, &owner).await
 }
 
 pub(crate) async fn plan_outcome(

@@ -657,16 +657,19 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
     fence.initialize(&db.pool,true).await.unwrap();
     let replica = db.reconnect(2).await;
     let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding), Some(&runtime.vault));
-    for (state, expected) in [
-        ("paused",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
-        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
-        ("expired",json!({"status":"pre_expiry_state_unresolved"})),
-        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+    let future = "2099-01-01T00:00:00.000Z";
+    let elapsed = "2000-01-01T00:00:00.000Z";
+    for (state, expires_at, expected) in [
+        ("paused",elapsed,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
+        ("ready",future,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+        ("expired",future,json!({"status":"pre_expiry_state_unresolved"})),
+        ("ready",elapsed,json!({"status":"pre_expiry_state_unresolved"})),
+        ("ready",future,json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
     ] {
         let previous = runtime.policies.load(&runtime.binding).await.unwrap();
         let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
             "id":ID,"ownerAccount":OWNER,"state":state,"scopes":["agent.view"],"r9Svc":draft["fingerprint"],
-            "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+            "expiresAt":expires_at,"quotaPerSecond":10
         }]}});
         let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
         let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();

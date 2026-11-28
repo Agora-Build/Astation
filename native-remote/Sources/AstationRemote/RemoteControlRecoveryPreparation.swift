@@ -7,6 +7,10 @@ public protocol RemoteControlRecoveryReviewTransport: Sendable {
         expected: LogHead) async throws -> RemoteControlRecoveryPreparation
 }
 
+public protocol RemoteControlRecoveryOriginalsTransport: RemoteControlRecoveryReviewTransport {
+    func controlRecoveryOriginals(for review: RemoteControlRecoveryPreparation) async throws -> [String]
+}
+
 /// An authenticated view of retained evidence, never signing or reopening authority.
 public struct RemoteControlRecoveryPreparation: Equatable, Sendable {
     public let context: RemoteControlRecoveryContext

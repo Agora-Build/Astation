@@ -22,6 +22,8 @@ mod service_drafts;
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
 mod history;
+#[path = "delegated_recovery_memberships.rs"]
+mod memberships;
 #[path = "delegated_native_recovery.rs"]
 pub(crate) mod native;
 #[path = "delegated_recovery_signatures.rs"]
@@ -237,6 +239,44 @@ pub(crate) async fn review_for_owner(
     Ok(summary)
 }
 
+/// Page only the originals still needing a manager signature at this review.
+pub(crate) async fn originals_for_owner(
+    pool: &PgPool, binding: &Binding, genesis: &str, owner: &str,
+    plan_id: &str, review: &str, offset: usize,
+) -> Result<Option<Value>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let (prepared, log, mut report) =
+        checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
+    let sources = review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    if !covers_retained_membership(&report) { return Err(invalid()); }
+    if prepared.plan_id != plan_id || report["reconstruction_hash"] != review { return Ok(None); }
+    let page = originals_page(&report, &sources.signed, plan_id, review, offset)?;
+    tx.commit().await?;
+    Ok(Some(page))
+}
+
+fn originals_page(report: &Value, signed: &BTreeMap<String, Value>, plan_id: &str, review: &str,
+    offset: usize) -> Result<Value, sqlx::Error> {
+    // The review builds obligations in record-ID order from the signed evidence map.
+    let obligations = report["recovery_signatures"]["known_native_obligations"].as_array().ok_or_else(invalid)?;
+    let mut pending = obligations.iter().filter(|row| row["requirement"] == "fresh_manager_signature").skip(offset).peekable();
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    while let Some(row) = pending.peek() {
+        let id = row["original"]["record_id"].as_str().ok_or_else(invalid)?;
+        let record = signed.get(id).ok_or_else(invalid)?;
+        let size = serde_json::to_vec(record).map_err(|_| invalid())?.len() + 1;
+        // Reserve space for the bounded plan, hash and pagination fields.
+        if records.len() == 64 || bytes + size > 262_144 - 512 { break; }
+        records.push(record);
+        bytes += size;
+        pending.next();
+    }
+    let more = pending.peek().is_some();
+    if more && records.is_empty() { return Err(invalid()); }
+    Ok(json!({"plan_id":plan_id,"reconstruction_hash":review,"offset":offset,"records":records,"more":more}))
+}
+
 fn covers_retained_membership(report: &Value) -> bool {
     report["known_history"]["membership_gaps"].as_array().is_some_and(Vec::is_empty)
 }
@@ -374,7 +414,6 @@ async fn checkpoint_for_owner(
         "membership": root.membership,
         "feed": feed,
     });
-    let source_hash = source_hash(&retained)?;
     // JSONB's text representation can be larger than canonical JSON. Check
     // the actual persisted size so a successful first call is readable again.
     let fits: bool = sqlx::query_scalar("SELECT octet_length($1::jsonb::text) <= $2")
@@ -398,8 +437,10 @@ async fn checkpoint_for_owner(
     .fetch_optional(&mut *connection)
     .await?;
     let prepared = if let Some(prepared) = prepared {
-        if prepared.abandoned || prepared.source_hash != source_hash
-            || prepared.retained != retained
+        if prepared.abandoned || prepared.source_hash != source_hash(&prepared.retained)?
+            || prepared.retained["account_subject"] != retained["account_subject"]
+            || prepared.retained["account_id"] != retained["account_id"]
+            || prepared.retained["feed"] != retained["feed"]
             || !canonical_uuid(&prepared.plan_id)
             || !canonical_uuid(&prepared.candidate_feed_id)
             || prepared.candidate_feed_id == review["retained_feed_id"]
@@ -407,6 +448,7 @@ async fn checkpoint_for_owner(
             // Never replace an earlier plan or silently drop its obligations.
             return Err(invalid());
         }
+        memberships::observe(connection, &prepared, &log, &root.membership, create).await?;
         prepared
     } else {
         if !create {
@@ -416,7 +458,7 @@ async fn checkpoint_for_owner(
             abandoned: false,
             plan_id: uuid::Uuid::new_v4().to_string(),
             candidate_feed_id: uuid::Uuid::new_v4().to_string(),
-            source_hash,
+            source_hash: source_hash(&retained)?,
             retained,
         };
         if prepared.candidate_feed_id == review["retained_feed_id"] {
