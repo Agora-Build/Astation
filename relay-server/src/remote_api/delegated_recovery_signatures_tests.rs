@@ -909,7 +909,7 @@ async fn postgres_delegated_restore_preserves_carried_stops_and_their_old_feed_i
     let revoke = feed.records[1].clone();
     let interrupt = record(&f, feed, &uuid::Uuid::new_v4().to_string(),
         ControlAction::InterruptRunning { revoke_seq: None });
-    feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).unwrap();
+    feed.publish(ORIGIN, &f.log, &interrupt, None, &[], f.created).unwrap();
 
     // Restore the state a replacement feed keeps: both original signatures
     // and the ledger survive; the old hold would need a fresh signature.
@@ -918,7 +918,7 @@ async fn postgres_delegated_restore_preserves_carried_stops_and_their_old_feed_i
     let review = feed.recovery_review(ORIGIN, &f.log).unwrap();
     assert_eq!(review["records"].as_array().unwrap().len(), 2);
     assert!(review["records"].as_array().unwrap().iter().all(|r| r["verification"] == "valid"));
-    assert!(feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).is_err());
+    assert!(feed.publish(ORIGIN, &f.log, &interrupt, None, &[], f.created).is_err());
     feed.records.push(hold);
     assert!(feed.recovery_review(ORIGIN, &f.log).is_err());
     feed.records.pop();

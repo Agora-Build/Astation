@@ -84,7 +84,7 @@ fn delegated_recovery_inspection_never_ticks_reports_or_exposes_record_bodies() 
         ORIGIN,
         &f.log,
         &held,
-        f.created,
+        None,
         &["host-a".into()],
         f.created,
     )
@@ -144,7 +144,7 @@ fn delegated_recovery_review_preserves_host_interrupts_and_never_trusts_unknown_
         record_id: uuid::Uuid::new_v4().to_string(), issued_at: f.created + 1,
         about: ControlAbout { integration_id: None, by: "owner".into() },
     }).unwrap()).unwrap();
-    feed.publish(ORIGIN, &f.log, &record, f.created, &["host-a".into()], f.created).unwrap();
+    feed.publish(ORIGIN, &f.log, &record, None, &["host-a".into()], f.created).unwrap();
     let before = serde_json::to_value(&feed).unwrap();
     let review = feed.recovery_review(ORIGIN, &f.log).unwrap();
     assert_eq!(review["records"][0]["requirement"], "retain_host_record");
@@ -286,7 +286,7 @@ fn report_backoff_and_stop_resume_are_durable_for_the_exact_client_history() {
             interrupt_running: false,
         },
     );
-    publish(&mut root, ORIGIN, &f.log, &r, f.created, &[], f.created).unwrap();
+    publish(&mut root, ORIGIN, &f.log, &r, Some(f.created), &[], f.created).unwrap();
     let feed = root.delegated.get_mut(ORIGIN).unwrap();
     let first = feed
         .update_ledger(ORIGIN, &f.log, LedgerUpdate::Tick, f.created)
@@ -390,7 +390,7 @@ async fn native_status_counts_all_effects_not_cursor_and_survives_restart() {
     body.signer = ControlSigner::Member("phone".into());
     let native = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap();
     let native = ControlRecord::from_signed(native).unwrap();
-    publish(&mut root, ORIGIN, &f.log, &native, f.created, &["host-a".into()], f.created).unwrap();
+    publish(&mut root, ORIGIN, &f.log, &native, Some(f.created), &["host-a".into()], f.created).unwrap();
     let unknown = uuid::Uuid::new_v4().to_string();
     let status = |root: &Root| root.delegated[ORIGIN]
         .native_status(ORIGIN, &f.log, &[id.clone(), unknown.clone()]).unwrap();
@@ -424,15 +424,15 @@ fn publication_conflicts_and_signature_failures_never_become_visible() {
     ensure(&mut root, ORIGIN, &f.log).unwrap();
     let id = uuid::Uuid::new_v4().to_string();
     let cover = record(&f, &root.delegated[ORIGIN], &id, ControlAction::Cover);
-    assert!(publish(&mut root, ORIGIN, &f.log, &cover, f.created, &[], f.created).unwrap());
-    assert!(!publish(&mut root, ORIGIN, &f.log, &cover, f.created, &[], f.created).unwrap());
+    assert!(publish(&mut root, ORIGIN, &f.log, &cover, Some(f.created), &[], f.created).unwrap());
+    assert!(!publish(&mut root, ORIGIN, &f.log, &cover, Some(f.created), &[], f.created).unwrap());
     let conflict = record(&f, &root.delegated[ORIGIN], &id, ControlAction::Hold);
     assert!(publish(
         &mut root,
         ORIGIN,
         &f.log,
         &conflict,
-        f.created,
+        Some(f.created),
         &[],
         f.created
     )
@@ -446,7 +446,7 @@ fn publication_conflicts_and_signature_failures_never_become_visible() {
         ORIGIN,
         &f.log,
         &tampered,
-        f.created,
+        Some(f.created),
         &[],
         f.created
     )
@@ -487,7 +487,7 @@ fn membership_freeze_blocks_new_authority_but_keeps_committed_report_settlement(
             interrupt_running: false,
         },
     );
-    publish(&mut root, ORIGIN, &f.log, &r, f.created, &[], f.created).unwrap();
+    publish(&mut root, ORIGIN, &f.log, &r, Some(f.created), &[], f.created).unwrap();
     let id = root.delegated[ORIGIN]
         .ledger(ORIGIN, &f.log)
         .unwrap()
@@ -563,7 +563,7 @@ fn pages_keep_correlation_and_do_not_turn_a_lower_head_into_progress() {
             &uuid::Uuid::new_v4().to_string(),
             ControlAction::Cover,
         );
-        publish(&mut root, ORIGIN, &f.log, &r, f.created, &[], f.created).unwrap();
+        publish(&mut root, ORIGIN, &f.log, &r, Some(f.created), &[], f.created).unwrap();
     }
     let call = sync(Some(&root.delegated[ORIGIN]), 0);
     let page = response(&root, ORIGIN, &f.log, &call, f.created)
@@ -638,7 +638,7 @@ async fn ack_is_atomic_cursor_alone_counts_nothing_and_restart_replays_one_repor
         ORIGIN,
         &f.log,
         &record,
-        f.created,
+        Some(f.created),
         &["host-a".into()],
         f.created,
     )
@@ -664,7 +664,7 @@ async fn ack_is_atomic_cursor_alone_counts_nothing_and_restart_replays_one_repor
         ORIGIN,
         &f.log,
         &second,
-        f.created,
+        Some(f.created),
         &["host-a".into()],
         f.created,
     )
