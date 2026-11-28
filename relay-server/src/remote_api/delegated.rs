@@ -691,8 +691,7 @@ impl super::RecoveryStore {
                 return true;
             }
             let now = chrono::Utc::now();
-            checkpoint.owned(&context.integration_id, &context.owner, now.timestamp())
-                .is_ok_and(|policy| policy.confirms_control_release(now.timestamp()))
+            checkpoint.allows_control_release(&context.integration_id, &context.owner, now.timestamp())
                 && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis())
         };
         if !policy_allows_signing() || (desired == ServiceDesired::Active

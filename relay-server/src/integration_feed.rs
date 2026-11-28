@@ -95,6 +95,9 @@ impl IntegrationPolicy {
     }
 
     pub(crate) fn confirms_control_release(&self, now: i64) -> bool {
+        if !matches!(self.state.as_str(), "provisioning" | "waiting_for_host" | "ready" | "expired") {
+            return false;
+        }
         match self.held {
             Some(held) => !held,
             None => self.state != "expired" && self.grant_unexpired(now),
@@ -640,6 +643,16 @@ impl PolicyCheckpoint {
     pub(crate) fn policy_current(&self, now: i64) -> bool {
         !self.denied && self.revision != 0
             && now.checked_sub(self.received_at).is_some_and(|age| (0..MAX_POLICY_AGE_SECS).contains(&age))
+    }
+
+    pub(crate) fn allows_control_release(&self, id: &str, owner: &str, now: i64) -> bool {
+        let Ok(live) = self.owned(id, owner, now) else { return false };
+        if !live.confirms_control_release(now) { return false; }
+        // A checkpoint can observe a pause before ordinary polling reaches that event.
+        self.portal_snapshot.as_ref().filter(|cut| cut.cursor >= self.cursor).is_none_or(|cut| {
+            cut.integrations.get(id).is_some_and(|row| row.policy.same_verifier(live)
+                && row.policy.confirms_control_release(now))
+        })
     }
 
     /// Either authenticated source can be the first to observe a revocation.
