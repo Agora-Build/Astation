@@ -340,7 +340,6 @@ impl PolicyCheckpoint {
         for change in &page.changes {
             // Event IDs are global: gaps between this Station's events are valid.
             if change.id <= previous
-                || change.id > page.cursor
                 || change.kind.is_empty()
                 || change.kind.len() > 128
             {
@@ -399,8 +398,10 @@ impl PolicyCheckpoint {
                 return Err(());
             }
         }
-        // The authenticated cursor also covers hidden events. Visible IDs were
-        // checked above against both the requested cursor and the returned one.
+        // The authenticated cursor can advance past the final visible change.
+        if previous > page.cursor {
+            return Err(());
+        }
         // A reset or malformed availability change needs another exact checkpoint.
         // Ordinary integration polling can still advance independently.
         if self.denied || (requested_cursor == 0 && self.cursor != 0) ||
