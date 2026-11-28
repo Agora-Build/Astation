@@ -414,6 +414,17 @@ final class AtemE2EIdentity {
         _ = try existingVerifierIdentity(log: log, memberID: memberID)
     }
 
+    func signProcessExport(_ proof: AstationRecoveryCoordinator.ConfirmedProcessExport, log: MembershipLog) throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard let member = log.member(deviceId: proof.managerID), member.roles.contains("manage") else {
+            throw AtemIdentityError.identityChanged
+        }
+        let record = try existingVerifierIdentity(log: log, memberID: proof.managerID)
+        let sig = try crypto.sign(proof.input, material: record.material)
+        try verifyRawSignature(key: member.authKey, message: proof.input, signature: sig)
+        return sig
+    }
+
     /// This API builds the report in the SDK; it never accepts arbitrary signing bytes.
     func verifierReport(log: MembershipLog, anchor: RemoteVerifierReportAnchor, memberID: String, challengeJSON: String, slot: String,
                         origin: String, wallMs: UInt64, current: () -> Bool) throws -> String {

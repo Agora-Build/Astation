@@ -829,10 +829,20 @@ station-relay-server admin delegated-recovery review-publication processes-a.jso
 The command uses the operator's primary and signing databases, Portal reporting
 configuration and service wrapping key. It holds signing reservations while it
 compares the staged feeds with current membership, Portal evidence and process
-exports. On success it prints the reviewed cut and feed hashes for each list.
-It rolls back its primary transaction and releases the signing hold. The
-output includes `"final_verification":"pending"`. Production publication still
-needs signed journal attachments, replacement-copy checks and service coverage.
+exports. Station verifies each export under a current native manager's key
+from that list. On success it prints the cut and feed hashes for each list
+and a generation-wide `review_hash`. Review rolls back its primary transaction
+and releases the signing hold. To publish that reviewed generation, run
+
+```sh
+station-relay-server admin delegated-recovery publish <review_hash> processes-a.json processes-b.json
+```
+
+Use the same signed files. Station rebuilds the cuts and verifies their
+processes, clocks, copies and service coverage under both holds. The hash binds
+the origin, generation, plans, cut and feed hashes, and exact export files.
+A changed review requires another `review-publication`. The feeds, individual
+receipts and reopened fence commit in one primary transaction.
 
 After a publisher disconnects, use
 `station-relay-server admin delegated-recovery release-signing-hold` with the

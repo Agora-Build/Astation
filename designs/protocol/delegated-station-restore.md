@@ -49,7 +49,8 @@ commit. A file import, another origin or an unknown outcome keeps the hold.
 Recovery Copies can request a Station challenge and submit a signed report
 when the delegated signing gate permits it. A retry can deliver a previously
 exposed signature. The Mac checks the authenticated terminal receipt for abandonment or publication.
-Station still needs atomic publication, complete historical author coverage and joint verification.
+The operator verifies historical author coverage during generation-wide publication.
+The two-replica dev rehearsal and joint host check are pending.
 
 Recovery Copies can review this Mac's retained evidence offline. The coordinator
 holds the account checkpoint and the member key's journal lock while reading
@@ -215,7 +216,8 @@ Publication also checks the retained journal gaps. Complete process coverage
 requires the signed process roster.
 
 In **Recovery Copies**, load the Station review and choose **Save Reviewed
-Processes**. Give the file to the recovery operator for comparison:
+Processes**. After the manager confirms, the Mac rechecks the protected list
+and signs the file. Give it to the recovery operator for comparison:
 
 ```sh
 station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file> [file ...]
@@ -238,8 +240,13 @@ and which still need confirmation. Several managers can supply separate exports
 for the same review. If two exports describe the same member, their slot lists
 must agree, including prior processes and reviewed heads. A disagreement or a
 stale file refuses the combined comparison. A retried receipt retains its original
-scope. Comparing exported files cannot attest their provenance, establish complete history,
-release a signing hold or reopen a feed.
+scope. Unsigned legacy files can still identify differences during comparison.
+Publication requires every export to be signed by a current native manager.
+The file has three fields, `manager`, `roster` and `signature`. The signature
+covers `enc(["astation-recovery-process-export-v1", manager, SHA256(roster)])`,
+where the hash uses the exact UTF-8 JSON object bytes of the protected export.
+The Station takes the verification key from its verified list at the reviewed
+head. This file is local to the native app and Station recovery operator.
 
 During publication Station rebuilds each device list's review while holding
 the primary recovery fence and the independent signing store. It compares that
@@ -256,8 +263,8 @@ same member's latest report for its journal, at the current membership head
 and evidence hash. A known gap before journal creation prevents publication.
 The shared SDK also checks each selected replacement against its original
 and checks the snapshot against the independently recovered service enrollment.
-Authenticating the independent process exports is still required before the
-operator can publish.
+The operator commits the exact verified generation using the digest printed
+by `review-publication`. Reordering the same files preserves the digest.
 
 When the Mac has a pinned verifier journal, the export also reads its saved
 process conflicts for this Station and device list. A missing pinned journal
@@ -305,9 +312,9 @@ matching the account, genesis, origin, generation, plan, candidate and source
 can end this hold. Missing, pending and unrecognized outcomes keep it held.
 The Mac retains the frozen signatures and end marker in one protected write.
 A late challenge cannot reinstall that plan. Holds at other origins still apply.
-Station may issue `published` only after it atomically commits the recovered
-feed, generation and plan outcome. The current server returns `pending` or
-`abandoned` while that publication path is under development.
+Station issues `published` once the recovered feeds, generation and plan
+outcomes commit together. An operator can recover the receipt with `inspect`
+if the publication response is lost.
 
 ## Implemented fence and operator commands
 
@@ -1256,8 +1263,7 @@ clock verification and atomic publication.
    that leaves old sockets or writers alive is unsupported.
 2. Increase the recovery generation outside the backup. Startup compares it
    with durable recovery state before admitting delegated traffic; a mismatch
-   never releases the fence. This guard is implemented; the remaining snapshot
-   and completion steps below are not.
+   keeps the fence closed until recovery publication commits.
 3. Inspect the restored account roots and reconcile them with authoritative
    later history. Retain every known stop and native interruption intent.
    Missing later history is an unresolved recovery obligation, never permission

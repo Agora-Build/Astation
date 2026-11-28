@@ -436,7 +436,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.isEnabled = available && selected?.signed == true
         sendCopy.isEnabled = available && selected?.signed == true && access?.canSign() == true
         loadReview.isEnabled = available && access?.canSign() == true
-        exportRoster.isEnabled = available && preparation != nil && access?.canSign() == true
+        exportRoster.isEnabled = available && preparation != nil && access?.canSign() == true &&
+            access?.coordinator.processReviewAvailable == true
         checkHold.isEnabled = available && heldPlan != nil && access?.canSign() == true
         report.isEnabled = available && preparation != nil && access?.canSign() == true &&
             access?.coordinator.delegatedControlsAvailable == true
@@ -498,13 +499,18 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     @objc private func saveRoster() {
         guard exportRoster.isEnabled, let access, let preparation else { return }
         saveEvidence(access, filename: "Astation Reviewed Processes.json",
-            message: "Share these reviewed process IDs with the Station recovery operator to identify missing reports.",
-            success: "Reviewed process list saved for comparison at this Station.") { current in
+            message: "Confirm the reviewed process list with your device to sign it for this Station's recovery operator.",
+            success: "Signed process list saved for the Station recovery operator.",
+            signFile: { reviewed, current in
+                try await access.coordinator.signAuthorRoster(preparation, reviewed: reviewed,
+                    current: { current() && access.canSign() })
+            }) { current in
             try access.coordinator.exportAuthorRoster(preparation, current: current)
         }
     }
 
     private func saveEvidence(_ access: Access, filename: String, message: String, success: String,
+        signFile: ((String, @escaping () -> Bool) async throws -> String)? = nil,
         read: @escaping (() -> Bool) throws -> String) {
         guard let window else { return }
         let epoch = generation
@@ -518,6 +524,21 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 self.panel = nil
                 defer { self.render() }
                 guard response == .OK, let url = panel.url, self.isCurrent(access, epoch: epoch) else { return }
+                if let signFile {
+                    self.task = Task {
+                        defer { self.task = nil; self.render() }
+                        do {
+                            let file = try await signFile(json, { self.isCurrent(access, epoch: epoch) })
+                            guard self.isCurrent(access, epoch: epoch), access.canSign() else { return }
+                            try RecoveryKit.save(file, to: url)
+                            self.status.stringValue = success
+                        } catch {
+                            guard self.isCurrent(access, epoch: epoch) else { return }
+                            self.status.stringValue = "Could not save file: " + error.localizedDescription
+                        }
+                    }
+                    return
+                }
                 do {
                     guard try read({ self.isCurrent(access, epoch: epoch) }) == json else {
                         throw RemoteRecoveryError.requiresReview

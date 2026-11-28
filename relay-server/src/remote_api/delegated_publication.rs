@@ -28,7 +28,7 @@ impl ProcessLists {
         let value = atem_client::canonical::StrictValue::parse(&bytes, limit)
             .map_err(|_| invalid())?
             .into_value();
-        let genesis = value["genesis_hash"]
+        let genesis = value.get("roster").unwrap_or(&value)["genesis_hash"]
             .as_str()
             .filter(|id| super::super::canonical_genesis(id))
             .ok_or_else(invalid)?;
@@ -95,8 +95,8 @@ pub(crate) async fn reconcile_signing_hold(
     tx.commit().await
 }
 
-/// Run final verification and install every feed while the independent
-/// signing inventory is durably held, including if either connection dies.
+/// Fault-injection entry for the commit and rollback tests.
+#[cfg(test)]
 pub(super) async fn publish_after_verification(
     pool: &PgPool,
     binding: &Binding,
@@ -115,17 +115,19 @@ pub(super) async fn publish_after_verification(
     .await
 }
 
-/// Exercise the same generation-wide input checks as publication. The primary
-/// rolls back all preparation writes; only actual publication can install a feed.
-pub(crate) async fn review_publication(
+/// Review and publish reconstruct the same cuts under both database holds.
+/// Publishing requires the exact commitment returned by the operator's review.
+pub(crate) async fn operator_publication(
     pool: &PgPool,
     binding: &Binding,
     portal: &FeedBinding,
     signing: &SigningCeilings,
     vault: &ServiceKeyVault,
     lists: ProcessLists,
+    expected_hash: Option<&str>,
 ) -> Result<Value, sqlx::Error> {
-    with_publication_hold(pool, binding, portal, signing, Operation::Review, async |publication| {
+    let operation = if expected_hash.is_some() { Operation::Publish } else { Operation::Review };
+    with_publication_hold(pool, binding, portal, signing, operation, async |publication| {
         let mut cuts = BTreeMap::new();
         for (genesis, (_, process_lists)) in lists.0 {
             let (plan_id, cut_hash, feed_hash, membership_head) = sqlx::query_as(
@@ -153,13 +155,21 @@ pub(crate) async fn review_publication(
             );
         }
         let mut reviews = Vec::new();
+        let mut commitments = Vec::new();
         publication
             .verify_inputs(
                 &cuts,
                 portal,
                 signing,
                 vault,
-                async |_, review, comparison| {
+                async |log, review, comparison| {
+                    let genesis = log.genesis_hash().to_hex();
+                    let cut = cuts.get(&genesis).ok_or_else(invalid)?;
+                    let mut exports: Vec<_> = cut.process_lists.iter()
+                        .map(|bytes| atem_client::Hash32::of(bytes).to_hex()).collect();
+                    exports.sort();
+                    commitments.push(json!({"genesis_hash":genesis,"plan_id":cut.plan_id,
+                        "cut_hash":cut.cut_hash,"feed_hash":cut.feed_hash,"process_exports":exports}));
                     reviews.push(json!({
                         "genesis_hash":review["genesis_hash"], "plan_id":review["plan_id"],
                         "candidate_feed_id":review["candidate_feed_id"],
@@ -171,9 +181,17 @@ pub(crate) async fn review_publication(
                 },
             )
             .await?;
+        let review_hash = source_hash(&json!({"origin":binding.origin,"generation":binding.generation.to_string(),
+            "lists":commitments}))?;
+        if let Some(expected) = expected_hash {
+            if expected != review_hash {
+                return Err(sqlx::Error::Protocol("the reviewed publication changed".into()));
+            }
+            publication.install_generation(&cuts).await?;
+        }
         Ok(
             json!({"origin":binding.origin, "generation":binding.generation.to_string(),
-            "lists":reviews, "final_verification":"pending", "published":false}),
+            "lists":reviews, "review_hash":review_hash, "final_verification":"verified", "published":expected_hash.is_some()}),
         )
     })
     .await
@@ -309,6 +327,14 @@ impl Publication {
             .await?;
             let feed = &review["replacement_feed"];
             let authors = &review["known_authors"];
+            let clocks = &review["service_clock_evidence"];
+            // Closing a service can end coverage. A missing historical signing
+            // reservation still prevents reconstructing the next safe watermark.
+            if !clocks["reservation_shortfalls"].as_array().is_some_and(Vec::is_empty)
+                || !clocks["uncovered_service_signatures"].as_object().is_some_and(|rows| rows.is_empty())
+            {
+                return Err(sqlx::Error::Protocol("incomplete historical service signing clock".into()));
+            }
             if !authors["pending_final_reports"]
                 .as_array()
                 .is_some_and(Vec::is_empty)
@@ -330,7 +356,7 @@ impl Publication {
                 return Err(invalid());
             }
             let comparison = super::author_roster::compare_at_review(
-                super::author_roster::combine(&cut.process_lists)?,
+                super::author_roster::combine(&cut.process_lists, &log, true)?,
                 &self.binding,
                 &log,
                 &review,
@@ -347,8 +373,8 @@ impl Publication {
                     return Err(invalid());
                 }
             }
-            // Matching signed journals cannot establish the provenance and
-            // completeness of the independent protected process lists.
+            // Only include this list in the generation review once its
+            // protected process inventory agrees with the signed journals.
             verify(&log, &review, &comparison).await?;
         }
         Ok(())
@@ -435,6 +461,19 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
+    fn signed_roster(roster: &Value) -> Vec<u8> {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let digest = atem_client::Hash32::of(roster.to_string().as_bytes());
+        let input = atem_client::encoding::enc(&[
+            b"astation-recovery-process-export-v1", b"phone", digest.as_bytes(),
+        ]);
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let sig: Signature = key.sign(&input);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        serde_json::to_vec(&json!({"manager":"phone","roster":roster,
+            "signature":atem_client::encoding::b64u(&sig.to_bytes())})).unwrap()
+    }
+
     /// The test manager reviews the local SDK process for both fixture lists.
     fn cuts(reviews: &[Value]) -> BTreeMap<String, AccountCut> {
         reviews
@@ -460,7 +499,7 @@ mod tests {
                         cut_hash: image["cut_hash"].as_str().unwrap().into(),
                         feed_hash: image["feed_hash"].as_str().unwrap().into(),
                         membership_head: r["membership_head"].clone(),
-                        process_lists: vec![serde_json::to_vec(&roster).unwrap()],
+                        process_lists: vec![signed_roster(&roster)],
                     },
                 )
             })
@@ -804,20 +843,57 @@ mod tests {
             files
         };
         let review_inputs = async |rows: &[Value]| {
-            review_publication(
+            operator_publication(
                 &db.pool,
                 &fence,
                 &runtime.binding,
                 signing,
                 &runtime.vault,
                 process_lists(rows),
+                None,
             )
             .await
         };
         assert!(review_inputs(&reviews[..1]).await.is_err());
+        // This service no longer belongs to the list, but its earlier
+        // reservation still exceeds what the restored signing store can prove.
+        let genesis = first.log.genesis_hash().to_hex();
+        sqlx::query("INSERT INTO station_delegated_observed_reservations
+            (origin,account_id,genesis_hash,service_id,key_hash,highest_ms)
+            VALUES ($1,$2,$3,'svc-retired',$4,17)")
+            .bind(&fence.origin).bind(first.log.account_id()).bind(&genesis).bind("a".repeat(64))
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(review_inputs(&reviews).await, Err(sqlx::Error::Protocol(reason))
+            if reason == "incomplete historical service signing clock"));
+        assert!(!inspect(&replica, &fence.origin).await.unwrap().unwrap().ready);
+        sqlx::query("DELETE FROM station_delegated_observed_reservations
+            WHERE origin=$1 AND genesis_hash=$2 AND service_id='svc-retired'")
+            .bind(&fence.origin).bind(&genesis).execute(&db.pool).await.unwrap();
         let checked = review_inputs(&reviews).await.unwrap();
-        assert_eq!(checked["final_verification"], "pending");
+        assert_eq!(checked["final_verification"], "verified");
         assert_eq!(checked["published"], false);
+        let review_hash = checked["review_hash"].as_str().unwrap();
+        assert!(super::super::super::canonical_genesis(review_hash));
+        let run_publish = async |lists: ProcessLists, expected: &str| {
+            operator_publication(&db.pool, &fence, &runtime.binding, signing,
+                &runtime.vault, lists, Some(expected)).await
+        };
+        assert!(run_publish(process_lists(&reviews), &"0".repeat(64)).await.is_err());
+        for change in ["unsigned", "edited", "wrong_manager"] {
+            let mut files = ProcessLists::default();
+            for (index, cut) in cuts(&reviews).into_values().enumerate() {
+                let mut file: Value = serde_json::from_slice(&cut.process_lists[0]).unwrap();
+                if index == 0 {
+                    match change {
+                        "unsigned" => file = file["roster"].take(),
+                        "edited" => file["roster"]["conflicted_slots"] = json!([]),
+                        _ => file["manager"] = json!("offline"),
+                    }
+                }
+                files.add(serde_json::to_vec(&file).unwrap()).unwrap();
+            }
+            assert!(run_publish(files, review_hash).await.is_err(), "{change}");
+        }
         let checked_lists = checked["lists"].as_array().unwrap();
         assert_eq!(checked_lists.len(), reviews.len());
         for review in &reviews {
@@ -923,8 +999,8 @@ mod tests {
         let mut last = changed_roster.last_entry().unwrap();
         let bytes = &mut last.get_mut().process_lists[0];
         let mut changed: Value = serde_json::from_slice(bytes).unwrap();
-        changed["slots"][0]["slot"] = json!("another-process-slot");
-        *bytes = serde_json::to_vec(&changed).unwrap();
+        changed["roster"]["slots"][0]["slot"] = json!("another-process-slot");
+        *bytes = signed_roster(&changed["roster"]);
         let mut verified = Vec::new();
         assert!(publish_after_verification(
             &db.pool,
@@ -948,11 +1024,11 @@ mod tests {
         let mut last = missing_attachment.last_entry().unwrap();
         let bytes = &mut last.get_mut().process_lists[0];
         let mut roster: Value = serde_json::from_slice(bytes).unwrap();
-        let mut retired = roster["slots"][0].clone();
+        let mut retired = roster["roster"]["slots"][0].clone();
         retired["selected"] = json!(false);
         retired["process"] = json!(atem_client::encoding::b64u(&[9; 16]));
-        roster["slots"].as_array_mut().unwrap().push(retired);
-        *bytes = serde_json::to_vec(&roster).unwrap();
+        roster["roster"]["slots"].as_array_mut().unwrap().push(retired);
+        *bytes = signed_roster(&roster["roster"]);
         assert!(publish_after_verification(
             &db.pool, &fence, &runtime.binding, signing, &runtime.vault, missing_attachment,
             async |_, _, _| Ok(())
@@ -1019,18 +1095,7 @@ mod tests {
             CREATE CONSTRAINT TRIGGER fail_publication AFTER UPDATE ON station_delegated_recovery
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_publication()")
             .execute(&db.pool).await.unwrap();
-        let checked = cuts(&reviews);
-        assert!(publish_after_verification(
-            &db.pool,
-            &fence,
-            &runtime.binding,
-            signing,
-            &runtime.vault,
-            checked,
-            async |_, _, _| Ok(())
-        )
-        .await
-        .is_err());
+        assert!(run_publish(process_lists(&reviews), review_hash).await.is_err());
         assert_eq!(
             sqlx::query_as::<_, (String, Value)>(read_roots)
                 .fetch_all(&replica)
@@ -1053,14 +1118,15 @@ mod tests {
             .await
             .unwrap();
 
-        let checked = cuts(&reviews);
-        publish_after_verification(
+        // Exercise the independent locking assertions on a rolled-back run,
+        // then commit through the same verified entry used by the operator.
+        let locking_probe = publish_after_verification(
             &db.pool,
             &fence,
             &runtime.binding,
             signing,
             &runtime.vault,
-            checked,
+            cuts(&reviews),
             async |_, _, _| {
                 assert!(
                     signing
@@ -1090,11 +1156,15 @@ mod tests {
                 .await
                 .is_err());
                 writer.rollback().await?;
-                Ok(())
+                Err(sqlx::Error::Protocol("locking probe finished".into()))
             },
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(matches!(locking_probe, Err(sqlx::Error::Protocol(reason)) if reason == "locking probe finished"));
+        let published = run_publish(process_lists(&reviews), review_hash).await.unwrap();
+        assert_eq!(published["published"], true);
+        assert_eq!(published["lists"], checked["lists"]);
+        assert_eq!(published["review_hash"], review_hash);
         let live: Vec<(String, Value)> = sqlx::query_as(read_roots)
             .fetch_all(&replica)
             .await
