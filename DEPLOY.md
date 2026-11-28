@@ -810,6 +810,25 @@ replication privileges with the operator. The Station primary and signing databa
 roles each need EXECUTE on `pg_catalog.pg_control_system()` in their respective
 databases. Restrict network access to the replicas and operators.
 
+For recovery publication, apply [the publication guard](relay-server/signing-store/publication-guard.sql)
+once to the same schema as the signing-store owner. Give the recovery operator
+SELECT on `station_signing_publication_guard` and UPDATE on its `attempt`,
+`origin`, `generation`, and `primary_store` columns. Ordinary signers keep the grants above.
+The database lets in-flight signing reservations finish before publication
+checks the clocks and refuses new reservations and key registrations until
+the primary recovery transaction settles.
+
+After a publisher disconnects, use
+`station-relay-server admin delegated-recovery release-signing-hold` with the
+operator's database connections and the current Station origin and generation.
+It checks the primary fence before clearing the observed signing hold. An active
+publisher keeps its hold. A retry after that publisher finishes is safe.
+The command changes only signing-store availability. Read the primary
+publication receipts to determine whether the feeds were installed. If the
+primary was replaced while a hold was active, reconcile it against the original
+cluster, database and fence table. If those are lost, keep signing drained
+until the operator has accounted for the old publisher and its commit outcome.
+
 A new key registers before its provisioning transaction commits. The signer durably
 reserves a batch of elapsed milliseconds before it produces the first signature.
 A failed or uncertain publication can consume a range. A retry waits for later elapsed

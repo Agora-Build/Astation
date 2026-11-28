@@ -7,6 +7,14 @@ use std::time::Duration;
 
 pub(crate) struct SigningCeilings(PgPool);
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct PublicationHold {
+    pub attempt: String,
+    pub origin: String,
+    pub generation: i64,
+    pub primary_store: String,
+}
+
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub(crate) struct Reservation {
     pub service_id: String,
@@ -89,6 +97,41 @@ impl SigningCeilings {
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM station_service_signing_ceilings WHERE highest_ms > 0)")
             .fetch_one(&self.0)
             .await
+    }
+
+    pub(crate) async fn publication_hold(&self) -> Result<Option<PublicationHold>, sqlx::Error> {
+        sqlx::query_as("SELECT attempt::text,origin,generation,primary_store FROM station_signing_publication_guard
+            WHERE singleton AND attempt IS NOT NULL")
+            .fetch_optional(&self.0).await
+    }
+
+    /// Commit independently, before inspecting any clocks. An interrupted
+    /// publisher leaves the store closed until the primary transaction settles.
+    pub(crate) async fn hold_for_publication(&self, origin: &str, generation: i64, primary_store: &str) -> Result<(), sqlx::Error> {
+        let result = sqlx::query("UPDATE station_signing_publication_guard SET attempt=$1::text::uuid,origin=$2,generation=$3,primary_store=$4
+            WHERE singleton AND attempt IS NULL AND EXISTS (
+                SELECT 1 FROM pg_catalog.pg_trigger t
+                JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+                JOIN pg_catalog.pg_class g ON g.relnamespace=c.relnamespace
+                WHERE c.oid='station_service_signing_ceilings'::regclass
+                  AND g.oid='station_signing_publication_guard'::regclass AND g.relpersistence='p'
+                  AND t.tgname='station_check_signing_publication' AND t.tgenabled='A'
+                  AND t.tgfoid='station_check_signing_publication()'::regprocedure
+                  AND t.tgtype=22 AND t.tgqual IS NULL AND t.tgattr=''::int2vector)")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(origin).bind(generation).bind(primary_store)
+            .execute(&self.0).await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol("signing store cannot hold recovery publication".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear_publication_hold(&self, hold: &PublicationHold) -> Result<(), sqlx::Error> {
+        // An earlier cleanup must never release a subsequent attempt.
+        sqlx::query("UPDATE station_signing_publication_guard SET attempt=NULL,origin=NULL,generation=NULL,primary_store=NULL
+            WHERE singleton AND (attempt,origin,generation,primary_store)=($1::text::uuid,$2,$3,$4)")
+            .bind(&hold.attempt).bind(&hold.origin).bind(hold.generation).bind(&hold.primary_store).execute(&self.0).await?;
+        Ok(())
     }
 
     /// Discover lists even when their entire Station recovery root was lost.

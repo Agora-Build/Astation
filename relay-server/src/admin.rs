@@ -9,6 +9,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin migrate-room-owners <genesis_hash>\n\
        station-relay-server admin delegated-recovery status|fence\n\
+       station-relay-server admin delegated-recovery release-signing-hold\n\
        station-relay-server admin delegated-recovery list-roots [after_genesis_hash]\n\
        station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>\n\
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
@@ -175,7 +176,7 @@ async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std:
 async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{canonical_genesis, generation, inspect, inspect_root, list_roots, Binding};
     let (fence, root, files, plan_or_hash) = match args {
-        [command] if command == "status" => (false, None, None, None),
+        [command] if matches!(command.as_str(), "status" | "release-signing-hold") => (false, None, None, None),
         [command, rest @ ..] if command == "list-roots"
             && (rest.is_empty() || rest.len() == 1 && canonical_genesis(&rest[0])) =>
         {
@@ -248,6 +249,18 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if args[0] == "release-signing-hold" {
+        let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+            eprintln!("release-signing-hold requires the independent signing database");
+            return 1;
+        };
+        return match crate::remote_api::recovery::delegated_recovery::plan::publication::reconcile_signing_hold(
+            &pool, &binding, &signing,
+        ).await {
+            Ok(()) => { println!("Signing hold reconciled."); 0 }
+            Err(_) => { eprintln!("Check the Station generation, active publication and signing database."); 1 }
+        };
+    }
     if args[0] == "list-roots" {
         let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
             eprintln!("list-roots requires the independent signing database");

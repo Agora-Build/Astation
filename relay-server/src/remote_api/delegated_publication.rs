@@ -18,10 +18,53 @@ pub(super) struct AccountCut {
 struct Publication<'a> {
     tx: Transaction<'a, Postgres>,
     binding: Binding,
+    primary_store: String,
 }
 
-/// Run final verification inside the transaction which installs every feed.
-/// The caller must keep the independent signing inventory stable through commit.
+async fn lock_generation(
+    db: &mut PgConnection,
+    binding: &Binding,
+) -> Result<(bool, String), sqlx::Error> {
+    // The origin and generation can exist in another restored database. Its
+    // row lock cannot establish that a publisher on this primary finished.
+    sqlx::query_as(
+        "SELECT ready, jsonb_build_array(
+        (SELECT system_identifier::text FROM pg_catalog.pg_control_system()),
+        (SELECT oid::text FROM pg_catalog.pg_database WHERE datname=current_database()),
+        tableoid::text)::text FROM station_delegated_recovery
+        WHERE origin=$1 AND generation=$2 FOR UPDATE NOWAIT",
+    )
+    .bind(&binding.origin)
+    .bind(binding.generation)
+    .fetch_one(db)
+    .await
+}
+
+/// An attempt visible before obtaining the primary row lock belongs to a
+/// finished or rolled-back publisher once we hold that row. A new publisher
+/// always creates a fresh attempt. The conditional clear cannot release it.
+pub(crate) async fn reconcile_signing_hold(
+    pool: &PgPool,
+    binding: &Binding,
+    signing: &SigningCeilings,
+) -> Result<(), sqlx::Error> {
+    let Some(hold) = signing.publication_hold().await? else {
+        return Ok(());
+    };
+    if hold.origin != binding.origin || hold.generation > binding.generation {
+        return Err(invalid());
+    }
+    let mut tx = pool.begin().await?;
+    let (_, primary_store) = lock_generation(&mut tx, binding).await?;
+    if hold.primary_store != primary_store {
+        return Err(invalid());
+    }
+    signing.clear_publication_hold(&hold).await?;
+    tx.commit().await
+}
+
+/// Run final verification and install every feed while the independent
+/// signing inventory is durably held, including if either connection dies.
 pub(super) async fn publish_after_verification(
     pool: &PgPool,
     binding: &Binding,
@@ -32,9 +75,24 @@ pub(super) async fn publish_after_verification(
     if portal.station_origin != binding.origin || portal.validate().is_err() {
         return Err(invalid());
     }
-    let mut publication = Publication::begin(pool, binding).await?;
-    let cuts = verify(&mut publication.tx).await?;
-    publication.commit(cuts, portal, signing).await
+    reconcile_signing_hold(pool, binding, signing).await?;
+    let result = async {
+        let mut publication = Publication::begin(pool, binding).await?;
+        signing
+            .hold_for_publication(
+                &binding.origin,
+                binding.generation,
+                &publication.primary_store,
+            )
+            .await?;
+        let cuts = verify(&mut publication.tx).await?;
+        publication.commit(cuts, portal, signing).await
+    }
+    .await;
+    // An uncertain primary commit can still be running. Reacquiring its
+    // row lock distinguishes that case from a safe cleanup on either outcome.
+    reconcile_signing_hold(pool, binding, signing).await?;
+    result
 }
 
 impl Publication<'_> {
@@ -43,10 +101,8 @@ impl Publication<'_> {
         sqlx::query("SET LOCAL statement_timeout = '5s'")
             .execute(&mut *tx)
             .await?;
-        let closed: Option<bool> = sqlx::query_scalar(
-            "SELECT NOT ready FROM station_delegated_recovery WHERE origin=$1 AND generation=$2 FOR UPDATE",
-        ).bind(&binding.origin).bind(binding.generation).fetch_optional(&mut *tx).await?;
-        if closed != Some(true) {
+        let (ready, primary_store) = lock_generation(&mut tx, binding).await?;
+        if ready {
             return Err(invalid());
         }
         // A root created between enumeration and reopening would have missed
@@ -60,6 +116,7 @@ impl Publication<'_> {
         Ok(Self {
             tx,
             binding: binding.clone(),
+            primary_store,
         })
     }
 
@@ -195,9 +252,114 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires two independent local PostgreSQL clusters"]
+    async fn postgres_delegated_signing_hold_survives_publisher_loss_and_reconciles_on_a_replica() {
+        let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+        let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 3).await;
+        sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+            .execute(&external.pool)
+            .await
+            .unwrap();
+        let signer =
+            || SigningCeilings::connect(&db.pool, (*external.pool.connect_options()).clone());
+        let first = signer().await.unwrap();
+        let second = signer().await.unwrap();
+        let fence = Binding::new("https://station-dev.agora.build", 2).unwrap();
+        fence.initialize(&db.pool, true).await.unwrap();
+        first
+            .register_new_key("account", "genesis", "service", "key")
+            .await
+            .unwrap();
+        assert!(first
+            .hold_for_publication(&fence.origin, fence.generation, "unused")
+            .await
+            .is_err());
+        sqlx::raw_sql(include_str!("../../signing-store/publication-guard.sql"))
+            .execute(&external.pool)
+            .await
+            .unwrap();
+
+        let mut writing = external.pool.begin().await.unwrap();
+        sqlx::query("UPDATE station_service_signing_ceilings SET highest_ms=1")
+            .execute(&mut *writing)
+            .await
+            .unwrap();
+        let publisher = db.reconnect(1).await;
+        let publication = Publication::begin(&publisher, &fence).await.unwrap();
+        {
+            let freeze = first.hold_for_publication(
+                &fence.origin,
+                fence.generation,
+                &publication.primary_store,
+            );
+            tokio::pin!(freeze);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze)
+                    .await
+                    .is_err()
+            );
+            writing.commit().await.unwrap();
+            freeze.await.unwrap();
+        }
+        drop(first);
+        let previous = second.publication_hold().await.unwrap().unwrap();
+        let reserve = || second.reserve("account", "genesis", "service", "key", 1, 2..=2);
+        assert!(reserve().await.is_err());
+        assert!(reconcile_signing_hold(&db.pool, &fence, &second)
+            .await
+            .is_err());
+        drop(publication);
+        publisher.close().await;
+        assert!(reserve().await.is_err());
+        let unrelated = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 1).await;
+        fence.initialize(&unrelated.pool, true).await.unwrap();
+        assert!(reconcile_signing_hold(&unrelated.pool, &fence, &second)
+            .await
+            .is_err());
+        unrelated.cleanup().await;
+        let stale = Binding::new(&fence.origin, 1).unwrap();
+        assert!(reconcile_signing_hold(&db.pool, &stale, &second)
+            .await
+            .is_err());
+        let other = Binding::new("https://elsewhere.example", 2).unwrap();
+        assert!(reconcile_signing_hold(&db.pool, &other, &second)
+            .await
+            .is_err());
+        reconcile_signing_hold(&db.pool, &fence, &second)
+            .await
+            .unwrap();
+        assert!(second.publication_hold().await.unwrap().is_none());
+        let next = Publication::begin(&db.pool, &fence).await.unwrap();
+        second
+            .hold_for_publication(&fence.origin, fence.generation, &next.primary_store)
+            .await
+            .unwrap();
+        second.clear_publication_hold(&previous).await.unwrap();
+        assert!(reserve().await.is_err());
+        next.tx.rollback().await.unwrap();
+        reconcile_signing_hold(&db.pool, &fence, &second)
+            .await
+            .unwrap();
+        reserve().await.unwrap();
+        assert!(
+            !inspect(&db.pool, &fence.origin)
+                .await
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        db.cleanup().await;
+        external.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires two independent local PostgreSQL clusters"]
     async fn postgres_delegated_publication_commits_every_feed_receipt_and_fence_together() {
         let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
         sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+            .execute(&external.pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../signing-store/publication-guard.sql"))
             .execute(&external.pool)
             .await
             .unwrap();
@@ -366,6 +528,18 @@ mod tests {
 
         let checked = cuts(&reviews);
         publish_after_verification(&db.pool, &fence, &runtime.binding, signing, async |_| {
+            assert!(
+                signing
+                    .register_new_key(
+                        first.log.account_id(),
+                        &missing,
+                        "late-service",
+                        &"e".repeat(64)
+                    )
+                    .await
+                    .is_err(),
+                "registration changed the signing inventory during publication"
+            );
             for i in 0..2 {
                 assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
             }
