@@ -9,6 +9,7 @@ import Combine
 final class IntegrationApprovalViewController: NSViewController {
     private let hub: AstationHubManager
     private let status = NSTextField(wrappingLabelWithString: "Load integration requests for your selected Station.")
+    private let pendingElsewhere = NSTextField(wrappingLabelWithString: "")
     private let picker = NSPopUpButton()
     private let hosts = NSStackView()
     private let hostStatus = NSTextField(wrappingLabelWithString: "")
@@ -28,6 +29,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private let relayOnlyButton = NSButton(title: "Use Selected Relay Only…", target: nil, action: nil)
     private let relayStatus = NSTextField(wrappingLabelWithString: "")
     private var policySubscription: AnyCancellable?
+    private var accountSubscription: AnyCancellable?
     private var hostButtons: [(String, NSButton)] = []
     private var records: [PortalIntegrationRecord] = []
     private var auth: AstationAccountAuth?
@@ -67,6 +69,8 @@ final class IntegrationApprovalViewController: NSViewController {
         reviewText.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         picker.setAccessibilityLabel("Integration request")
         if picker.numberOfItems == 0 { picker.addItem(withTitle: "Load requests to choose an integration") }
+        pendingElsewhere.isHidden = true
+        pendingElsewhere.isSelectable = true
         status.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [loadButton, reviewButton, approveButton])
         actions.spacing = 10
@@ -74,7 +78,7 @@ final class IntegrationApprovalViewController: NSViewController {
         let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions,
             NSTextField(labelWithString: "Integration request"), picker,
             setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, markPermission, reviewText, reviewAgainButton,
-            revokeButton, interruptButton, removeButton, status])
+            revokeButton, interruptButton, removeButton, status, pendingElsewhere])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = NSView(); scroll.documentView = document
@@ -90,7 +94,7 @@ final class IntegrationApprovalViewController: NSViewController {
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
         ])
-        for field in [intro, sessions, projects, reviewText, status, relayStatus, hostStatus] {
+        for field in [intro, sessions, projects, reviewText, status, relayStatus, hostStatus, pendingElsewhere] {
             field.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         picker.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -105,6 +109,10 @@ final class IntegrationApprovalViewController: NSViewController {
         relayOnlyButton.target = self; relayOnlyButton.action = #selector(changeRelayPolicy)
         setupButton.target = self; setupButton.action = #selector(setupSecurity)
         policySubscription = hub.$relayOnlyPolicyStatus.sink { [weak self] value in self?.relayStatus.stringValue = value }
+        accountSubscription = hub.integrationAccountChanges.receive(on: DispatchQueue.main).sink { [weak self] in
+            guard let self, self.contextCurrent?() == false else { return }
+            self.cancelPending()
+        }
         render()
     }
 
@@ -118,6 +126,8 @@ final class IntegrationApprovalViewController: NSViewController {
         coordinator = nil
         securityMissingOnStation = false
         approvedScope = nil
+        pendingElsewhere.stringValue = ""
+        pendingElsewhere.isHidden = true
         records = []; picker.removeAllItems(); picker.addItem(withTitle: "Load requests to choose an integration")
         status.stringValue = "Load integration requests for your selected Station."
         showScope(hosts: [], sessions: nil, projects: nil, approved: false)
@@ -278,7 +288,8 @@ final class IntegrationApprovalViewController: NSViewController {
                 }
                 let portal = try PortalIntegrationHTTP(configuration: config, portalOrigin: settings.portalURL,
                     ownerAccount: owner, accessToken: { try await auth.accessToken() })
-                let records = try await portal.owned(stationOrigin: origin)
+                let overview = try await portal.accessOverview(stationOrigin: origin)
+                let records = overview.selected
                 guard epoch == generation, accountEpoch == hub.integrationAccountGeneration,
                       hub.signedInAccount == owner, hub.stationRelayUrl == origin, !Task.isCancelled else { throw AccountLoginError.changed }
                 contextCurrent = { [weak self, weak hub = self.hub] in
@@ -286,8 +297,7 @@ final class IntegrationApprovalViewController: NSViewController {
                         && hub?.accountSignInRequired == false && hub?.stationRelayUrl == origin
                 }
                 self.portal = portal
-                hasLoadedRequests = true
-                setRequests(records, selectedID: selectedIntegrationID)
+                try presentPortalList(overview, current: contextCurrent ?? { false })
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
                 hostButtons = []
                 if !records.isEmpty, records.allSatisfy({ $0.stationRemoved == true }) {
@@ -317,6 +327,17 @@ final class IntegrationApprovalViewController: NSViewController {
                     current: contextCurrent ?? { false }, selectedID: selectedIntegrationID)
             } catch { fail(error, epoch: epoch) }
         }
+    }
+
+    func presentPortalList(_ overview: (selected: [PortalIntegrationRecord], pendingElsewhere: [PortalIntegrationRecord]),
+                           current: () -> Bool) throws {
+        guard current() else { throw AccountLoginError.changed }
+        hasLoadedRequests = true
+        let lines = overview.pendingElsewhere.map { "\($0.name) · \($0.stationOrigin)" }
+        pendingElsewhere.stringValue = lines.isEmpty ? "" :
+            (["Waiting for hosts to confirm revocation at removed Stations"] + lines).joined(separator: "\n")
+        pendingElsewhere.isHidden = lines.isEmpty
+        setRequests(overview.selected, selectedID: selectedIntegrationID)
     }
 
     private func setRequests(_ records: [PortalIntegrationRecord], selectedID: String?) {
