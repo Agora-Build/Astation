@@ -734,7 +734,9 @@ async fn postgres_delegated_inventory_recovers_native_only_lists_across_report_c
         .bind(&prior.issuer).bind(&prior.portal_origin).bind(&prior.station_origin)
         .bind(hash(66)).bind(vec![0u8; 32]).bind(report).execute(&db.pool).await.unwrap();
     save_release_checkpoint(&store, &current, json!([row(1)]),
-        Some(json!([release_for(&row(67), "pending")]))).await;
+        Some(json!([release_for(&row(67), "pending"),release_for(&row(68), "checkpoint-only")]))).await;
+    sqlx::query("DELETE FROM station_binding_release_requests WHERE release_id='checkpoint-only'")
+        .execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'member','{}')")
         .bind(hash(1)).execute(&db.pool).await.unwrap();
     signing.register_new_key("native-account", &hash(2), "service", "key").await.unwrap();
@@ -746,8 +748,8 @@ async fn postgres_delegated_inventory_recovers_native_only_lists_across_report_c
     let second = list_roots(&replica, &fence, &signing, Some(&current), Some(&hash(64))).await.unwrap();
     assert!(second["next_after"].is_null());
     let rows: Vec<_> = [&first, &second].iter().flat_map(|p| p["roots"].as_array().unwrap()).collect();
-    assert_eq!(rows.len(), 67);
-    for (i, result) in (1..=67).zip(rows) {
+    assert_eq!(rows.len(), 68);
+    for (i, result) in (1..=68).zip(rows) {
         assert_eq!(*result, json!({"genesis_hash":hash(i),"root_present":i==1,
             "registered_keys":u64::from(i==2),"keys_with_reservations":0}));
     }

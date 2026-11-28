@@ -49,10 +49,12 @@ pub(super) async fn list(
         let source: FeedBinding = serde_json::from_str(&key).map_err(|_| invalid_root())?;
         source.validate().map_err(|_| invalid_root())?;
         let policy = PolicyStore::decode_checkpoint(&source, Some(saved)).map_err(|_| invalid_root())?;
-        if let Some(bindings) = policy.portal_snapshot.and_then(|cut| cut.bindings) {
-            for row in bindings {
-                if after.is_none_or(|cursor| row.genesis_hash.as_str() > cursor) {
-                    roots.insert(row.genesis_hash);
+        if let Some(cut) = policy.portal_snapshot {
+            let bindings = cut.bindings.into_iter().flatten().map(|row| row.genesis_hash);
+            let releases = cut.pending_releases.into_iter().flatten().map(|row| row.genesis_hash);
+            for genesis in bindings.chain(releases) {
+                if after.is_none_or(|cursor| genesis.as_str() > cursor) {
+                    roots.insert(genesis);
                     if roots.len() > limit {
                         roots.pop_last();
                     }
