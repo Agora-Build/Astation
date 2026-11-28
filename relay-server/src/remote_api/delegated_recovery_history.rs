@@ -114,6 +114,7 @@ pub(super) async fn inspection(
     let mut found_current = false;
     let mut journals = super::author_history::JournalHistory::default();
     let mut current_authors = None;
+    let mut candidate_services_hash = None;
     let mut prior_authors = Vec::new();
     let mut new_export_digests = BTreeMap::new();
     let mut confirmation_hashes = Vec::new();
@@ -272,10 +273,15 @@ pub(super) async fn inspection(
             add_record(&mut records, &record, recovery_record_review(&record, log))
         }).await?;
         if !components.is_empty() {
-            if !current_plan {
+            let hash = source_hash(&json!(components))?;
+            if current_plan {
+                // Station signs after the native author round. Its own output
+                // changes the snapshot, while the confirmed author inputs stay fixed.
+                candidate_services_hash = Some(hash);
+            } else {
                 retained_feed_ids.insert(checkpoint.candidate_feed_id.clone());
+                commitment["service_components"] = hash.into();
             }
-            commitment["service_components"] = source_hash(&json!(components))?.into();
         }
         if heads.len() > 1 {
             commitment["observed_membership"] = source_hash(&latest.to_stored())?.into();
@@ -327,7 +333,7 @@ pub(super) async fn inspection(
             stops::review(&record, log, &binding.origin)?,
         )?;
     }
-    let report = json!({
+    let mut report = json!({
         "checkpoints": summaries,
         "membership_gaps": membership_gaps,
         "observed_service_keys": service_keys.into_iter().map(|((service, key), highest)| json!({
@@ -339,6 +345,9 @@ pub(super) async fn inspection(
         "complete_history": false,
         "signing_clock_complete": false,
     });
+    if let Some(hash) = candidate_services_hash {
+        report["candidate_service_components_hash"] = hash.into();
+    }
     Ok(History {
         review: report,
         signed: records

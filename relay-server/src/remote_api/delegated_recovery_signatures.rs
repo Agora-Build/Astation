@@ -189,7 +189,7 @@ async fn load(
     Ok((rows, lower_bounds))
 }
 
-fn unsigned_id(report: &Value, id: &str) -> bool {
+pub(super) fn unsigned_id(report: &Value, id: &str) -> bool {
     report["native_archives"]["archives"]
         .as_array()
         .into_iter()

@@ -303,6 +303,9 @@ async fn review_evidence(
     if let Some(confirmations) = report.get("author_confirmation_hash") {
         reconstruction["author_confirmation_hash"] = confirmations.clone();
     }
+    if let Some(services) = report["known_history"].get("candidate_service_components_hash") {
+        reconstruction["candidate_service_components_hash"] = services.clone();
+    }
     // Invalidate components staged before retained copies were counted as stops.
     if report["recovery_signatures"]["records"].as_array().is_some_and(|rows| !rows.is_empty()) {
         reconstruction["includes_signed_copies"] = true.into();

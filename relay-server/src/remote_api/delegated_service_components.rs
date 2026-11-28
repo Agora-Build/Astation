@@ -124,13 +124,20 @@ pub(crate) async fn retain(
     tx: &mut Transaction<'_, Postgres>,
     binding: &Binding,
     genesis: &str,
-    plan_id: &str,
-    source: &str,
-    bodies_hash: &str,
+    reviewed: &Value,
     records: &[ControlRecord],
 ) -> Result<Value, sqlx::Error> {
-    let (plan, log, _) = checkpoint(tx, binding, genesis, false).await?;
-    if plan.plan_id != plan_id || records.is_empty() || records.len() > MAX_RECORDS {
+    let (plan, log, mut current) = checkpoint(tx, binding, genesis, false).await?;
+    let plan_id = &plan.plan_id;
+    let draft = &reviewed["service_drafts"];
+    let source = draft["source_hash"].as_str().ok_or_else(invalid)?;
+    let bodies_hash = draft["bodies_hash"].as_str().ok_or_else(invalid)?;
+    if reviewed["plan_id"] != *plan_id
+        || reviewed["candidate_feed_id"] != plan.candidate_feed_id
+        || super::service_drafts::review_source(reviewed)? != source
+        || records.is_empty()
+        || records.len() > MAX_RECORDS
+    {
         return Err(invalid());
     }
     let signed = Value::Array(records.iter().map(|r| r.object().to_json()).collect());
@@ -163,6 +170,17 @@ pub(crate) async fn retain(
         "SELECT bodies_hash,bodies FROM station_delegated_service_drafts WHERE plan_id=$1 AND source_hash=$2 FOR SHARE",
     ).bind(plan_id).bind(source).fetch_one(&mut **tx).await?;
     if saved.0 != bodies_hash || source_hash(&saved.1)? != bodies_hash {
+        return Err(invalid());
+    }
+    let known = super::review_evidence(tx, &plan, &log, binding, &mut current, false).await?;
+    if current["reconstruction_hash"] != reviewed["reconstruction_hash"]
+        || !super::covers_retained_membership(&current)
+        || known.signed.len() + records.len() > MAX_RECORDS
+        || records.iter().any(|record| {
+            known.signed.contains_key(record.record_id())
+                || super::signatures::unsigned_id(&current, record.record_id())
+        })
+    {
         return Err(invalid());
     }
 

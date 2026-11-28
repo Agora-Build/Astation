@@ -118,6 +118,14 @@ fn batches(review: &Value) -> Result<DraftBatches<'_>, sqlx::Error> {
     Ok(DraftBatches { ready, unresolved })
 }
 
+pub(super) fn review_source(review: &Value) -> Result<String, sqlx::Error> {
+    source_hash(&json!({
+        "reconstruction":review["reconstruction_hash"],
+        "service_clock":review["service_clock_evidence_hash"],
+        "portal":review["portal_service_evidence_hash"],
+    }))
+}
+
 pub(super) async fn prepare(
     db: &mut PgConnection,
     plan: &Prepared,
@@ -130,11 +138,7 @@ pub(super) async fn prepare(
         return Ok(json!({"status":"awaiting_policy","observation":observation}));
     }
     let DraftBatches { ready, unresolved } = batches(review)?;
-    let source = source_hash(&json!({
-        "reconstruction":review["reconstruction_hash"],
-        "service_clock":review["service_clock_evidence_hash"],
-        "portal":review["portal_service_evidence_hash"],
-    }))?;
+    let source = review_source(review)?;
     let now = super::super::super::now().wall_ms;
     // Only elapsed milliseconds can be used. A future reservation can become
     // usable without any change to the Portal checkpoint or recovery evidence.

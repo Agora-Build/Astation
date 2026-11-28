@@ -1139,6 +1139,10 @@ and membership head at acceptance. An operator can recover that receipt from
 `known_history.checkpoints[].service_components` after a lost response,
 including after the independent clock advances and a replica prepares a new
 draft. The original records also remain available when a plan is abandoned.
+The current plan's service signatures change its reconstruction hash. The
+native author round stays bound to the evidence the managers reviewed before
+Station signed. When a later plan starts, these service signatures are part
+of its historical inputs.
 Station verifies each signature at its acceptance head, carries signed
 revocations and interrupts into the next review, and accounts for each key's
 highest observed signature. A retained receipt alone grants no publication
