@@ -18,6 +18,8 @@ pub(crate) mod reporting_history;
 pub(crate) mod stops;
 #[path = "delegated_service_drafts.rs"]
 mod service_drafts;
+#[path = "delegated_service_components.rs"]
+pub(crate) mod service_components;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
@@ -300,6 +302,9 @@ async fn review_evidence(
     });
     if let Some(confirmations) = report.get("author_confirmation_hash") {
         reconstruction["author_confirmation_hash"] = confirmations.clone();
+    }
+    if let Some(services) = report["known_history"].get("candidate_service_components_hash") {
+        reconstruction["candidate_service_components_hash"] = services.clone();
     }
     // Invalidate components staged before retained copies were counted as stops.
     if report["recovery_signatures"]["records"].as_array().is_some_and(|rows| !rows.is_empty()) {
