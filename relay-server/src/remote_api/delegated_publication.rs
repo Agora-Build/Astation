@@ -182,6 +182,16 @@ impl Publication<'_> {
             )
             .await?;
             let feed = &review["replacement_feed"];
+            let authors = &review["known_authors"];
+            if !authors["pending_final_reports"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                || !authors["journal_gaps"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            {
+                return Err(invalid());
+            }
             if review["plan_id"] != cut.plan_id
                 || review["membership_head"] != cut.membership_head
                 || feed["status"] != "staged"
@@ -258,7 +268,13 @@ mod tests {
         station_integrations::tests::{fixture_with_ceiling_cluster, PRINCIPAL},
         test_database::TestDatabase,
     };
-    use atem_client::membership::Head;
+    use atem_client::{
+        member_report::{
+            sign_signer_report, signer_report_body, JournalView, SignerReportChallenge,
+        },
+        membership::Head,
+        KeyId,
+    };
     use axum::http::StatusCode;
     use serde_json::json;
 
@@ -281,6 +297,52 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    async fn report_own_journal(db: &PgPool, fence: &Binding, review: &Value, fixture: &Fixture) {
+        let genesis = fixture.log.genesis_hash().to_hex();
+        let signer = "member:phone";
+        let slot = "native";
+        let request = plan::signer_challenges::Request::parse(&json!({
+            "signer":signer,"slot":slot,"expected":fixture.log.head().to_json(),
+            "recovery":{"generation":fence.generation.to_string(),"plan_id":review["plan_id"],
+                "candidate_feed_id":review["candidate_feed_id"],"source_hash":review["source_hash"],
+                "evidence_hash":review["evidence_hash"]}
+        }))
+        .unwrap();
+        let challenge = plan::signer_challenges::mint(db, fence, &genesis, PRINCIPAL, request)
+            .await
+            .ok()
+            .expect("mint journal challenge");
+        let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
+        let journal = JournalView {
+            id: [1; 16],
+            since: 1,
+            revision: 1,
+            records: vec![],
+            drafts: vec![],
+        };
+        let body = signer_report_body(
+            &fixture.log,
+            &challenge,
+            signer,
+            slot,
+            &fence.origin,
+            &journal,
+            challenge.issued_at(),
+        )
+        .unwrap();
+        let signed = sign_signer_report(&fixture.keys, &KeyId::new("manager"), &body).unwrap();
+        plan::signer_reports::submit(
+            db,
+            fence,
+            &genesis,
+            PRINCIPAL,
+            &json!({"report":signed.to_json(),"records":[]}),
+        )
+        .await
+        .ok()
+        .expect("accept signed journal report");
     }
 
     #[tokio::test]
@@ -448,6 +510,41 @@ mod tests {
                 .unwrap(),
             );
         }
+        let signing = recovery.signing_ceilings.get().unwrap();
+        let unconfirmed = cuts(&reviews);
+        assert!(
+            publish_after_verification(
+                &db.pool,
+                &fence,
+                &runtime.binding,
+                signing,
+                &runtime.vault,
+                async move |_| Ok(unconfirmed)
+            )
+            .await
+            .is_err(),
+            "published before the managers reported"
+        );
+        for (review, fixture) in reviews.iter_mut().zip([&first, &second]) {
+            assert_eq!(
+                review["known_authors"]["pending_final_reports"],
+                json!([{
+                    "signer":"member:phone", "journal_id":null, "reason":"no_report"
+                }])
+            );
+            report_own_journal(&db.pool, &fence, review, fixture).await;
+            *review = plan::prepare_with_sources(
+                &db.pool,
+                &fence,
+                &fixture.log.genesis_hash().to_hex(),
+                Some(signing),
+                Some(&runtime.binding),
+                Some(&runtime.vault),
+            )
+            .await
+            .unwrap();
+            assert_eq!(review["known_authors"]["pending_final_reports"], json!([]));
+        }
         // An authenticated Portal checkpoint can advance after staging without
         // changing the membership head, the old feed or the signing inventory.
         let before = runtime.policies.load(&runtime.binding).await.unwrap();
@@ -463,7 +560,6 @@ mod tests {
             .await
             .unwrap();
         let old_cuts = cuts(&reviews);
-        let signing = recovery.signing_ceilings.get().unwrap();
         assert!(
             publish_after_verification(
                 &db.pool,

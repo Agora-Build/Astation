@@ -1,6 +1,6 @@
 //! Manager authority established by the signed list, including prior managers.
-use atem_client::member_report::JournalSummary;
-use atem_client::membership::{Action, MemberStatus, Membership, RecoveryState, Role, RolesChange};
+use atem_client::member_report::{JournalSummary, VerifiedSignerReport};
+use atem_client::membership::{Action, Head, MemberStatus, Membership, RecoveryState, Role, RolesChange};
 use atem_client::Hash32;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +51,46 @@ pub(super) fn inventory(log: &Membership) -> BTreeMap<String, Value> {
             )
         })
         .collect()
+}
+
+#[derive(Default)]
+pub(super) struct AuthorRound {
+    // Reports arrive here in challenge order. A successor may report the
+    // same exclusive journal, so keep its latest head and round per journal.
+    signers: BTreeMap<String, BTreeMap<[u8; 16], Option<(Head, Hash32)>>>,
+}
+
+impl AuthorRound {
+    pub(super) fn require(&mut self, signer: &str) {
+        self.signers.entry(signer.to_owned()).or_default();
+    }
+
+    pub(super) fn observe(&mut self, report: &VerifiedSignerReport, current_plan: bool) {
+        let journals = self.signers.entry(report.signer.clone()).or_default();
+        let latest = journals.entry(report.journal.id).or_default();
+        if current_plan {
+            *latest = Some((report.head, report.recovery.evidence_hash()));
+        }
+    }
+
+    pub(super) fn pending(&self, head: Head, base: Hash32) -> Vec<Value> {
+        let mut pending = Vec::new();
+        for (signer, journals) in &self.signers {
+            if journals.is_empty() {
+                pending.push(json!({"signer":signer,"journal_id":null,"reason":"no_report"}));
+            }
+            for (id, latest) in journals {
+                let reason = match latest {
+                    None => "missing_current_report",
+                    Some((signed, _)) if *signed != head => "membership_changed",
+                    Some((_, signed)) if *signed != base => "evidence_changed",
+                    Some(_) => continue,
+                };
+                pending.push(json!({"signer":signer,"journal_id":atem_client::encoding::b64u(id),"reason":reason}));
+            }
+        }
+        pending
+    }
 }
 
 /// A journal ID survives an SDK process restart. Compare its signed creation

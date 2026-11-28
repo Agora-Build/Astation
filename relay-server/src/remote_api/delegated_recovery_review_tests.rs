@@ -832,6 +832,11 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), second).await.0, StatusCode::OK);
     let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
     assert_ne!(first["evidence_hash"], initial["evidence_hash"]);
+    let journal_id = atem_client::encoding::b64u(&[1;16]);
+    assert_eq!(first["known_authors"]["pending_final_reports"], json!([
+        {"signer":former,"journal_id":null,"reason":"no_report"},
+        {"signer":active,"journal_id":journal_id,"reason":"evidence_changed"}
+    ]));
     // The other author already approved the prior round. It can finish that
     // outstanding request after discovery, then confirm the enlarged base.
     let original_receipt = post_recovery(&other_app, &report_path, Some("alice"), initial_submission.clone()).await;
@@ -839,6 +844,10 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_eq!(cut["evidence_hash"], first["evidence_hash"]);
     assert_ne!(cut["reconstruction_hash"], first["reconstruction_hash"]);
+    assert_eq!(cut["known_authors"]["pending_final_reports"], json!([
+        {"signer":former,"journal_id":journal_id,"reason":"evidence_changed"},
+        {"signer":active,"journal_id":journal_id,"reason":"evidence_changed"}
+    ]));
     assert_eq!(cut["recovery_signatures"]["records"][0]["exported_at_cut"], false);
     assert!(plan::snapshot_stops::stage(&replica, &binding, &genesis,
         cut["reconstruction_hash"].as_str().unwrap()).await.is_err());
@@ -851,6 +860,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let resumed = database.reconnect(2).await;
     let confirmed = plan::prepare(&resumed, &binding, &genesis).await.unwrap();
     assert_eq!(&confirmed["evidence_hash"], hash);
+    assert_eq!(confirmed["known_authors"]["pending_final_reports"], json!([]));
     assert_ne!(confirmed["reconstruction_hash"], cut["reconstruction_hash"]);
     let mapped = &confirmed["recovery_signatures"]["records"][0];
     assert_eq!(mapped["current_review"], false);

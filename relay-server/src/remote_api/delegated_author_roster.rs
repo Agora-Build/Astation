@@ -140,6 +140,7 @@ pub(crate) async fn compare(
     comparison["genesis_hash"] = json!(genesis);
     comparison["plan_id"] = json!(plan);
     comparison["reconstruction_hash"] = json!(export.reconstruction_hash);
+    comparison["pending_final_reports"] = report["known_authors"]["pending_final_reports"].clone();
     tx.commit().await?;
     Ok(comparison)
 }
@@ -247,6 +248,7 @@ fn compare_members(
     }
     let mut missing_early_ranges = Vec::new();
     let mut latest = BTreeMap::new();
+    let current_head = log.head().to_json();
     for (signer, member) in authors["members"].as_object().ok_or_else(invalid)? {
         let id = signer.strip_prefix("member:").ok_or_else(invalid)?;
         for report in member["reports"].as_array().ok_or_else(invalid)? {
@@ -258,9 +260,8 @@ fn compare_members(
             );
             latest.insert(
                 process,
-                report["signed_evidence_hash"]
-                    .as_str()
-                    .ok_or_else(invalid)?,
+                report["signed_evidence_hash"].as_str().ok_or_else(invalid)? == evidence_hash
+                    && report["signed_head"] == current_head,
             );
             if report["missing_early_range"] == true {
                 missing_early_ranges.push(json!({"signer": signer, "slot": report["slot"],
@@ -270,7 +271,7 @@ fn compare_members(
     }
     let confirmed: BTreeSet<_> = latest
         .into_iter()
-        .filter_map(|(p, hash)| (hash == evidence_hash).then_some(p))
+        .filter_map(|(p, current)| current.then_some(p))
         .collect();
     Ok(json!({
         "conflicted_author_slots": conflicted_authors,

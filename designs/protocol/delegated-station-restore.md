@@ -202,6 +202,15 @@ cannot account for the missing old one. An empty list describes only the
 journals observed at this Station. Participant coverage still requires the
 independent roster.
 
+The operator's `prepare` output lists `known_authors.pending_final_reports`.
+A signer with no observed journal appears with a null journal ID. Each known
+journal needs a report in the current plan, signed at the current membership
+head and naming the final evidence hash. The newest verified challenge for
+that journal determines its entry. After a newly exported stop changes the
+hash, every affected signer can see which journal needs another report.
+Publication also checks the retained journal gaps. Complete process coverage
+requires the signed process roster.
+
 In **Recovery Copies**, load the Station review and choose **Save Reviewed
 Processes**. Give the file to the recovery operator for comparison:
 

@@ -387,9 +387,13 @@ async fn review_source_evidence(
         sources["exported_records"] = json!(history.new_export_digests);
     }
     let evidence_hash = source_hash(&sources)?;
+    if operator_review {
+        let base = Hash32::from_hex(&evidence_hash).map_err(|_| invalid())?;
+        report["known_authors"]["pending_final_reports"] = json!(history.author_round.pending(log.head(), base));
+    }
     let exported_at_cut = history.latest_exports.into_iter()
-        .filter(|(base, _)| base.to_hex() == evidence_hash)
-        .flat_map(|(_, ids)| ids).collect();
+        .filter(|(head, base, _)| *head == log.head() && base.to_hex() == evidence_hash)
+        .flat_map(|(_, _, ids)| ids).collect();
     report["evidence_hash"] = evidence_hash.into();
     Ok(SignedEvidence { external_source_hash, records: history.signed, exported_at_cut })
 }
