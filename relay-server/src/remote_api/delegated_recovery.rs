@@ -169,12 +169,15 @@ pub(crate) async fn inspect(pool: &PgPool, origin: &str) -> Result<Option<Status
         .await
 }
 
-/// Compare the same page of both stores before choosing a continuation.
-/// A registration at zero can survive a failed provisioning transaction too.
+#[path = "delegated_binding_inventory.rs"]
+mod binding_inventory;
+
+/// Merge the first page from each source before choosing the continuation.
 pub(crate) async fn list_roots(
     pool: &PgPool,
     binding: &Binding,
     signing: &SigningCeilings,
+    portal: Option<&crate::integration_feed::FeedBinding>,
     after: Option<&str>,
 ) -> Result<Value, sqlx::Error> {
     use std::collections::BTreeMap;
@@ -185,6 +188,7 @@ pub(crate) async fn list_roots(
         return Err(invalid_root());
     }
     let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut *tx).await?;
     sqlx::query("SET LOCAL statement_timeout = '5s'").execute(&mut *tx).await?;
     binding.lock_mode(&mut tx, false).await?;
     let retained: Vec<String> = sqlx::query_scalar(
@@ -197,6 +201,27 @@ pub(crate) async fn list_roots(
     for genesis in retained {
         roots.insert(genesis, (true, 0, 0));
     }
+    if let Some(scope) = portal {
+        if scope.station_origin != binding.origin || scope.validate().is_err() {
+            return Err(invalid_root());
+        }
+        for genesis in crate::service_keys::list_recovery_roots(&mut tx, scope, after, limit).await? {
+            if !canonical_genesis(&genesis) {
+                return Err(invalid_root());
+            }
+            roots.entry(genesis).or_insert((false, 0, 0));
+        }
+    }
+    let binding_discovery = match portal {
+        _ if !crate::account_identity::built_in_station(&binding.origin) => "not_applicable",
+        None => "reporting_unconfigured",
+        Some(scope) => {
+            for genesis in binding_inventory::list(&mut tx, scope, after, PAGE_SIZE + 1).await? {
+                roots.entry(genesis).or_insert((false, 0, 0));
+            }
+            "retained"
+        }
+    };
     for (genesis, registered, reserved) in signing.root_registrations(after, limit).await? {
         if !canonical_genesis(&genesis) {
             return Err(invalid_root());
@@ -214,6 +239,7 @@ pub(crate) async fn list_roots(
     let next = page.last().filter(|_| more).map(|row| &row["genesis_hash"]);
     tx.commit().await?;
     Ok(json!({"origin":binding.origin, "generation":binding.generation.to_string(),
+        "binding_discovery":binding_discovery, "checked_service_contexts":portal.is_some(),
         "roots":page, "next_after":next}))
 }
 

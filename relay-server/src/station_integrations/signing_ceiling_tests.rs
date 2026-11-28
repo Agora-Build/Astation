@@ -21,9 +21,9 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
     let signing = SigningCeilings::fixture(external.pool.clone()).await;
     let fence = Binding::new("https://station.example", 1).unwrap();
     fence.initialize(&primary.pool, false).await.unwrap();
-    assert!(list_roots(&primary.pool, &fence, &signing, None).await.is_err());
+    assert!(list_roots(&primary.pool, &fence, &signing, None, None).await.is_err());
     fence.initialize(&primary.pool, true).await.unwrap();
-    let empty = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    let empty = list_roots(&primary.pool, &fence, &signing, None, None).await.unwrap();
     assert_eq!(empty["roots"], json!([]));
     assert!(empty["next_after"].is_null());
 
@@ -40,13 +40,13 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
     signing.register_new_key("account", &hash(64), "other", "key").await.unwrap();
     signing.reserve("account", &hash(64), "other", "key", 0, 1..=2).await.unwrap();
     let replica = primary.reconnect(2).await;
-    let first = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    let first = list_roots(&primary.pool, &fence, &signing, None, None).await.unwrap();
     assert_eq!(first["next_after"], hash(64));
     assert_eq!(first["roots"].as_array().unwrap().len(), 64);
     assert_eq!(first["roots"][63], json!({"genesis_hash":hash(64),"root_present":false,
         "registered_keys":2,"keys_with_reservations":1}));
-    assert_eq!(list_roots(&replica, &fence, &signing, None).await.unwrap(), first);
-    let second = list_roots(&replica, &fence, &signing, first["next_after"].as_str()).await.unwrap();
+    assert_eq!(list_roots(&replica, &fence, &signing, None, None).await.unwrap(), first);
+    let second = list_roots(&replica, &fence, &signing, None, first["next_after"].as_str()).await.unwrap();
     assert!(second["next_after"].is_null());
     let rows: Vec<_> = [&first, &second].into_iter()
         .flat_map(|page| page["roots"].as_array().unwrap()).collect();
@@ -58,17 +58,126 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
         assert_eq!(row["keys_with_reservations"].as_i64(), Some(i64::from(i == 64)));
     }
     // Exactly one full remaining page must have no continuation.
-    let exact = list_roots(&replica, &fence, &signing, Some(&hash(32))).await.unwrap();
+    let exact = list_roots(&replica, &fence, &signing, None, Some(&hash(32))).await.unwrap();
     assert_eq!(exact["roots"].as_array().unwrap().len(), 64);
     assert!(exact["next_after"].is_null());
     let newer = Binding::new(&fence.origin, 2).unwrap();
     newer.initialize(&primary.pool, true).await.unwrap();
-    assert!(list_roots(&replica, &fence, &signing, Some(&hash(64))).await.is_err());
+    assert!(list_roots(&replica, &fence, &signing, None, Some(&hash(64))).await.is_err());
     sqlx::query("DROP TABLE station_service_signing_ceilings").execute(&external.pool).await.unwrap();
-    assert!(list_roots(&replica, &newer, &signing, None).await.is_err());
+    assert!(list_roots(&replica, &newer, &signing, None, None).await.is_err());
     replica.close().await;
     primary.cleanup().await;
     external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_inventory_finds_interrupted_and_orphaned_service_keys() {
+    use crate::remote_api::recovery::delegated_recovery::list_roots;
+    use crate::station_integrations::tests::fixture_at_station;
+
+    for origin in ["https://custom.example", "https://station-dev.agora.build"] {
+        let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+        sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+            .execute(&external.pool)
+            .await
+            .unwrap();
+        let (primary, runtime, fixture) =
+            fixture_at_station("https://auth.example", Some(&external.pool), origin).await;
+        let genesis = fixture.log.genesis_hash().to_hex();
+        let store = runtime.app.recovery.signing_ceilings.get().unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION refuse_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN RAISE EXCEPTION 'test failure'; END $$;
+            CREATE TRIGGER fail_registration BEFORE INSERT ON station_service_signing_ceilings
+            FOR EACH ROW EXECUTE FUNCTION refuse_registration()",
+        )
+        .execute(&external.pool)
+        .await
+        .unwrap();
+        assert!(runtime.prepare(ID, OWNER, request(&fixture)).await.is_err());
+        let pending: (i64, i64) = sqlx::query_as(
+            "SELECT
+            (SELECT count(*) FROM station_integration_provisioning WHERE fingerprint IS NULL),
+            (SELECT count(*) FROM station_service_keys)",
+        )
+        .fetch_one(&primary.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, (1, 0));
+        let fence = Binding::new(origin, 2).unwrap();
+        fence.initialize(&primary.pool, true).await.unwrap();
+        let replica = primary.reconnect(1).await;
+        // Simulate a restore that retained the provisioning intent and lost the signed list.
+        let state: (String, Value) = sqlx::query_as(
+            "DELETE FROM remote_recovery_roots
+            WHERE genesis_hash=$1 RETURNING account_subject,state",
+        )
+        .bind(&genesis)
+        .fetch_one(&primary.pool)
+        .await
+        .unwrap();
+        let rotated = crate::integration_feed::FeedBinding {
+            report_client_id: format!("s-{}", "3".repeat(26)),
+            ..runtime.binding.clone()
+        };
+        let missing = json!([{"genesis_hash":genesis,"root_present":false,
+            "registered_keys":0,"keys_with_reservations":0}]);
+        assert_eq!(
+            list_roots(&replica, &fence, store, Some(&rotated), None)
+                .await
+                .unwrap()["roots"],
+            missing
+        );
+        let foreign = crate::integration_feed::FeedBinding {
+            portal_origin: "https://different-portal.example".into(),
+            ..rotated.clone()
+        };
+        assert_eq!(
+            list_roots(&replica, &fence, store, Some(&foreign), None)
+                .await
+                .unwrap()["roots"],
+            json!([])
+        );
+        sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,$2,$3)")
+            .bind(&genesis).bind(&state.0).bind(&state.1).execute(&primary.pool).await.unwrap();
+        sqlx::query("DROP TRIGGER fail_registration ON station_service_signing_ceilings")
+            .execute(&external.pool)
+            .await
+            .unwrap();
+        runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+        sqlx::raw_sql(
+            "DELETE FROM remote_recovery_roots; DELETE FROM station_integration_provisioning",
+        )
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM station_service_signing_ceilings")
+            .execute(&external.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_roots(&replica, &fence, store, Some(&rotated), None)
+                .await
+                .unwrap()["roots"],
+            missing
+        );
+        let other_issuer = crate::integration_feed::FeedBinding {
+            issuer: "https://different-auth.example".into(),
+            ..rotated
+        };
+        assert_eq!(
+            list_roots(&replica, &fence, store, Some(&other_issuer), None)
+                .await
+                .unwrap()["roots"],
+            json!([])
+        );
+        drop(runtime);
+        replica.close().await;
+        primary.cleanup().await;
+        external.cleanup().await;
+    }
 }
 
 #[tokio::test]

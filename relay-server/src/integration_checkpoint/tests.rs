@@ -694,6 +694,84 @@ fn release_for(row: &Value, id: &str) -> Value {
     release
 }
 
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_inventory_recovers_native_only_lists_across_report_credentials() {
+    use crate::remote_api::recovery::delegated_recovery::{inspect_root, list_roots, Binding as Fence};
+    use crate::service_signing_ceilings::SigningCeilings;
+    use crate::test_database::TestDatabase;
+
+    let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let independent = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    let signing = SigningCeilings::fixture(independent.pool.clone()).await;
+    let store = PolicyStore(db.pool.clone());
+    let prior = binding(true);
+    let current = FeedBinding { report_client_id: format!("s-{}", "2".repeat(26)), ..prior.clone() };
+    let fence = Fence::new(&current.station_origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    let hash = |i: u32| format!("{i:064x}");
+    let row = |i| json!({"account":OWNER, "accountId":"native-account", "genesisHash":hash(i),
+        "bindingId":format!("bind-{i}"), "version":1, "bindingState":"bound"});
+
+    let old_rows: Vec<_> = (1..=65).map(row).collect();
+    save_release_checkpoint(&store, &prior, json!(old_rows), None).await;
+    store.deny(&prior).await.unwrap();
+    save_release_checkpoint(&store, &current, json!([row(1)]), None).await;
+    let issuer = FeedBinding { issuer: "https://other-auth.example".into(), ..current.clone() };
+    let portal = FeedBinding { portal_origin: "https://other-portal.example".into(), ..current.clone() };
+    let prod = FeedBinding { station_origin: "https://station.agora.build".into(), ..current.clone() };
+    for foreign in [&issuer, &portal, &prod] {
+        save_release_checkpoint(&store, foreign, json!([row(80)]), Some(json!([release_for(&row(81), "foreign")]))).await;
+    }
+
+    // The native transition and the Portal release request name lists missing from every cut.
+    let report = json!({"state":"binding_changed","accountId":"native-account","genesisHash":hash(66),
+        "version":1,"bindingState":"bound"});
+    sqlx::query("INSERT INTO station_native_binding_transitions
+        (issuer,portal_origin,station_origin,account_id,genesis,version,nonce,proof_hash,report,retired_routes)
+        VALUES ($1,$2,$3,'native-account',$4,1,'test-nonce',$5,$6,'[]')")
+        .bind(&prior.issuer).bind(&prior.portal_origin).bind(&prior.station_origin)
+        .bind(hash(66)).bind(vec![0u8; 32]).bind(report).execute(&db.pool).await.unwrap();
+    save_release_checkpoint(&store, &current, json!([row(1)]),
+        Some(json!([release_for(&row(67), "pending"),release_for(&row(68), "checkpoint-only")]))).await;
+    sqlx::query("DELETE FROM station_binding_release_requests WHERE release_id='checkpoint-only'")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'member','{}')")
+        .bind(hash(1)).execute(&db.pool).await.unwrap();
+    signing.register_new_key("native-account", &hash(2), "service", "key").await.unwrap();
+
+    let replica = db.reconnect(1).await;
+    let first = list_roots(&db.pool, &fence, &signing, Some(&current), None).await.unwrap();
+    assert_eq!(first["binding_discovery"], "retained");
+    assert_eq!(first["next_after"], hash(64));
+    let second = list_roots(&replica, &fence, &signing, Some(&current), Some(&hash(64))).await.unwrap();
+    assert!(second["next_after"].is_null());
+    let rows: Vec<_> = [&first, &second].iter().flat_map(|p| p["roots"].as_array().unwrap()).collect();
+    assert_eq!(rows.len(), 68);
+    for (i, result) in (1..=68).zip(rows) {
+        assert_eq!(*result, json!({"genesis_hash":hash(i),"root_present":i==1,
+            "registered_keys":u64::from(i==2),"keys_with_reservations":0}));
+    }
+    assert_eq!(list_roots(&replica, &fence, &signing, Some(&current), None).await.unwrap(), first);
+    let missing = inspect_root(&db.pool, &fence, &hash(66), Some(&current)).await.unwrap();
+    assert!(missing["root"].is_null());
+    assert_eq!(missing["recovery_ready"], false);
+    let partial = list_roots(&replica, &fence, &signing, None, None).await.unwrap();
+    assert_eq!(partial["binding_discovery"], "reporting_unconfigured");
+    assert_eq!(partial["roots"].as_array().unwrap().len(), 2);
+    assert!(list_roots(&replica, &fence, &signing, Some(&prod), None).await.is_err());
+
+    // A credential cannot lend its checkpoint to another storage key.
+    sqlx::query("UPDATE station_integration_policy SET checkpoint=jsonb_set(checkpoint::jsonb,
+        '{portal_snapshot,binding,report_client_id}',to_jsonb($1::text))::text WHERE binding=$2")
+        .bind(&current.report_client_id).bind(prior.storage_key().unwrap()).execute(&db.pool).await.unwrap();
+    assert!(list_roots(&replica, &fence, &signing, Some(&current), None).await.is_err());
+    replica.close().await;
+    db.cleanup().await;
+    independent.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
