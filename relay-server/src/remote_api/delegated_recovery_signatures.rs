@@ -359,6 +359,7 @@ pub(super) async fn inspection(
     }
     current_copies.extend(reported_copies);
     let mut obligations = Vec::new();
+    let mut pending_copy_exports = Vec::new();
     for value in signed.values() {
         let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
@@ -367,6 +368,11 @@ pub(super) async fn inspection(
         }
         let original = super::stops::review(&record, log, &binding.origin)?;
         let copy = current_copies.get(record.record_id()).map(ControlRecord::record_id);
+        if original["requirement"] == "fresh_manager_signature"
+            && !copy.is_some_and(|id| source.exported_at_cut.contains(id))
+        {
+            pending_copy_exports.push(json!({"original_record_id":record.record_id(),"copy_record_id":copy}));
+        }
         let requirement = if copy.is_some() {
             "signed_copy_retained"
         } else {
@@ -379,7 +385,7 @@ pub(super) async fn inspection(
     }
     Ok((
         json!({"records":summaries,"evidence_hash":source_hash(&json!(commitments))?,
-        "known_native_obligations":obligations,
+        "known_native_obligations":obligations,"pending_copy_exports":pending_copy_exports,
         "observed_signing_lower_bounds":lower_bounds,"signing_clock_complete":false,
         "snapshot_complete":false,"recovery_ready":false}),
         current_copies,

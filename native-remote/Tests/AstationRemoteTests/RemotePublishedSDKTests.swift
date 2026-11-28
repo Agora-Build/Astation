@@ -204,15 +204,46 @@ final class RemotePublishedSDKTests: XCTestCase {
         }
     }
 
+    func testResignedCopiesMatchSharedVerdicts() throws {
+        let source = try fixture("r9-vectors-resigned-copy")
+        let cases = try rows(source["cases"])
+        XCTAssertEqual(cases.count, 37)
+        for vector in cases {
+            let membership = try log(vector, reports: source)
+            let label = try XCTUnwrap(vector["label"] as? String)
+            let original = try XCTUnwrap(vector["original_json"] as? String)
+            let copy = try XCTUnwrap(vector["copy_json"] as? String)
+            let feed = try XCTUnwrap(vector["candidate_feed_id"] as? String)
+            func check() throws -> ResignedCopy {
+                try checkResignedCopy(log: membership, originalJson: original, copyJson: copy, candidateFeedId: feed)
+            }
+            if let expected = vector["expect"] as? [String: String] {
+                let result = try check()
+                XCTAssertEqual(result.originalRecordId, expected["original_record_id"], label)
+                XCTAssertEqual(result.copyRecordId, expected["copy_record_id"], label)
+                XCTAssertEqual(result.signer, expected["signer"], label)
+                XCTAssertEqual(result.principal, expected["principal"], label)
+                XCTAssertEqual(result.action, expected["action"], label)
+                XCTAssertEqual(result.feed, expected["feed"], label)
+            } else {
+                XCTAssertThrowsError(try check(), label) { error in
+                    guard case let AtemError.Invalid(code, detail) = error else { return XCTFail("\(label): \(error)") }
+                    XCTAssertEqual(code, vector["code"] as? String, label)
+                    XCTAssertEqual(detail, vector["detail"] as? String ?? "", label)
+                }
+            }
+        }
+    }
+
     func testAllPublishedSnapshotCasesUseTheActualConsistencyChecker() throws {
         let source = try fixture("r9-vectors-host-work-control")
         let records = Dictionary(uniqueKeysWithValues: try rows(source["records"]).map {
             (try XCTUnwrap($0["label"] as? String), try json(XCTUnwrap($0["record"])))
         })
         let cases = try rows(source["snapshots"])
-        XCTAssertEqual(cases.count, 44)
+        XCTAssertEqual(cases.count, 59)
         for vector in cases {
-            let membership = try log(vector)
+            let membership = try log(vector, reports: source)
             func recordSet(_ key: String) throws -> [String] {
                 try XCTUnwrap(vector[key] as? [String]).map { try XCTUnwrap(records[$0]) }
             }
@@ -222,7 +253,8 @@ final class RemotePublishedSDKTests: XCTestCase {
             let result = try checkControlSnapshotConsistency(log: membership,
                 origin: XCTUnwrap(vector["origin"] as? String), candidateFeedId: XCTUnwrap(vector["candidate_feed_id"] as? String),
                 retainedJson: recordSet("retained"), snapshotJson: recordSet("snapshot"),
-                marks: marks, covered: XCTUnwrap(vector["covered"] as? [String]))
+                marks: marks, covered: XCTUnwrap(vector["covered"] as? [String]),
+                provisioned: XCTUnwrap(vector["provisioned"] as? [String]))
             let expected = try XCTUnwrap(vector["expect"] as? [String: Any])
             if expected["consistent"] as? Bool == true { XCTAssertEqual(result, .consistent) }
             else {

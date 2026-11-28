@@ -1318,6 +1318,7 @@ async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock
     let input = SnapshotInput {
         list: &log, origin, candidate_feed_id: &candidate, retained: &[], snapshot: &records,
         marks: &[(principal.clone(), updated.sign_above_ms)].into(), covered: &[principal.clone()].into(),
+        provisioned: &[principal.clone()].into(),
     };
     assert_eq!(check_snapshot_consistency(&input).unwrap(), SnapshotConsistency::Consistent);
     let other = primary.reconnect(3).await;

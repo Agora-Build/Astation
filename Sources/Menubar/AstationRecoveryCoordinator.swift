@@ -1,6 +1,7 @@
 import AtemClient
 import AstationRemote
 import AppKit
+import CryptoKit
 import Foundation
 
 @MainActor
@@ -2350,6 +2351,35 @@ extension AstationRecoveryCoordinator {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
         guard data.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Constructed only from the protected export after the manager confirms.
+    struct ConfirmedProcessExport {
+        let managerID: String
+        let input: Data
+
+        fileprivate init(managerID: String, roster: String) {
+            self.managerID = managerID
+            input = encodeFields(fields: [Data("astation-recovery-process-export-v1".utf8),
+                Data(managerID.utf8), Data(SHA256.hash(data: Data(roster.utf8)))])
+        }
+    }
+
+    func signAuthorRoster(_ plan: RemoteControlRecoveryPreparation, reviewed: String, current: () -> Bool) async throws -> String {
+        guard let confirmProcessRoster, try exportAuthorRoster(plan, current: current) == reviewed,
+              let log = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        try identity.requireVerifierManager(log: log, memberID: managerID)
+        guard await confirmProcessRoster() else { throw RemoteRecoveryError.confirmationRequired }
+        guard try exportAuthorRoster(plan, current: current) == reviewed,
+              let latest = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        let proof = ConfirmedProcessExport(managerID: managerID, roster: reviewed)
+        let sig = try identity.signProcessExport(proof, log: latest)
+        guard try exportAuthorRoster(plan, current: current) == reviewed else { throw RemoteRecoveryError.requiresReview }
+        let name = try JSONSerialization.data(withJSONObject: managerID, options: [.fragmentsAllowed])
+        let file = "{\"manager\":" + String(decoding: name, as: UTF8.self) + ",\"roster\":" + reviewed +
+            ",\"signature\":\"" + sig.base64URLEncodedString() + "\"}"
+        guard file.utf8.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
+        return file
     }
 
     func submitSignerReport(_ context: RemoteControlRecoveryContext, slot: String, preview: RemoteControlAuthorInventory,

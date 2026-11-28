@@ -38,7 +38,7 @@ android {
     }
 }
 
-val atemSdk = file("../../../build/atem-client/ee3352e1c05eee4de97359809d57e0be4fed86f4/atem-client-android")
+val atemSdk = file("../../../build/atem-client/f59e083385cd33e7c899788f0444778c2981b976/atem-client-android")
 check(atemSdk.resolve("README.txt").isFile) {
     "Run python3 scripts/check-atem-client-android.py --install from the repository root."
 }

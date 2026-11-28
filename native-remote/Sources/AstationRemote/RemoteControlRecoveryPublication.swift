@@ -331,9 +331,8 @@ public final class RemoteControlRecoveryPublication {
         let operation = saved.operations[index], review = try validate(operation)
         try check(review.context, log: log)
         if let record = operation.recordJSON {
-            guard case .valid = try verifyControlRecord(log: log, recordJson: record) else {
-                throw RemoteControlPublicationError.requiresReview
-            }
+            _ = try checkResignedCopy(log: log, originalJson: operation.originalRecordJSON,
+                copyJson: record, candidateFeedId: review.context.candidateFeedID)
             return record
         }
         guard let authority else { throw RemoteControlPublicationError.requiresReview }
@@ -357,9 +356,8 @@ public final class RemoteControlRecoveryPublication {
         }
         guard current() else { throw RemoteChannelError.staleLink }
         try authorize(review, log: log, authority: authority)
-        guard case .valid = try verifyControlRecord(log: log, recordJson: record) else {
-            throw RemoteControlPublicationError.requiresReview
-        }
+        _ = try checkResignedCopy(log: log, originalJson: operation.originalRecordJSON,
+            copyJson: record, candidateFeedId: review.context.candidateFeedID)
         try commit { $0.operations[index].recordJSON = record }
         return record
     }

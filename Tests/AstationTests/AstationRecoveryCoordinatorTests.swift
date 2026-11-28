@@ -1076,7 +1076,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let journal = try RemoteMemberVerifierJournal(log: log, origin: origin,
             read: { h.verifierHistoryBytes[origin] }, persist: { h.verifierHistoryBytes[origin] = $0 })
         try journal.record(RemoteMemberVerifierSlot(memberID: member, slot: "offline", process: other), conflict: true)
-        let restarted = try h.coordinator()
+        let restarted = try h.coordinator(confirmProcessRoster: { true })
         let panel = RecoveryCopySavePanel(), url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         panel.destination = url
         defer { try? FileManager.default.removeItem(at: url) }
@@ -1091,7 +1091,18 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         try await waitForRecoveryUI { save.isEnabled }
         try clickRecovery(save)
         try XCTUnwrap(panel.reply)(.OK)
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        try await waitForRecoveryUI { FileManager.default.fileExists(atPath: url.path) }
+        let file = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let object = try XCTUnwrap(file["roster"] as? [String: Any])
+        XCTAssertEqual(file["manager"] as? String, member)
+        let raw = try restarted.exportAuthorRoster(plan, current: { true })
+        let input = encodeFields(fields: [Data("astation-recovery-process-export-v1".utf8),
+            Data(member.utf8), Data(SHA256.hash(data: Data(raw.utf8)))])
+        let encoded = try XCTUnwrap(file["signature"] as? String)
+        let signature = try XCTUnwrap(Data(base64Encoded: encoded.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/") + "=="))
+        let key = try P256.Signing.PublicKey(x963Representation: XCTUnwrap(log.member(deviceId: member)).authKey.raw)
+        XCTAssertTrue(key.isValidSignature(try P256.Signing.ECDSASignature(rawRepresentation: signature), for: input))
         let rows = try XCTUnwrap(object["slots"] as? [[String: Any]])
         XCTAssertEqual(rows.compactMap { $0["slot"] as? String }, ["desktop", "desktop", "offline"])
         XCTAssertEqual(rows.compactMap { $0["process"] as? String }, [other, local, other])
@@ -1109,6 +1120,32 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         h.verifierHistoryBytes[origin] = pinned
         h.store.readFailure = true
         XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
+    }
+
+    func testProcessExportRequiresConfirmationOfTheExactProtectedRoster() async throws {
+        let h = RecoveryCoordinatorHarness(), (_, plan) = try await preparedRecoverySource(h)
+        var current = true
+        var confirm = false
+        let coordinator = try h.coordinator(confirmProcessRoster: {
+            if confirm { current = false }
+            return confirm
+        })
+        let raw = try coordinator.exportAuthorRoster(plan, current: { current })
+        let before = h.identityCryptography.signingCalls
+        for approved in [false, true] {
+            confirm = approved
+            do {
+                _ = try await coordinator.signAuthorRoster(plan, reviewed: raw, current: { current })
+                XCTFail("signed after cancellation or a changed account")
+            } catch {}
+        }
+        XCTAssertEqual(h.identityCryptography.signingCalls, before)
+        current = true
+        do {
+            _ = try await coordinator.signAuthorRoster(plan, reviewed: raw + " ", current: { true })
+            XCTFail("signed a caller-supplied export")
+        } catch {}
+        XCTAssertEqual(h.identityCryptography.signingCalls, before)
     }
 
     func testProcessReviewRefusesDeniedStaleOrSupersededConfirmation() async throws {
@@ -3399,7 +3436,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     }
                     let records = try XCTUnwrap(input["records"] as? [Any]).map(json)
                     let checked = try verifySignerReport(log: log, reportJson: json(XCTUnwrap(input["report"])),
-                        expectedChallengeJson: challenge, exportedRecordsJson: records, nowMs: wall)
+                        expectedChallengeJson: challenge, exportedRecordsJson: records,
+                        exportedProcesses: XCTUnwrap(input["processes"] as? [String]), nowMs: wall)
                     XCTAssertTrue(checked.atHead)
                     XCTAssertEqual(checked.slot, "truck")
                     XCTAssertEqual(checked.process, verifierReportProcess())

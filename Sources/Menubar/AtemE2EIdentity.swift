@@ -380,7 +380,7 @@ final class AtemE2EIdentity {
     func signRecoveryReport(_ reviewed: RemoteControlSigningJournal.ReportKeyRequest, expectedPublicKey: Data) throws -> Data {
         let request = reviewed.request
         lock.lock(); defer { lock.unlock() }
-        guard request.purpose == .signerReport, request.freshConfirmation, request.label == "atem-signer-report-v1",
+        guard request.purpose == .signerReport, request.freshConfirmation, request.label == "atem-signer-report-v2",
               let record = try read(create: false),
               try crypto.signingPublicKey(record.material) == expectedPublicKey else { throw AtemIdentityError.identityChanged }
         return try crypto.sign(request.input, material: record.material)
@@ -412,6 +412,19 @@ final class AtemE2EIdentity {
         lock.lock(); defer { lock.unlock() }
         guard log.member(deviceId: memberID)?.roles.contains("manage") == true else { throw AtemIdentityError.identityChanged }
         _ = try existingVerifierIdentity(log: log, memberID: memberID)
+    }
+
+    func signProcessExport(_ proof: AstationRecoveryCoordinator.ConfirmedProcessExport, log: MembershipLog) throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard let member = log.member(deviceId: proof.managerID), member.roles.contains("manage") else {
+            throw AtemIdentityError.identityChanged
+        }
+        let record = try existingVerifierIdentity(log: log, memberID: proof.managerID)
+        let sig = try crypto.sign(proof.input, material: record.material)
+        guard AtemE2ECrypto.verifyP256Signature(sig, message: proof.input, publicKey: member.authKey.raw) else {
+            throw AtemIdentityError.identityChanged
+        }
+        return sig
     }
 
     /// This API builds the report in the SDK; it never accepts arbitrary signing bytes.

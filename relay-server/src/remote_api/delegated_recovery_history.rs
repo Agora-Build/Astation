@@ -57,10 +57,11 @@ pub(super) struct History {
     pub review: Value,
     pub signed: BTreeMap<String, Value>,
     pub authors: Value,
+    pub author_round: super::author_history::AuthorRound,
     pub new_export_digests: BTreeMap<String, String>,
     pub confirmation_hashes: Vec<String>,
-    // One latest verified export per signer, slot and process, in this plan.
-    pub latest_exports: Vec<(Hash32, Vec<String>)>,
+    // The latest verified export from each signer's journal in this plan.
+    pub latest_exports: Vec<(atem_client::membership::Head, Hash32, Vec<String>)>,
 }
 
 pub(super) async fn inspection(
@@ -113,6 +114,7 @@ pub(super) async fn inspection(
     let mut retained_feed_ids = BTreeSet::new();
     let mut found_current = false;
     let mut journals = super::author_history::JournalHistory::default();
+    let mut author_round = super::author_history::AuthorRound::default();
     let mut current_authors = None;
     let mut candidate_services_hash = None;
     let mut prior_authors = Vec::new();
@@ -216,16 +218,21 @@ pub(super) async fn inspection(
             *lower = (*lower).max(value.as_u64().ok_or_else(invalid)?);
         }
         let mut authors = operator_review.then(|| super::author_history::inventory(latest));
+        if let Some(members) = &authors {
+            for signer in members.keys() { author_round.require(signer); }
+        }
         let mut hashes = Vec::new();
         let current_plan = checkpoint.plan_id == prepared.plan_id;
         signer_reports::visit(connection, &checkpoint, &heads, &binding.origin, generation, |verified, hash, accepted_log| {
             if operator_review {
-                journals.observe(&verified.signer, &verified.journal, generation, current_plan,
+                author_round.observe(&verified, current_plan);
+                journals.observe(&verified.signer, &verified.journal, &verified.processes, generation, current_plan,
                     verified.records.iter().map(ControlRecord::record_id));
             }
             if current_plan {
-                latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
-                    (verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
+                // A successor can report the same exclusive journal from a different slot.
+                latest_exports.insert((verified.signer.clone(), verified.journal.id),
+                    (verified.head, verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
             }
             for record in verified.records {
                 // Checkpoint records and older plans already contribute to the base.
@@ -248,7 +255,9 @@ pub(super) async fn inspection(
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
                     "connection": verified.connection, "slot": verified.slot,
                     "process": atem_client::encoding::b64u(&verified.process), "journal": verified.journal.to_json(),
+                    "attached_processes": verified.processes.iter().map(|p| atem_client::encoding::b64u(p)).collect::<Vec<_>>(),
                     "missing_early_range": verified.journal.since > first, "submission_hash": hash,
+                    "signed_head": verified.head.to_json(),
                     "signed_evidence_hash": verified.recovery.evidence_hash().to_hex(),
                 }));
             }
@@ -356,6 +365,7 @@ pub(super) async fn inspection(
             .collect(),
         authors: json!({"members": current_authors, "prior_plans": prior_authors,
             "journal_gaps": journals.gaps(), "complete_history": false}),
+        author_round,
         new_export_digests,
         confirmation_hashes,
         latest_exports: latest_exports.into_values().collect(),

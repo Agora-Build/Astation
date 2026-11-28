@@ -6,7 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [.library(name: "AstationRemote", targets: ["AstationRemote"])],
     dependencies: [
-        .package(path: "../build/atem-client/ee3352e1c05eee4de97359809d57e0be4fed86f4/AtemClient")
+        .package(path: "../build/atem-client/f59e083385cd33e7c899788f0444778c2981b976/AtemClient")
     ],
     targets: [
         .target(name: "AstationRemote", dependencies: [.product(name: "AtemClient", package: "AtemClient")]),

@@ -97,7 +97,7 @@ dependencies = [
 [[package]]
 name = "atem-client"
 version = "0.1.0"
-source = "git+https://github.com/Agora-Build/Atem.git?rev=5319070c93df7681f73a813d2d0267450a8ac2f9#5319070c93df7681f73a813d2d0267450a8ac2f9"
+source = "git+https://github.com/Agora-Build/Atem.git?rev=f59e083385cd33e7c899788f0444778c2981b976#f59e083385cd33e7c899788f0444778c2981b976"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2652,6 +2652,7 @@ dependencies = [
  "futures-util",
  "governor",
  "libc",
+ "p256",
  "rand 0.8.5",
  "redis",
  "reqwest",

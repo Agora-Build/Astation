@@ -285,6 +285,23 @@ pub(crate) async fn inspect_root(
             let log = Membership::from_stored(&root.account, &hash, &root.membership)
                 .map_err(|_| invalid_root())?;
             let mut report = root_inspection(&root, binding, &log)?;
+            // The live feed can advance after reopening. Read the original
+            // publication hashes in the same snapshot as its generation fence.
+            let receipt: Option<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('plan_id',plan_id,'candidate_feed_id',candidate_feed_id,
+                    'cut_hash',published_cut_hash,'feed_hash',published_feed_hash)
+                 FROM station_delegated_recovery_plans
+                 WHERE origin=$1 AND generation=$2 AND genesis_hash=$3 AND published_cut_hash IS NOT NULL
+                   AND retained->>'account_subject'=$4 AND retained->>'account_id'=$5",
+            )
+            .bind(&binding.origin)
+            .bind(binding.generation)
+            .bind(genesis)
+            .bind(&owner)
+            .bind(&root.account)
+            .fetch_optional(&mut *tx)
+            .await?;
+            report["publication_receipt"] = receipt.unwrap_or(Value::Null);
             if let Some(source) = portal.filter(|p| crate::integration_checkpoint::PortalCheckpoint::built_in(p)) {
                 report["route_ownership"] = route_ownership::inspect(&mut tx, &root, &log, &owner, source).await?;
             }

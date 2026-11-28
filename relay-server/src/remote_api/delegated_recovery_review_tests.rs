@@ -616,14 +616,19 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let before = saved(&database.pool, &genesis).await;
     let original = &before["delegated"][ORIGIN]["records"][1];
     let mut inputs = Vec::new();
+    let displaced = atem_client::encoding::b64u(&[2; 16]);
     for slot in ["astation-macos", "other"] {
         let (status, challenge) = post_recovery(&a, &format!("{base}/signer-challenges"), Some("alice"), mint(slot)).await;
         assert_eq!(status, StatusCode::OK);
         let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
-        let journal = JournalView {id:[1;16], since:2, revision:2, records:vec![original["body"].to_string()], drafts:vec![]};
+        let journal = JournalView {
+            id: [1; 16], since: 2, revision: 2,
+            records: vec![original["body"].to_string()], drafts: vec![],
+            processes: vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation()), displaced.clone()],
+        };
         let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
         let report = sign_signer_report(&f.keys, &KeyId::new("manager"), &body).unwrap();
-        inputs.push(json!({"report":report.to_json(),"records":[original]}));
+        inputs.push(json!({"report":report.to_json(),"records":[original],"processes":journal.processes}));
     }
     let input = &inputs[0];
     let bytes = input.to_string().into_bytes();
@@ -631,11 +636,13 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let missing = path.replace(&genesis, &"0".repeat(64));
     assert_eq!(post_recovery(&a, &path, Some("bob"), bytes.clone()).await,
         post_recovery(&a, &missing, Some("alice"), bytes.clone()).await);
-    for field in ["signature", "records", "extra"] {
+    for field in ["signature", "records", "processes", "missing_processes", "extra"] {
         let mut bad = input.clone();
         match field {
             "signature" => bad["report"]["sig"] = json!("forged"),
             "records" => bad["records"] = json!([{}]),
+            "processes" => bad["processes"] = json!([]),
+            "missing_processes" => { bad.as_object_mut().unwrap().remove("processes"); }
             _ => bad["extra"] = json!(true),
         }
         assert_eq!(post_recovery(&a, &path, Some("alice"), bad.to_string().into_bytes()).await.0, StatusCode::BAD_REQUEST);
@@ -696,9 +703,18 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let result = comparison(roster.clone()).await.unwrap();
     assert_eq!(result["matching_current_reports"][0]["slot"], "astation-macos");
     assert_eq!(result["reviewed_without_current_report"][0]["slot"], "offline");
+    assert_eq!(result["reviewed_without_signed_attachment"], json!([{
+        "member": "phone", "slot": "offline", "process": offline["process"]
+    }]));
     assert_eq!(result["reports_missing_early_range"][0]["submission_hash"], one.1["submission_hash"]);
     assert_eq!(result["reported_outside_review"], json!([]));
     assert_eq!(result["recovery_ready"], false);
+    let mut attached = roster.clone();
+    attached["slots"][1]["process"] = json!(displaced);
+    let transferred = comparison(attached).await.unwrap();
+    assert_eq!(transferred["reviewed_without_signed_attachment"], json!([]));
+    assert_eq!(transferred["reviewed_without_current_report"][0]["slot"], "offline");
+    assert_eq!(transferred["reports_missing_early_range"].as_array().unwrap().len(), 1);
     let mut replaced = roster.clone();
     replaced["slots"][0]["process"] = offline["process"].clone();
     let mismatch = comparison(replaced).await.unwrap();
@@ -731,7 +747,7 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let (status, pending) = post_recovery(&a, &format!("{base}/signer-challenges"), Some("alice"), mint("pending")).await;
     assert_eq!(status, StatusCode::OK);
     let challenge = SignerReportChallenge::parse(pending.to_string().as_bytes()).unwrap();
-    let journal = JournalView {id:[3;16], since:1, revision:0, records:vec![], drafts:vec![]};
+    let journal = JournalView {id:[3;16], since:1, revision:0, records:vec![], drafts:vec![], processes:vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation())]};
     let body = signer_report_body(&f.log, &challenge, signer, "pending", ORIGIN, &journal, challenge.issued_at()).unwrap();
     let pending = sign_signer_report(&f.keys, &KeyId::new("manager"), &body).unwrap();
 
@@ -755,7 +771,7 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     assert!(plan::snapshot_stops::stage(&restart, &binding, &genesis, other["reconstruction_hash"].as_str().unwrap()).await.is_err());
     assert!(comparison(roster.clone()).await.is_err());
     assert_eq!(post_recovery(&a, &path, Some("alice"),
-        json!({"report":pending.to_json(),"records":[]}).to_string().into_bytes()).await.0, StatusCode::CONFLICT);
+        json!({"report":pending.to_json(),"records":[],"processes":journal.processes}).to_string().into_bytes()).await.0, StatusCode::CONFLICT);
     assert_eq!(post_recovery(&b, &path, Some("alice"), bytes).await, one);
     restart.close().await;
     // A corrupted retained report cannot appear in a subsequent operator review.
@@ -803,6 +819,10 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
         "replacements":[{"original_record_id":original.record_id(),"record":copy}]});
     let plan_id = initial["plan_id"].as_str().unwrap();
     assert_eq!(retain_http(&app, &genesis, plan_id, Some("alice"), copies.to_string().into_bytes()).await.0, StatusCode::OK);
+    let retained_copy = plan::prepare(&replica, &binding, &genesis).await.unwrap();
+    assert_eq!(retained_copy["recovery_signatures"]["pending_copy_exports"], json!([{
+        "original_record_id": original.record_id(), "copy_record_id": replacement.record_id
+    }]));
     let mut newly_discovered = replacement.clone();
     newly_discovered.record_id = uuid::Uuid::new_v4().to_string();
     newly_discovered.issued_at += 1;
@@ -822,16 +842,21 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
             if revision >= 3 { records.push(&new_stop); }
         }
         let journal = JournalView { id: [1; 16], since: 1, revision,
-            records: records.iter().map(|record| record["body"].to_string()).collect(), drafts };
+            records: records.iter().map(|record| record["body"].to_string()).collect(), drafts, processes: vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation())] };
         let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
         let report = sign_signer_report(&f.keys, &KeyId::new(key), &body).unwrap();
-        json!({"report":report.to_json(),"records":records}).to_string().into_bytes()
+        json!({"report":report.to_json(),"records":records,"processes":journal.processes}).to_string().into_bytes()
     };
     let initial_submission = make_submission(former, "manager", 1, vec![], &initial["evidence_hash"]).await;
     let second = make_submission(active, "replacement-manager", 1, vec![], &initial["evidence_hash"]).await;
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), second).await.0, StatusCode::OK);
     let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
     assert_ne!(first["evidence_hash"], initial["evidence_hash"]);
+    let journal_id = atem_client::encoding::b64u(&[1;16]);
+    assert_eq!(first["known_authors"]["pending_final_reports"], json!([
+        {"signer":former,"journal_id":null,"reason":"no_report"},
+        {"signer":active,"journal_id":journal_id,"reason":"evidence_changed"}
+    ]));
     // The other author already approved the prior round. It can finish that
     // outstanding request after discovery, then confirm the enlarged base.
     let original_receipt = post_recovery(&other_app, &report_path, Some("alice"), initial_submission.clone()).await;
@@ -839,6 +864,10 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_eq!(cut["evidence_hash"], first["evidence_hash"]);
     assert_ne!(cut["reconstruction_hash"], first["reconstruction_hash"]);
+    assert_eq!(cut["known_authors"]["pending_final_reports"], json!([
+        {"signer":former,"journal_id":journal_id,"reason":"evidence_changed"},
+        {"signer":active,"journal_id":journal_id,"reason":"evidence_changed"}
+    ]));
     assert_eq!(cut["recovery_signatures"]["records"][0]["exported_at_cut"], false);
     assert!(plan::snapshot_stops::stage(&replica, &binding, &genesis,
         cut["reconstruction_hash"].as_str().unwrap()).await.is_err());
@@ -851,10 +880,12 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let resumed = database.reconnect(2).await;
     let confirmed = plan::prepare(&resumed, &binding, &genesis).await.unwrap();
     assert_eq!(&confirmed["evidence_hash"], hash);
+    assert_eq!(confirmed["known_authors"]["pending_final_reports"], json!([]));
     assert_ne!(confirmed["reconstruction_hash"], cut["reconstruction_hash"]);
     let mapped = &confirmed["recovery_signatures"]["records"][0];
     assert_eq!(mapped["current_review"], false);
     assert_eq!(mapped["exported_at_cut"], true);
+    assert_eq!(confirmed["recovery_signatures"]["pending_copy_exports"], json!([]));
     let staged = plan::snapshot_stops::stage(&resumed, &binding, &genesis,
         confirmed["reconstruction_hash"].as_str().unwrap()).await.unwrap();
     assert_eq!(staged["stop_count"], 1);
@@ -930,6 +961,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let latest = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(&latest["evidence_hash"], hash);
     assert_eq!(latest["recovery_signatures"]["records"][0]["exported_at_cut"], false);
+    assert_eq!(latest["recovery_signatures"]["pending_copy_exports"][0]["original_record_id"], original.record_id());
     assert!(plan::snapshot_stops::stage(&resumed, &binding, &genesis,
         latest["reconstruction_hash"].as_str().unwrap()).await.is_err());
     roster["evidence_hash"] = latest["evidence_hash"].clone();
@@ -1024,6 +1056,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
             revision: 2,
             records: stops.iter().map(|r| r["body"].to_string()).collect(),
             drafts: vec![],
+            processes: vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation())],
         };
         let report = signer_report_body(
             &f.log,
@@ -1036,7 +1069,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
         )
         .unwrap();
         let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &report).unwrap();
-        json!({"report":signed.to_json(),"records":stops})
+        json!({"report":signed.to_json(),"records":stops,"processes":journal.processes})
             .to_string()
             .into_bytes()
     };
@@ -1156,11 +1189,11 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let other = build_control(&f.keys, &KeyId::new("manager"), &other).unwrap().to_json();
     let records = [&root["delegated"][ORIGIN]["records"][1], &unresolved, &other];
     let journal = JournalView {id:[1;16], since:1, revision:3,
-        records:records.iter().map(|r| r["body"].to_string()).collect(), drafts:vec![]};
+        records:records.iter().map(|r| r["body"].to_string()).collect(), drafts:vec![], processes:vec![atem_client::encoding::b64u(&atem_client::member_report::process_generation())]};
     let author_report = signer_report_body(&demoted, &challenge, signer, slot, ORIGIN,
         &journal, challenge.issued_at()).unwrap();
     let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &author_report).unwrap();
-    let payload = json!({"report":signed.to_json(),"records":records});
+    let payload = json!({"report":signed.to_json(),"records":records,"processes":journal.processes});
     assert_eq!(post_recovery(&peer, &path, Some("alice"), payload.to_string().into_bytes()).await.0,
         StatusCode::OK);
     let checked = plan::prepare(&database.pool, &next, &genesis).await.unwrap();
@@ -1181,7 +1214,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let request = signer_report_body(&demoted, &challenge, signer, slot, ORIGIN,
         &rolled_back, challenge.issued_at()).unwrap();
     let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &request).unwrap();
-    let payload = json!({"report":signed.to_json(),"records":records});
+    let payload = json!({"report":signed.to_json(),"records":records,"processes":rolled_back.processes});
     assert_eq!(post_recovery(&peer, &path, Some("alice"), payload.to_string().into_bytes()).await.0,
         StatusCode::OK);
     let inspected = plan::prepare(&database.pool, &next, &genesis).await.unwrap();
