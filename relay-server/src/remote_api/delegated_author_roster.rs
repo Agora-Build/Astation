@@ -2,7 +2,7 @@
 use super::{checkpoint, invalid, review_evidence, Binding};
 use atem_client::{
     canonical::StrictValue,
-    encoding::b64u_decode_array,
+    encoding::{b64u_decode_array, enc, Hash32},
     membership::{Head, Membership},
     session::wire::is_opaque_id,
 };
@@ -23,9 +23,16 @@ struct Slot {
     selected: bool,
 }
 
+#[derive(Deserialize, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct ConflictedSlot {
+    member: String,
+    slot: String,
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Export {
+pub(super) struct Export {
     version: u8,
     account_id: String,
     genesis_hash: String,
@@ -38,17 +45,48 @@ struct Export {
     reconstruction_hash: String,
     membership_head: Value,
     slots: Vec<Slot>,
+    #[serde(default)]
+    conflicted_slots: Vec<ConflictedSlot>,
 }
 
-fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedExport<'a> {
+    manager: &'a str,
+    #[serde(borrow)]
+    roster: &'a serde_json::value::RawValue,
+    signature: &'a str,
+}
+
+fn read_export(bytes: &[u8], log: &Membership, require_signature: bool) -> Result<Export, sqlx::Error> {
+    let strict = StrictValue::parse(bytes, INPUT_LIMIT).map_err(|_| invalid())?.into_value();
+    if strict.get("roster").is_none() {
+        if require_signature { return Err(invalid()); }
+        return serde_json::from_value(strict).map_err(|_| invalid());
+    }
+    let signed: SignedExport<'_> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let key = log.current_manager_key(signed.manager).ok_or_else(invalid)?;
+    let signature = b64u_decode_array::<64>(signed.signature).map_err(|_| invalid())?;
+    let raw = signed.roster.get().as_bytes();
+    let digest = Hash32::of(raw);
+    let input = enc(&[b"astation-recovery-process-export-v1", signed.manager.as_bytes(), digest.as_bytes()]);
+    key.verify_raw(&input, &signature).map_err(|_| invalid())?;
+    serde_json::from_slice(raw).map_err(|_| invalid())
+}
+
+pub(super) fn combine(inputs: &[Vec<u8>], log: &Membership, require_signature: bool) -> Result<Export, sqlx::Error> {
     let mut remaining = INPUT_LIMIT;
     let mut scope = None;
     let mut members = BTreeMap::<String, Vec<Slot>>::new();
+    let mut conflicts = BTreeSet::new();
     for bytes in inputs {
         remaining = remaining.checked_sub(bytes.len()).ok_or_else(invalid)?;
-        let strict = StrictValue::parse(bytes, INPUT_LIMIT).map_err(|_| invalid())?;
-        let mut export: Export =
-            serde_json::from_value(strict.into_value()).map_err(|_| invalid())?;
+        let mut export = read_export(bytes, log, require_signature)?;
+        let rows = std::mem::take(&mut export.conflicted_slots);
+        let count = rows.len();
+        let reported: BTreeSet<_> = rows.into_iter().collect();
+        if count > 4096 || reported.len() != count { return Err(invalid()); }
+        conflicts.extend(reported);
         let mut reviewed = BTreeMap::<String, Vec<Slot>>::new();
         for row in std::mem::take(&mut export.slots) {
             reviewed.entry(row.member.clone()).or_default().push(row);
@@ -77,6 +115,7 @@ fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
     }
     let mut export = scope.ok_or_else(invalid)?;
     export.slots = members.into_values().flatten().collect();
+    export.conflicted_slots = conflicts.into_iter().collect();
     Ok(export)
 }
 
@@ -87,43 +126,49 @@ pub(crate) async fn compare(
     plan: &str,
     inputs: &[Vec<u8>],
 ) -> Result<Value, sqlx::Error> {
-    let export = combine(inputs)?;
-    if export.version != 1
-        || export.origin != binding.origin
-        || export.genesis_hash != genesis
-        || export.plan_id != plan
-        || export.generation != binding.generation.to_string()
-        || export.slots.len() > 8192
-    {
-        return Err(invalid());
-    }
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, false).await?;
-    if prepared.plan_id != plan
+    if prepared.plan_id != plan { return Err(invalid()); }
+    let export = combine(inputs, &log, false)?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    let comparison = compare_at_review(export, binding, &log, &report)?;
+    tx.commit().await?;
+    Ok(comparison)
+}
+
+pub(super) fn compare_at_review(
+    export: Export,
+    binding: &Binding,
+    log: &Membership,
+    report: &Value,
+) -> Result<Value, sqlx::Error> {
+    if export.version != 1
+        || export.origin != binding.origin
+        || export.genesis_hash != log.genesis_hash().to_hex()
+        || report["plan_id"] != export.plan_id
+        || export.generation != binding.generation.to_string()
+        || export.slots.len() > 8192
         || export.account_id != log.account_id()
         || export.membership_head != log.head().to_json()
-        || export.source_hash != prepared.source_hash
-        || export.candidate_feed_id != prepared.candidate_feed_id
-    {
-        return Err(invalid());
-    }
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
-    if report["evidence_hash"] != export.evidence_hash
+        || report["source_hash"] != export.source_hash
+        || report["candidate_feed_id"] != export.candidate_feed_id
+        || report["evidence_hash"] != export.evidence_hash
         || report["reconstruction_hash"] != export.reconstruction_hash
     {
         return Err(invalid());
     }
     let mut comparison = compare_members(
-        &log,
+        log,
         &report["known_authors"],
         &export.evidence_hash,
         export.slots,
+        export.conflicted_slots,
     )?;
     comparison["origin"] = json!(binding.origin);
-    comparison["genesis_hash"] = json!(genesis);
-    comparison["plan_id"] = json!(plan);
+    comparison["genesis_hash"] = json!(export.genesis_hash);
+    comparison["plan_id"] = json!(export.plan_id);
     comparison["reconstruction_hash"] = json!(export.reconstruction_hash);
-    tx.commit().await?;
+    comparison["pending_final_reports"] = report["known_authors"]["pending_final_reports"].clone();
     Ok(comparison)
 }
 
@@ -157,6 +202,7 @@ fn compare_members(
     authors: &Value,
     evidence_hash: &str,
     slots: Vec<Slot>,
+    conflicts: Vec<ConflictedSlot>,
 ) -> Result<Value, sqlx::Error> {
     let mut managers = BTreeSet::new();
     let mut current = BTreeSet::new();
@@ -164,6 +210,17 @@ fn compare_members(
     let mut observed = current.clone();
     for prior in authors["prior_plans"].as_array().ok_or_else(invalid)? {
         observations(&prior["members"], &mut managers, &mut observed)?;
+    }
+    let mut conflicted_authors = Vec::new();
+    for row in conflicts {
+        if !is_opaque_id(&row.member) || !is_opaque_id(&row.slot)
+            || !log.member(&row.member).is_some_and(|m| matches!(
+                m.member.kind, atem_client::membership::MemberKind::Native { .. }
+            ))
+        {
+            return Err(invalid());
+        }
+        if managers.contains(&row.member) { conflicted_authors.push(row); }
     }
     let mut reviewed = BTreeSet::new();
     let mut current_rosters = BTreeSet::new();
@@ -218,9 +275,14 @@ fn compare_members(
     }
     let mut missing_early_ranges = Vec::new();
     let mut latest = BTreeMap::new();
+    let mut attached = BTreeSet::new();
+    let current_head = log.head().to_json();
     for (signer, member) in authors["members"].as_object().ok_or_else(invalid)? {
         let id = signer.strip_prefix("member:").ok_or_else(invalid)?;
+        let mut latest_journals = BTreeMap::new();
         for report in member["reports"].as_array().ok_or_else(invalid)? {
+            let journal = report["journal"]["id"].as_str().ok_or_else(invalid)?;
+            latest_journals.insert(journal, report);
             // Reports are read in ascending Station connection order within this plan.
             let process = (
                 id.to_owned(),
@@ -229,21 +291,32 @@ fn compare_members(
             );
             latest.insert(
                 process,
-                report["signed_evidence_hash"]
-                    .as_str()
-                    .ok_or_else(invalid)?,
+                report["signed_evidence_hash"].as_str().ok_or_else(invalid)? == evidence_hash
+                    && report["signed_head"] == current_head,
             );
             if report["missing_early_range"] == true {
                 missing_early_ranges.push(json!({"signer": signer, "slot": report["slot"],
                     "process": report["process"], "submission_hash": report["submission_hash"]}));
             }
         }
+        for report in latest_journals.values() {
+            if report["signed_head"] != current_head || report["signed_evidence_hash"] != evidence_hash {
+                continue;
+            }
+            for process in report["attached_processes"].as_array().ok_or_else(invalid)? {
+                attached.insert((id, process.as_str().ok_or_else(invalid)?));
+            }
+        }
     }
     let confirmed: BTreeSet<_> = latest
         .into_iter()
-        .filter_map(|(p, hash)| (hash == evidence_hash).then_some(p))
+        .filter_map(|(p, current)| current.then_some(p))
         .collect();
     Ok(json!({
+        "conflicted_author_slots": conflicted_authors,
+        "reviewed_without_signed_attachment": reviewed.iter()
+            .filter(|(member, _, process)| !attached.contains(&(member.as_str(), process.as_str())))
+            .map(describe).collect::<Vec<_>>(),
         "reviewed_without_current_confirmation": reviewed.difference(&confirmed).map(describe).collect::<Vec<_>>(),
         "matching_evidence_confirmations": reviewed.intersection(&confirmed).map(describe).collect::<Vec<_>>(),
         "missing_current_roster": managers.difference(&current_rosters).collect::<Vec<_>>(),

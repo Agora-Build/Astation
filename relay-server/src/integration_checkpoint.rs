@@ -123,7 +123,7 @@ fn opaque(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
-fn timestamp(value: &str) -> bool {
+pub(super) fn timestamp(value: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(value)
         .is_ok_and(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == value)
 }
@@ -181,6 +181,7 @@ impl PortalCheckpoint {
                     "quotaPerSecond",
                     "interruptRunning",
                     "revokedAt",
+                    "held",
                 ]
                 .contains(&key.as_str())
             }) {
@@ -190,7 +191,7 @@ impl PortalCheckpoint {
                 .as_str()
                 .filter(|id| client_id(id, "i-"))
                 .ok_or(())?;
-            let policy: IntegrationPolicy = serde_json::from_value(row.clone()).map_err(|_| ())?;
+            let mut policy: IntegrationPolicy = serde_json::from_value(row.clone()).map_err(|_| ())?;
             policy.validate()?;
             let stopped = matches!(policy.state.as_str(), "revoking" | "revoked");
             if stopped && (!fields.contains_key("revokedAt") || policy.interrupt_running.is_none())
@@ -200,11 +201,8 @@ impl PortalCheckpoint {
             if !stopped && fields.contains_key("revokedAt") {
                 return Err(());
             }
-            let revoked_at = match fields.get("revokedAt") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(at)) if timestamp(at) => Some(at.clone()),
-                _ => return Err(()),
-            };
+            // Keep one timestamp in the existing durable checkpoint format.
+            let revoked_at = policy.revoked_at.take().flatten();
             if integrations
                 .insert(id.into(), CheckpointIntegration { policy, revoked_at })
                 .is_some()
@@ -251,7 +249,7 @@ impl PortalCheckpoint {
             }
             row.policy.validate()?;
             let stopped = matches!(row.policy.state.as_str(), "revoking" | "revoked");
-            if (stopped && row.policy.interrupt_running.is_none())
+            if row.policy.revoked_at.is_some() || (stopped && row.policy.interrupt_running.is_none())
                 || row
                     .revoked_at
                     .as_ref()

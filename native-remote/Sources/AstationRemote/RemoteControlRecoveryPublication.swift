@@ -66,17 +66,84 @@ public struct RemoteControlRecoveryReview: Equatable, Sendable {
     public let signed: Bool
 }
 
-/// A trusted adapter must establish the current closed plan, exact original,
-/// complete history/clocks and a durable reservation for this exact body. These
-/// checks are required again at signing; a saved draft is never authorization.
-/// Cached context and a local journal alone cannot establish current authority
-/// or complete clocks, including after loading a legacy/empty checkpoint.
-/// There is deliberately no default or production implementation yet.
+/// Checks the closed plan, exact original, current manager and the adapter's timestamp
+/// reservation again at signing. Managers sign native copies before their final reports.
+/// Service clock reconstruction and complete author history are publication requirements.
 @MainActor
 public protocol RemoteControlRecoveryAuthorizing {
     func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
         managerID: String, log: MembershipLog) async throws -> UInt64
+    func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64
     func authorize(_ review: RemoteControlRecoveryReview, log: MembershipLog) throws
+    func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws
+}
+
+public extension RemoteControlRecoveryAuthorizing {
+    func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64 {
+        let time = try await reserve(originalRecordJSON: originalRecordJSON, context: context, managerID: managerID, log: log)
+        guard time > issuedAt else { throw RemoteControlPublicationError.requiresReview }
+        return time
+    }
+
+    func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws {
+        try authorize(review, log: log)
+    }
+}
+
+public enum RemoteRecoveryCopyReservationError: Error { case changed }
+
+/// Holds one checked reservation across the synchronous protected-key operation.
+/// A new confirmation or a restart rechecks the exact durable draft with Station.
+@MainActor
+public final class RemoteStationRecoveryCopyAuthority: RemoteControlRecoveryAuthorizing {
+    private let station: RemoteRecoveryHTTP
+    private var reservation: (RemoteControlRecoveryContext, String, String, UInt64, ContinuousClock.Instant)?
+
+    public init(station: RemoteRecoveryHTTP) { self.station = station }
+
+    public func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog) async throws -> UInt64 {
+        try await reserve(originalRecordJSON: originalRecordJSON, context: context, managerID: managerID, log: log, after: 0)
+    }
+
+    public func reserve(originalRecordJSON: String, context: RemoteControlRecoveryContext,
+        managerID: String, log: MembershipLog, after issuedAt: UInt64) async throws -> UInt64 {
+        try await check(original: originalRecordJSON, context: context, manager: managerID, log: log,
+            issuedAt: nil, after: issuedAt)
+    }
+
+    public func revalidate(_ review: RemoteControlRecoveryReview, log: MembershipLog) async throws {
+        _ = try await check(original: review.originalRecordJSON, context: review.context,
+            manager: review.request.keyId, log: log, issuedAt: review.body.issuedAt)
+        try authorize(review, log: log)
+    }
+
+    private func check(original: String, context: RemoteControlRecoveryContext, manager: String,
+        log: MembershipLog, issuedAt: UInt64?, after: UInt64 = 0) async throws -> UInt64 {
+        reservation = nil
+        guard context.stationOrigin == station.controlStationOrigin, context.accountID == log.accountId(),
+              context.genesisHash == log.genesisHash(), context.membershipHead == log.head(), log.frozen() == nil,
+              let member = log.member(deviceId: manager), member.kind == "native", member.status == .active,
+              member.roles.contains("manage"), case .refused(let reason) = try verifyControlRecord(log: log, recordJson: original),
+              reason == "removed_manager" else { throw RemoteControlPublicationError.requiresReview }
+        let canonical = try canonicalJson(json: original)
+        let time = try await station.reserveRecoveryCopy(context: context, original: canonical, manager: manager, issuedAt: issuedAt, after: after)
+        try Task.checkCancellation()
+        guard context.membershipHead == log.head(), log.frozen() == nil else { throw RemoteControlPublicationError.requiresReview }
+        reservation = (context, canonical, manager, time, .now)
+        return time
+    }
+
+    public func authorize(_ review: RemoteControlRecoveryReview, log: MembershipLog) throws {
+        guard let (context, original, manager, time, checked) = reservation,
+              checked.duration(to: .now) < .seconds(30), context == review.context,
+              log.head() == context.membershipHead, log.frozen() == nil,
+              manager == review.request.keyId, review.body.signer == "member:" + manager,
+              review.body.issuedAt == time, try canonicalJson(json: review.originalRecordJSON) == original
+        else { throw RemoteControlPublicationError.requiresReview }
+    }
 }
 
 /// Recovery signatures never supersede originals or enter ordinary delivery.
@@ -90,6 +157,7 @@ public final class RemoteControlRecoveryPublication {
         let signingKey: SavedKey
         var recordJSON: String?
         var attempted: Bool?
+        var replacesRecordID: String?
     }
     private struct SavedKey: Codable {
         let algorithm: String
@@ -141,21 +209,28 @@ public final class RemoteControlRecoveryPublication {
         saved = try PropertyListDecoder().decode(Checkpoint.self, from: checkpoint)
         self.draftJournal = draftJournal
         self.persist = persist
-        guard [1, 2].contains(saved.version), saved.accountID == accountID, saved.genesisHash == genesisHash,
+        guard (1...3).contains(saved.version), saved.accountID == accountID, saved.genesisHash == genesisHash,
               saved.stationOrigin == stationOrigin, saved.operations.count <= 256,
               RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin) else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
-        var ids = Set<String>(), sources = Set<String>(), reviews = Set<String>()
+        var ids = Set<String>(), sources = Set<String>()
+        var reviews: [String: RemoteControlRecoveryReview] = [:]
         var observedTimes: [String: UInt64] = [:]
         var originals: [String: String] = [:]
         for operation in saved.operations {
-            guard saved.version == 2 || operation.attempted == nil else { throw RemoteControlPublicationError.invalidCheckpoint }
+            guard saved.version >= 2 || operation.attempted == nil else { throw RemoteControlPublicationError.invalidCheckpoint }
             let review = try validate(operation)
             let original = try canonicalJson(json: review.originalRecordJSON)
+            let scope = review.context.planID + ":" + review.context.evidenceHash + ":" + review.originalRecordID
+            if let prior = reviews[scope] {
+                guard saved.version >= 3, operation.replacesRecordID == prior.body.recordId,
+                      prior.context == review.context, prior.body.signer == review.body.signer
+                else { throw RemoteControlPublicationError.invalidCheckpoint }
+            } else if operation.replacesRecordID != nil { throw RemoteControlPublicationError.invalidCheckpoint }
+            reviews[scope] = review
             guard ids.insert(review.body.recordId).inserted,
-                  reviews.insert(review.context.planID + ":" + review.context.evidenceHash + ":" + review.originalRecordID).inserted,
                   review.body.issuedAt > (observedTimes[review.body.principal] ?? 0),
                   originals[review.originalRecordID] == nil || originals[review.originalRecordID] == original else {
                 throw RemoteControlPublicationError.invalidCheckpoint
@@ -167,18 +242,17 @@ public final class RemoteControlRecoveryPublication {
         guard ids.isDisjoint(with: sources) else { throw RemoteControlPublicationError.invalidCheckpoint }
     }
 
-    /// The authority must already own a complete clock and the exact reservation.
-    /// A retained lower bound, wall clock or caller-supplied context is insufficient.
+    /// The authority must validate the reservation for this review before the draft is saved.
     public func prepare(originalRecordJSON: String, context: RemoteControlRecoveryContext,
         managerID: String, issuedAt: UInt64, log: MembershipLog,
-        authority: RemoteControlRecoveryAuthorizing?) throws -> RemoteControlRecoveryReview {
+        authority: RemoteControlRecoveryAuthorizing?, replacingRecordID: String? = nil) throws -> RemoteControlRecoveryReview {
         try available()
         guard let authority else { throw RemoteControlPublicationError.requiresReview }
         operating = true
         defer { operating = false }
         try check(context, log: log)
         let old = try original(originalRecordJSON, log: log)
-        if let operation = saved.operations.first(where: {
+        if let operation = saved.operations.last(where: {
             $0.context.planID == context.planID && $0.context.evidenceHash == context.evidenceHash &&
                 (try? parseControlRecord(recordJson: $0.originalRecordJSON).recordId) == old.recordId
         }) {
@@ -187,9 +261,14 @@ public final class RemoteControlRecoveryPublication {
                   try canonicalJson(json: originalRecordJSON) == canonicalJson(json: operation.originalRecordJSON) else {
                 throw RemoteControlPublicationError.requiresReview
             }
-            try authorize(review, log: log, authority: authority)
-            return review
-        }
+            if replacingRecordID == nil {
+                try authorize(review, log: log, authority: authority)
+                return review
+            }
+            guard replacingRecordID == review.body.recordId, issuedAt > review.body.issuedAt else {
+                throw RemoteControlPublicationError.requiresReview
+            }
+        } else if replacingRecordID != nil { throw RemoteControlPublicationError.requiresReview }
         guard let oldKey = log.member(deviceId: String(old.signer.dropFirst(7)))?.authKey,
               let key = log.member(deviceId: managerID)?.authKey else {
             throw RemoteControlPublicationError.requiresReview
@@ -214,7 +293,8 @@ public final class RemoteControlRecoveryPublication {
         catch { if capture.request == nil { throw error } }
         guard let bodyJSON = capture.request?.bodyJson else { throw RemoteControlPublicationError.invalidRecord }
         let operation = Operation(context: context, originalRecordJSON: originalRecordJSON,
-            originalKey: SavedKey(oldKey), bodyJSON: bodyJSON, signingKey: SavedKey(key), attempted: false)
+            originalKey: SavedKey(oldKey), bodyJSON: bodyJSON, signingKey: SavedKey(key), attempted: false,
+            replacesRecordID: replacingRecordID)
         let review = try validate(operation)
         try authorize(review, log: log, authority: authority)
         guard !saved.operations.contains(where: {
@@ -222,7 +302,10 @@ public final class RemoteControlRecoveryPublication {
             (try? Self.body($0.bodyJSON).recordId) == old.recordId
         }), saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
         try draftJournal(log, managerID).withPermittedStopChange(bodyJSON: operation.bodyJSON) {
-            try commit { $0.operations.append(operation) }
+            try commit {
+                if replacingRecordID != nil { $0.version = 3 }
+                $0.operations.append(operation)
+            }
         }
         return review
     }
@@ -248,9 +331,8 @@ public final class RemoteControlRecoveryPublication {
         let operation = saved.operations[index], review = try validate(operation)
         try check(review.context, log: log)
         if let record = operation.recordJSON {
-            guard case .valid = try verifyControlRecord(log: log, recordJson: record) else {
-                throw RemoteControlPublicationError.requiresReview
-            }
+            _ = try checkResignedCopy(log: log, originalJson: operation.originalRecordJSON,
+                copyJson: record, candidateFeedId: review.context.candidateFeedID)
             return record
         }
         guard let authority else { throw RemoteControlPublicationError.requiresReview }
@@ -274,9 +356,8 @@ public final class RemoteControlRecoveryPublication {
         }
         guard current() else { throw RemoteChannelError.staleLink }
         try authorize(review, log: log, authority: authority)
-        guard case .valid = try verifyControlRecord(log: log, recordJson: record) else {
-            throw RemoteControlPublicationError.requiresReview
-        }
+        _ = try checkResignedCopy(log: log, originalJson: operation.originalRecordJSON,
+            copyJson: record, candidateFeedId: review.context.candidateFeedID)
         try commit { $0.operations[index].recordJSON = record }
         return record
     }
@@ -399,7 +480,7 @@ public final class RemoteControlRecoveryPublication {
     }
     private func commit<T>(_ change: (inout Checkpoint) throws -> T) throws -> T {
         var next = saved
-        next.version = 2
+        next.version = max(next.version, 2)
         let result = try change(&next)
         let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
         let bytes = try encoder.encode(next)

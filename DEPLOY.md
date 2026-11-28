@@ -810,6 +810,56 @@ replication privileges with the operator. The Station primary and signing databa
 roles each need EXECUTE on `pg_catalog.pg_control_system()` in their respective
 databases. Restrict network access to the replicas and operators.
 
+For recovery publication, apply [the publication guard](relay-server/signing-store/publication-guard.sql)
+once to the same schema as the signing-store owner. Give the recovery operator
+SELECT on `station_signing_publication_guard` and UPDATE on its `attempt`,
+`origin`, `generation`, and `primary_store` columns. Ordinary signers keep the grants above.
+The database lets in-flight signing reservations finish before publication
+checks the clocks and refuses new reservations and key registrations until
+the primary recovery transaction settles.
+
+With the generation fenced and the replacement feeds staged, an operator can
+review all lists together. Pass the native **Save Reviewed Processes** exports
+for every device list in this Station generation.
+
+```sh
+station-relay-server admin delegated-recovery review-publication processes-a.json processes-b.json
+```
+
+The command uses the operator's primary and signing databases, Portal reporting
+configuration and service wrapping key. It holds signing reservations while it
+compares the staged feeds with current membership, Portal evidence and process
+exports. Station verifies each export under a current native manager's key
+from that list. On success it prints the cut and feed hashes for each list
+and a generation-wide `review_hash`. Review rolls back its primary transaction
+and releases the signing hold. To publish that reviewed generation, run
+
+```sh
+station-relay-server admin delegated-recovery publish <review_hash> processes-a.json processes-b.json
+```
+
+Use the same signed files. Station rebuilds the cuts and verifies their
+processes, clocks, copies and service coverage under both holds. The hash binds
+the origin, generation, plans, cut and feed hashes, and exact export files.
+A changed review requires another `review-publication`. The feeds, individual
+receipts and reopened fence commit in one primary transaction.
+
+After a publisher disconnects, use
+`station-relay-server admin delegated-recovery release-signing-hold` with the
+operator's database connections and the current Station origin and generation.
+It checks the primary fence before clearing the observed signing hold. An active
+publisher keeps its hold. A retry after that publisher finishes is safe.
+The command changes only signing-store availability. To verify a lost publication
+response, run `admin delegated-recovery inspect <genesis_hash>` on either replica
+for each reviewed device list. Compare the plan ID, candidate feed ID, cut hash
+and feed hash in `root.publication_receipt` with the reviewed publication. The
+hashes identify the original publication even after new records arrive. A null
+receipt means this owner has no committed publication for that list and
+configured generation. Check `recovery_ready` separately for the current fence. If the
+primary was replaced while a hold was active, reconcile it against the original
+cluster, database and fence table. If those are lost, keep signing drained
+until the operator has accounted for the old publisher and its commit outcome.
+
 A new key registers before its provisioning transaction commits. The signer durably
 reserves a batch of elapsed milliseconds before it produces the first signature.
 A failed or uncertain publication can consume a range. A retry waits for later elapsed

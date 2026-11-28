@@ -1,6 +1,7 @@
 import AtemClient
 import AstationRemote
 import AppKit
+import CryptoKit
 import Foundation
 
 @MainActor
@@ -131,9 +132,10 @@ final class AstationRecoveryCoordinator {
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
         accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil) throws {
+        let station = try RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken)
         try self.init(accountID: accountID, managerID: managerID, identity: identity, relayURL: relayURL,
             store: RemoteRecoveryStore(accountID: accountID),
-            transport: RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken),
+            transport: station,
             dataKeys: DataEncryptionKeyManager.shared, allowNewDataKey: allowNewDataKey,
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in
@@ -163,7 +165,8 @@ final class AstationRecoveryCoordinator {
                         continuation.resume(returning: $0)
                     }
                 }
-            }, retainedControlTransport: retainedControlTransport, confirmVerifierRoster: { _ in
+            }, controlRecoveryAuthority: RemoteStationRecoveryCopyAuthority(station: station),
+            retainedControlTransport: retainedControlTransport, confirmVerifierRoster: { _ in
                 await withCheckedContinuation { continuation in
                     DeviceOwnerAuth.authenticate(reason: "confirm the reviewed Station server list") {
                         continuation.resume(returning: $0)
@@ -2275,6 +2278,37 @@ extension AstationRecoveryCoordinator {
         return try controls(stationOrigin: stationOrigin).activity(log: log).filter(\.signed)
     }
 
+    struct StationRecoveryOriginal {
+        let body: ControlRecordBody
+        fileprivate let recordJSON: String
+        fileprivate let review: RemoteControlRecoveryPreparation
+    }
+
+    func loadStationRecoveryOriginals(for review: RemoteControlRecoveryPreparation,
+        current: () -> Bool) async throws -> [StationRecoveryOriginal] {
+        try begin(); defer { busy = false }
+        let context = review.context
+        guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
+              let log = membershipLog, log.genesisHash() == context.genesisHash, log.frozen() == nil,
+              log.head() == context.membershipHead, let transport = http as? RemoteControlRecoveryOriginalsTransport
+        else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        let records = try await transport.controlRecoveryOriginals(for: review)
+        guard current(), !Task.isCancelled, membershipLog?.head() == context.membershipHead,
+              membershipLog?.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        return try records.map { record in
+            let body = try parseControlRecord(recordJson: record)
+            guard body.accountId == accountID, body.genesisHash == context.genesisHash,
+                  body.origin == nil || body.origin == relayURL, body.signer.hasPrefix("member:"),
+                  ["revoke", "interrupt_running"].contains(body.action),
+                  case .refused(let reason) = try verifyControlRecord(log: log, recordJson: record),
+                  reason == "removed_manager" else { throw RemoteRecoveryError.requiresReview }
+            // The SDK returns removed_manager only after verifying a historical manager key.
+            return StationRecoveryOriginal(body: body, recordJSON: record, review: review)
+        }
+    }
+
     func loadControlRecoveryPreparation(stationOrigin: String, current: () -> Bool) async throws -> RemoteControlRecoveryPreparation {
         try begin(); defer { busy = false }
         guard current(), !Task.isCancelled, let kit = try currentKit(), let log = membershipLog,
@@ -2376,15 +2410,52 @@ extension AstationRecoveryCoordinator {
                 try append(slot, seq: old.sequence, hash: old.headHash, selected: false)
             }
         }
-        let value: [String: Any] = ["version": 1, "account_id": accountID, "genesis_hash": context.genesisHash,
+        var value: [String: Any] = ["version": 1, "account_id": accountID, "genesis_hash": context.genesisHash,
             "origin": relayURL, "generation": String(context.generation), "plan_id": context.planID,
             "candidate_feed_id": context.candidateFeedID, "source_hash": context.sourceHash,
             "evidence_hash": context.evidenceHash, "reconstruction_hash": plan.reconstructionHash,
             "membership_head": ["seq": context.membershipHead.seq, "hash": context.membershipHead.hash],
             "slots": rows]
+        if let pinned = saved.verifierHistoryRoots?[relayURL] {
+            guard pinned == context.genesisHash else { throw RemoteRecoveryError.invalidCheckpoint }
+            let journal = try verifierHistory(log, relayURL, false)
+            let conflicts = try journal.nativeConflicts(log: log, origin: relayURL)
+            if !conflicts.isEmpty {
+                value["conflicted_slots"] = conflicts.map { ["member": $0.member, "slot": $0.slot] }
+            }
+        }
         let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
         guard data.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Constructed only from the protected export after the manager confirms.
+    struct ConfirmedProcessExport {
+        let managerID: String
+        let input: Data
+
+        fileprivate init(managerID: String, roster: String) {
+            self.managerID = managerID
+            input = encodeFields(fields: [Data("astation-recovery-process-export-v1".utf8),
+                Data(managerID.utf8), Data(SHA256.hash(data: Data(roster.utf8)))])
+        }
+    }
+
+    func signAuthorRoster(_ plan: RemoteControlRecoveryPreparation, reviewed: String, current: () -> Bool) async throws -> String {
+        guard let confirmProcessRoster, try exportAuthorRoster(plan, current: current) == reviewed,
+              let log = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        try identity.requireVerifierManager(log: log, memberID: managerID)
+        guard await confirmProcessRoster() else { throw RemoteRecoveryError.confirmationRequired }
+        guard try exportAuthorRoster(plan, current: current) == reviewed,
+              let latest = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        let proof = ConfirmedProcessExport(managerID: managerID, roster: reviewed)
+        let sig = try identity.signProcessExport(proof, log: latest)
+        guard try exportAuthorRoster(plan, current: current) == reviewed else { throw RemoteRecoveryError.requiresReview }
+        let name = try JSONSerialization.data(withJSONObject: managerID, options: [.fragmentsAllowed])
+        let file = "{\"manager\":" + String(decoding: name, as: UTF8.self) + ",\"roster\":" + reviewed +
+            ",\"signature\":\"" + sig.base64URLEncodedString() + "\"}"
+        guard file.utf8.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
+        return file
     }
 
     func submitSignerReport(_ context: RemoteControlRecoveryContext, slot: String, preview: RemoteControlAuthorInventory,
@@ -2436,7 +2507,7 @@ extension AstationRecoveryCoordinator {
     }
 
     func prepareControlRecoveryCopy(recordID: String, context: RemoteControlRecoveryContext,
-        current: () -> Bool) async throws -> RemoteControlRecoveryReview {
+        stationOriginal: StationRecoveryOriginal? = nil, current: () -> Bool) async throws -> RemoteControlRecoveryReview {
         try begin(); defer { busy = false }
         guard controlRecoveryAvailable, let authority = controlRecoveryAuthority else {
             throw AstationDelegatedControlError.notVerified
@@ -2449,22 +2520,50 @@ extension AstationRecoveryCoordinator {
         let log = try await refreshedLog(genesis: kit.genesisHash)
         try requireManager(log)
         try requireDelegatedControl(log)
-        guard current(), !Task.isCancelled, log.head() == context.membershipHead,
-              let original = try controls().retainedDelivery(recordID: recordID) else {
+        guard current(), !Task.isCancelled, log.head() == context.membershipHead else {
             throw RemoteRecoveryError.requiresReview
         }
         try requireDurableRecoveryCheckpoint()
+        let original: String
+        if let stationOriginal {
+            guard stationOriginal.body.recordId == recordID, stationOriginal.review.context == context,
+                  let transport = http as? RemoteControlRecoveryReviewTransport else { throw RemoteRecoveryError.requiresReview }
+            let latest = try await transport.controlRecoveryReview(accountID: accountID, genesisHash: kit.genesisHash,
+                expected: context.membershipHead)
+            guard current(), !Task.isCancelled, latest.context == context,
+                  latest.reconstructionHash == stationOriginal.review.reconstructionHash,
+                  membershipLog?.head() == context.membershipHead, membershipLog?.frozen() == nil
+            else { throw RemoteRecoveryError.requiresReview }
+            try controls().checkRecoveryOriginal(stationOriginal.recordJSON)
+            original = stationOriginal.recordJSON
+        } else if let local = try controls().retainedDelivery(recordID: recordID) {
+            original = local.recordJSON
+        } else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
         let recovery = try recoveryControls(origin: context.stationOrigin)
-        if let prior = try recovery.reviews().first(where: { $0.context == context && $0.originalRecordID == recordID }) {
-            guard prior.body.signer == "member:" + managerID, prior.originalRecordJSON == original.recordJSON else {
+        let reviews = try recovery.reviews()
+        var replacing: String?
+        if let prior = reviews.last(where: { $0.context == context && $0.originalRecordID == recordID }) {
+            guard prior.body.signer == "member:" + managerID, try canonicalJson(json: prior.originalRecordJSON) == canonicalJson(json: original) else {
                 throw RemoteRecoveryError.requiresReview
             }
-            try authority.authorize(prior, log: log)
+            do {
+                try await authority.revalidate(prior, log: log)
+            } catch RemoteRecoveryCopyReservationError.changed {
+                // A later signed stop may have passed this reservation. A new
+                // draft requires the Station to confirm the obligation again.
+                replacing = prior.body.recordId
+            }
             guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
-            return prior
+            try requireManager(log)
+            try requireDelegatedControl(log)
+            try requireDurableRecoveryCheckpoint()
+            if replacing == nil { return prior }
         }
-        let time = try await authority.reserve(originalRecordJSON: original.recordJSON, context: context,
-            managerID: managerID, log: log)
+        let principal = try parseControlRecord(recordJson: original).principal
+        let lastTime = reviews.last(where: { $0.body.principal == principal })?.body.issuedAt ?? 0
+        let time = try await authority.reserve(originalRecordJSON: original, context: context,
+            managerID: managerID, log: log, after: lastTime)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
         try requireDurableRecoveryCheckpoint()
         let latest = try await refreshedLog(genesis: kit.genesisHash)
@@ -2472,8 +2571,8 @@ extension AstationRecoveryCoordinator {
         try requireDelegatedControl(latest)
         guard current(), !Task.isCancelled, latest.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
         try requireDurableRecoveryCheckpoint()
-        return try recovery.prepare(originalRecordJSON: original.recordJSON, context: context, managerID: managerID,
-            issuedAt: time, log: latest, authority: authority)
+        return try recovery.prepare(originalRecordJSON: original, context: context, managerID: managerID,
+            issuedAt: time, log: latest, authority: authority, replacingRecordID: replacing)
     }
 
     /// Owner confirmation signs only the protected recovery draft. No live feed,
@@ -2498,7 +2597,11 @@ extension AstationRecoveryCoordinator {
             throw RemoteChannelError.staleLink
         }
         try requireDurableRecoveryCheckpoint()
-        try authority.authorize(retained, log: before)
+        try await authority.revalidate(retained, log: before)
+        guard current(), !Task.isCancelled, membershipLog?.head() == before.head() else { throw RemoteChannelError.staleLink }
+        try requireManager(before)
+        try requireDelegatedControl(before)
+        try requireDurableRecoveryCheckpoint()
         var confirmedAt: UInt64 = 0
         if !retained.signed {
             try requireControlChange(retained.request)
@@ -2512,7 +2615,10 @@ extension AstationRecoveryCoordinator {
         try requireManager(latest)
         try requireDelegatedControl(latest)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-        try authority.authorize(retained, log: latest)
+        try await authority.revalidate(retained, log: latest)
+        guard current(), !Task.isCancelled, membershipLog?.head() == latest.head() else { throw RemoteChannelError.staleLink }
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
         try requireDurableRecoveryCheckpoint()
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
@@ -3099,7 +3205,7 @@ extension AstationRecoveryCoordinator {
         if let id = saved.controlJournalIDs?[scope] {
             guard journal.id == id else { throw RemoteRecoveryError.storageUncertain }
         } else {
-            guard journal.revision == 0 else { throw RemoteRecoveryError.requiresReview }
+            guard journal.canEstablishInitialPin else { throw RemoteRecoveryError.requiresReview }
             try journal.establish()
             try persist {
                 $0.version = 6

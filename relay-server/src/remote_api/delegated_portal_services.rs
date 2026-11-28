@@ -61,23 +61,27 @@ pub(super) async fn observe(
     }
 
     let genesis = log.genesis_hash().to_hex();
-    let can_release = snapshot
+    let owner_allows_release = snapshot
         .accounts
         .as_ref()
         .is_none_or(|accounts| accounts.enabled(owner))
         && policy.allows_list_release_in(connection, owner, log.account_id(), &genesis)
             .await.map_err(|_| invalid())?;
-    let policy = |id: &str, key: &str| {
+    let integration = |id: &str, key: &str| {
         id.strip_prefix("svc-")
             .and_then(|id| snapshot.integrations.get(id))
             .filter(|row| {
                 row.policy.owner_account == *owner && row.policy.r9_svc.as_deref() == Some(key)
             })
     };
-    let observation = |id: &str, key: &str| match policy(id, key) {
+    let observation = |id: &str, key: &str| match integration(id, key) {
         Some(row) => {
-            json!({"state":row.policy.state, "interrupt_running":row.policy.interrupt_running,
-            "revoked_at":row.revoked_at, "expires_at":row.policy.expires_at})
+            let mut observation = json!({"state":row.policy.state, "interrupt_running":row.policy.interrupt_running,
+                "revoked_at":row.revoked_at, "expires_at":row.policy.expires_at});
+            if let Some(held) = row.policy.held {
+                observation["held"] = json!(held);
+            }
+            observation
         }
         None => json!({"status":"unresolved"}),
     };
@@ -210,6 +214,9 @@ pub(super) async fn observe(
         .cloned()
         .collect();
     let stops = ServiceStops::from_review(review)?;
+    let now = chrono::Utc::now();
+    let can_release = owner_allows_release && policy.policy_current(now.timestamp())
+        && policy.binding_feed_current(log.account_id(), &genesis, now.timestamp_millis());
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
         let known = stops.get(&(id.as_str(), key.as_str())).copied().unwrap_or_default();
@@ -223,17 +230,31 @@ pub(super) async fn observe(
         let mut reconstruction = known.reconstruct(
             *active,
             managed_keys.contains(identity),
-            policy(id, key),
+            integration(id, key),
             can_release,
             coverage_end.is_some(),
+            now.timestamp(),
         );
         if let Some(end) = coverage_end {
             reconstruction["coverage_end"] = end;
         }
-        rows.push(
-            json!({"service_id":id,"key_fingerprint":key,"observation":observation(id,key),
-            "snapshot_review":reconstruction}),
-        );
+        let mut row = json!({"service_id":id,"key_fingerprint":key,"observation":observation(id,key),
+            "snapshot_review":reconstruction});
+        if let Some(checkpoint) = integration(id, key).filter(|s| matches!(s.policy.state.as_str(), "revoking" | "revoked")) {
+            let integration_id = id.strip_prefix("svc-").ok_or_else(invalid)?;
+            let from_feed = if policy.integrations.get(integration_id).is_some_and(|live|
+                live.owner_account == *owner && live.r9_svc.as_deref() == Some(key)) {
+                policy.known_revocation_ms(integration_id).map_err(|_| invalid())?
+            } else { None };
+            let from_checkpoint = checkpoint.revoked_at.as_ref().map(|at| {
+                let date = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| invalid())?;
+                u64::try_from(date.timestamp_millis()).map_err(|_| invalid())
+            }).transpose()?;
+            if let Some(time) = from_checkpoint.or(from_feed) {
+                row["revoked_at_ms"] = time.into();
+            }
+        }
+        rows.push(row);
     }
 
     // A registration may outlive an enrollment or its failed provisioning transaction.
@@ -281,19 +302,30 @@ pub(super) async fn observe(
         .collect();
     // Portal identifies the Agora.Build owner but does not identify an R9
     // genesis for a service. Keep these out of this list's signing inputs.
-    let unattributed: Vec<_> = portal_keys
-        .difference(&attributed_keys)
+    let unmatched_portal: BTreeSet<_> = portal_keys.difference(&attributed_keys).cloned().collect();
+    let other_lists = match vault {
+        Some(vault) if !unmatched_portal.is_empty() => {
+            other_list_memberships(connection, portal, subject, owner, &genesis, vault, &unmatched_portal).await?
+        }
+        _ => BTreeMap::new(),
+    };
+    let unattributed: Vec<_> = unmatched_portal.iter()
+        .filter(|identity| !other_lists.contains_key(*identity))
         .map(|(id, key)| {
             json!({"service_id":id,"key_fingerprint":key,
             "portal_observation":observation(id,key)})
         })
         .collect();
     let mut evidence = json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
+        "policy_revision":policy.revision,
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":genesis,
         "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
         "provisioning_without_fingerprint":pending,
         "portal_keys_without_attribution":unattributed,"services":rows});
+    if !other_lists.is_empty() {
+        evidence["portal_keys_at_other_lists"] = json!(other_lists.into_values().collect::<Vec<_>>());
+    }
     if vault.is_some() {
         evidence["protected_service_keys"] = json!(protected);
     }
@@ -325,6 +357,82 @@ pub(super) async fn observe(
         .into();
     }
     Ok(evidence)
+}
+
+/// A Portal fingerprint is account-wide. Attribute it elsewhere only when the
+/// unique provisioning row, protected key and the owner's signed list agree.
+async fn other_list_memberships(
+    db: &mut PgConnection,
+    portal: &FeedBinding,
+    subject: &str,
+    owner: &str,
+    current_genesis: &str,
+    vault: &ServiceKeyVault,
+    unmatched: &BTreeSet<(String, String)>,
+) -> Result<BTreeMap<(String, String), Value>, sqlx::Error> {
+    let ids: Vec<_> = unmatched
+        .iter()
+        .filter_map(|(id, _)| id.strip_prefix("svc-"))
+        .collect();
+    let scope =
+        json!({"issuer":portal.issuer,"station_origin":portal.station_origin,"owner":owner});
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT p.integration_id,p.context,p.fingerprint,k.sealed
+         FROM station_integration_provisioning p JOIN station_service_keys k ON k.context=($5 || p.context || ']')
+         WHERE p.binding=$1 AND p.integration_id=ANY($2) AND p.context::jsonb @> $3
+          AND p.context::jsonb->>'genesis'<>$4 AND length(p.fingerprint)=64
+          AND octet_length(p.context)<=4096 AND octet_length(k.sealed)<=8192 FOR SHARE OF p,k NOWAIT",
+    ).bind(portal.storage_key().map_err(|_| invalid())?).bind(ids).bind(scope).bind(current_genesis)
+        .bind(format!(r#"["{SERVICE_KEY_CONTEXT}","#)).fetch_all(&mut *db).await?;
+    let mut by_list = BTreeMap::<String, Vec<(String, String)>>::new();
+    for (id, stored, fingerprint, sealed) in rows {
+        let Ok(context) = serde_json::from_str::<ServiceKeyContext>(&stored) else {
+            continue;
+        };
+        let identity = (format!("svc-{id}"), fingerprint);
+        if context.integration_id == id
+            && context.service_id == identity.0
+            && unmatched.contains(&identity)
+            && serde_json::to_string(&context).map_err(|_| invalid())? == stored
+            && vault.retained_fingerprint(&context, &sealed).as_ref() == Ok(&identity.1)
+        {
+            by_list.entry(context.genesis).or_default().push(identity);
+        }
+    }
+    let mut verified = BTreeMap::new();
+    for (genesis, identities) in by_list {
+        let root: Option<(String, Value)> = sqlx::query_as(
+            "SELECT state->>'account',state->'membership' FROM remote_recovery_roots
+             WHERE genesis_hash=$1 AND account_subject=$2 AND octet_length(state::text)<=$3
+              AND state->>'account' IS NOT NULL AND state ? 'membership' FOR SHARE NOWAIT",
+        )
+        .bind(&genesis)
+        .bind(subject)
+        .bind(super::MAX_STATE as i64)
+        .fetch_optional(&mut *db)
+        .await?;
+        let Some((account, membership)) = root else {
+            continue;
+        };
+        let hash = atem_client::Hash32::from_hex(&genesis).map_err(|_| invalid())?;
+        let Ok(log) = Membership::from_stored(&account, &hash, &membership) else {
+            continue;
+        };
+        if log.frozen().is_some() {
+            continue;
+        }
+        for (id, key) in identities {
+            if log.member(&id).is_some_and(|m| {
+                matches!(m.status, MemberStatus::Active | MemberStatus::Removed)
+                    && m.member.service_key_fingerprint().as_ref() == Some(&key)
+            }) {
+                let proof = json!({"service_id":id,"key_fingerprint":key,"genesis_hash":genesis,
+                    "membership_head":log.head().to_json()});
+                verified.insert((id, key), proof);
+            }
+        }
+    }
+    Ok(verified)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -384,6 +492,7 @@ impl ServiceStops {
         row: Option<&CheckpointIntegration>,
         can_release: bool,
         coverage_ended: bool,
+        now: i64,
     ) -> Value {
         if !provisioned {
             return json!({"status":"provisioning_unresolved"});
@@ -417,6 +526,9 @@ impl ServiceStops {
         let actions = match desired {
             Some(ServiceDesired::Held) => json!([{"action":"cover"},{"action":"hold"}]),
             Some(ServiceDesired::Active) => {
+                if !row.policy.confirms_control_release(now) {
+                    return json!({"status":"pre_expiry_state_unresolved"});
+                }
                 if !can_release {
                     return json!({"status":"owner_availability_unresolved"});
                 }
@@ -455,6 +567,7 @@ mod tests {
                 Some(row),
                 true,
                 false,
+                100,
             )
         };
         assert_eq!(actions(&review, &row)["fresh_stop_actions"], json!([]));
@@ -485,8 +598,12 @@ mod tests {
 
         row.policy.state = "ready".into();
         assert_eq!(
-            ServiceStops::default().reconstruct(true, true, Some(&row), false, false)["status"],
+            ServiceStops::default().reconstruct(true, true, Some(&row), false, false, 100)["status"],
             "owner_availability_unresolved"
         );
+        let expiry = row.policy.expires_at().unwrap();
+        let at = |time| ServiceStops::default().reconstruct(true, true, Some(&row), true, false, time);
+        assert_eq!(at(expiry - 1)["fresh_actions"][1]["action"], "release");
+        assert_eq!(at(expiry), json!({"status":"pre_expiry_state_unresolved"}));
     }
 }

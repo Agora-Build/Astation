@@ -48,6 +48,7 @@ pub(crate) mod verifier_replicas;
 
 #[path = "verifier_reports.rs"]
 pub(super) mod verifier_reports;
+pub(crate) use verifier_reports::external::ExternalVerifierRequest;
 
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
@@ -128,7 +129,26 @@ impl Root {
 #[derive(Debug)]
 pub(crate) enum HostRouteError {
     Refused(Value),
+    Suspended(Value),
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteService {
+    Allowed,
+    Unavailable,
+    Disabled,
+    NoOwner,
+}
+
+impl RouteService {
+    fn suspension_text(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => Some("service suspended: account disabled at Agora.Build"),
+            Self::NoOwner => Some("service suspended: no Agora.Build owner at this Station"),
+            Self::Allowed | Self::Unavailable => None,
+        }
+    }
 }
 
 /// Carrier A has no route proof; it is usable only while this exact room owner
@@ -273,6 +293,31 @@ impl RecoveryStore {
         }
     }
 
+    pub(crate) async fn control_recovery_originals(&self, genesis: &str, plan: &str, review: &str,
+        offset: usize, owner: &str) -> Reply {
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
+        match tokio::time::timeout(std::time::Duration::from_secs(10),
+            delegated_recovery::plan::originals_for_owner(pool, binding, genesis, owner, plan, review, offset)).await {
+            Ok(Ok(Some(page))) => (StatusCode::OK, Json(page)),
+            Ok(Ok(None)) => error(StatusCode::CONFLICT, "recovery_plan_changed"),
+            Ok(Err(sqlx::Error::RowNotFound)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
+    pub(crate) async fn reserve_control_copy(&self, genesis: &str, owner: &str, request: delegated_recovery::plan::copy_reservations::Request) -> Reply {
+        use delegated_recovery::plan::copy_reservations::{reserve, Error};
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), reserve(pool, binding, genesis, owner, request)).await {
+            Ok(Ok(receipt)) => (StatusCode::OK, Json(receipt)),
+            Ok(Err(Error::Changed)) => error(StatusCode::CONFLICT, "recovery_plan_changed"),
+            Ok(Err(Error::Clock)) => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_clock_wait"),
+            Ok(Err(Error::Limit)) => error(StatusCode::TOO_MANY_REQUESTS, "recovery_copy_limit"),
+            Ok(Err(Error::Storage(sqlx::Error::RowNotFound))) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
     pub(crate) async fn mint_signer_challenge(&self, genesis: &str, owner: &str, request: delegated_recovery::plan::signer_challenges::Request) -> Reply {
         use delegated_recovery::plan::signer_challenges::MintError;
         let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
@@ -366,7 +411,7 @@ impl RecoveryStore {
     pub(crate) async fn with_delegated_route<T, F, Fut>(&self, binding: &HostBinding, action: F) -> Option<T>
     where F: FnOnce() -> Fut, Fut: std::future::Future<Output = T> {
         let origin = self.delegated_origin.get()?;
-        self.with_root(&binding.genesis, |root, log| delegated::current_link(root, log, origin, binding),
+        self.with_root(&binding.genesis, &binding.room, |root, log| delegated::current_link(root, log, origin, binding),
             |_, _| action()).await
     }
 
@@ -378,7 +423,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         let origin = self.delegated_origin.get()?;
-        self.with_root(&binding.genesis,
+        self.with_root(&binding.genesis, &binding.room,
             |root, log| delegated::current_link(root, log, origin, binding),
             |root, log| {
                 let response = match call {
@@ -451,7 +496,9 @@ impl RecoveryStore {
             )
             .await;
         if reply.0 != StatusCode::OK {
-            return Err(if reply.0 == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(if reply.0 == StatusCode::FORBIDDEN && reply.1.0["code"] == "service_suspended" {
+                HostRouteError::Suspended(reply.1.0)
+            } else if reply.0 == StatusCode::SERVICE_UNAVAILABLE {
                 HostRouteError::Unavailable
             } else {
                 HostRouteError::Refused(if reply.1 .0["type"] == "relay" {
@@ -484,11 +531,20 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| root.current(binding) && binding.valid(log),
             |_, _| action(),
         )
         .await
+    }
+
+    /// A channel may close because its association changed or because the
+    /// account lost service. Only the same still-proved link can learn the latter.
+    pub(crate) async fn with_host_suspension<T, F, Fut>(&self, binding: &HostBinding, action: F) -> Option<T>
+    where F: FnOnce(&'static str) -> Fut, Fut: std::future::Future<Output = T> {
+        self.with_root_service(&binding.genesis, &binding.room,
+            |root, log| root.current(binding) && binding.valid(log),
+            |_, _, suspended| async move { Some(action(suspended?).await) }).await?
     }
 
     pub(crate) async fn with_owner_route<T, F, Fut>(
@@ -502,7 +558,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &route.genesis,
+            &route.genesis, &route.room,
             |root, log| {
                 // A socket that once proved its identity cannot become an
                 // unproved owner-present route when that proof is invalidated.
@@ -529,7 +585,7 @@ impl RecoveryStore {
         generation: u64,
     ) -> Option<VerificationAuthority> {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| {
                 root.current(binding)
                     && binding.valid(log)
@@ -568,7 +624,7 @@ impl RecoveryStore {
         Fut: std::future::Future<Output = T>,
     {
         self.with_root(
-            &binding.genesis,
+            &binding.genesis, &binding.room,
             |root, log| {
                 let manager_current = log.member(&binding.room).is_some_and(|m| {
                     m.status == MemberStatus::Active
@@ -602,15 +658,28 @@ impl RecoveryStore {
         ).await
     }
 
-    async fn with_root<T, P, F, Fut>(&self, genesis: &str, predicate: P, action: F) -> Option<T>
+    async fn with_root<T, P, F, Fut>(&self, genesis: &str, room: &str, predicate: P, action: F) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
         F: FnOnce(&Root, &Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
+        self.with_root_service(genesis, room, predicate, |root, log, suspended| {
+            let action = suspended.is_none().then(|| action(root, log));
+            async move { Some(action?.await) }
+        }).await?
+    }
+
+    async fn with_root_service<T, P, F, Fut>(&self, genesis: &str, room: &str, predicate: P, action: F)
+        -> Option<T>
+    where
+        P: FnOnce(&Root, &Membership) -> bool,
+        F: FnOnce(&Root, &Membership, Option<&'static str>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            self.with_root_inner(genesis, predicate, action),
+            self.with_root_inner(genesis, room, predicate, action),
         )
         .await
         .ok()
@@ -620,12 +689,13 @@ impl RecoveryStore {
     async fn with_root_inner<T, P, F, Fut>(
         &self,
         genesis: &str,
+        room: &str,
         predicate: P,
         action: F,
     ) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
-        F: FnOnce(&Root, &Membership) -> Fut,
+        F: FnOnce(&Root, &Membership, Option<&'static str>) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         let valid = |root: &Root| {
@@ -643,7 +713,7 @@ impl RecoveryStore {
             let roots = memory.lock().await;
             let (_, root) = roots.get(genesis)?;
             let log = valid(root)?;
-            return Some(action(root, &log).await);
+            return Some(action(root, &log, None).await);
         }
         let pool = self.pool.as_ref()?;
         let mut tx = pool.begin().await.ok()?;
@@ -653,17 +723,51 @@ impl RecoveryStore {
             .execute(&mut *tx)
             .await
             .ok()?;
-        let saved: Option<(Value,)> = sqlx::query_as(
-            "SELECT state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE",
+        let saved: Option<(String,Value)> = sqlx::query_as(
+            "SELECT account_subject,state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE",
         )
         .bind(genesis)
         .fetch_optional(&mut *tx)
         .await
         .ok()?;
-        let root: Root = serde_json::from_value(saved?.0).ok()?;
+        let (principal,state) = saved?;
+        let root: Root = serde_json::from_value(state).ok()?;
         let log = valid(&root)?;
+        let service = self.route_service(&mut tx, &principal, &root.account, genesis, room).await.ok()?;
+        let suspended = match service {
+            RouteService::Allowed => None,
+            other => Some(other.suspension_text()?),
+        };
         // No state changes: dropping the read transaction releases its locks.
-        Some(action(&root, &log).await)
+        Some(action(&root, &log, suspended).await)
+    }
+
+    async fn route_service(
+        &self,
+        db: &mut sqlx::PgConnection,
+        principal: &str,
+        account: &str,
+        genesis: &str,
+        room: &str,
+    ) -> Result<RouteService, sqlx::Error> {
+        let Some(origin) = self
+            .delegated_origin
+            .get()
+            .filter(|s| crate::account_identity::built_in_station(s))
+        else {
+            return Ok(RouteService::Allowed);
+        };
+        let Some(station) = self
+            .verifier_portal
+            .get()
+            .filter(|s| &s.station_origin == origin)
+        else {
+            return Ok(RouteService::Unavailable);
+        };
+        delegated_recovery::route_ownership::route_service(
+            db, station, principal, account, genesis, room,
+        )
+        .await
     }
 
     pub fn disabled() -> Arc<Self> {
@@ -861,7 +965,12 @@ impl RecoveryStore {
             },
             None => None,
         };
-        if let Operation::VerifierReport { origin, .. } = &operation {
+        if let Operation::VerifierReport { origin, command } = &operation {
+            if let Some(root) = root.as_ref() {
+                if !verifier_reports::external::readable(connection, self.verifier_portal.get(), &owner, hash, root, command).await? {
+                    return Ok(error(StatusCode::CONFLICT, "verifier_report_context_changed"));
+                }
+            }
             if self.delegated_enabled() && crate::account_identity::built_in_station(origin) {
                 let Some(root) = root.as_ref() else {
                     return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
@@ -874,14 +983,41 @@ impl RecoveryStore {
                 }
             }
         }
+        let new_service_nonce = match (&operation, root.as_ref(), self.verifier_portal.get()) {
+            (Operation::VerifierReport { origin, command: verifier_reports::Command::Create { challenge, .. } }, Some(root), Some(portal))
+                if self.delegated_enabled() && portal.station_origin == *origin => {
+                verifier_reports::external::new_service_challenge(root, challenge)
+            }
+            _ => None,
+        };
+        let admitting_proof = matches!(&operation, Operation::HostRoute { .. });
+        let admitted_room = match &operation {
+            Operation::HostRoute { room, .. } => Some(room.clone()),
+            Operation::Delegated { binding: Some(binding), .. } => Some(binding.room.clone()),
+            _ => None,
+        };
         let proved_room = match (&operation, self.room_ownership.as_ref()) {
             (Operation::HostRoute { room, proxy, .. }, Some(scope)) => Some((scope, room.clone(), proxy.is_some())),
             _ => None,
         };
-        let (root, reply) = match apply(root, hash, operation, now()) {
+        let (mut root, reply) = match apply(root, hash, operation, now()) {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
+        if let (Some((nonce, id)), Some(portal)) = (new_service_nonce, self.verifier_portal.get()) {
+            verifier_reports::external::bind(connection, portal, &owner, hash, &mut root, &nonce, &id).await?;
+        }
+        if let Some(room) = admitted_room {
+            let service = self.route_service(connection, &owner, &root.account, genesis, &room).await?;
+            if service != RouteService::Allowed {
+                // apply verified the exact route proof before the owner lookup.
+                if let Some(text) = service.suspension_text().filter(|_| admitting_proof) {
+                    let refusal = RelayReply::suspended(text).map_err(|_| sqlx::Error::Protocol("invalid suspension text".into()))?;
+                    return Ok((StatusCode::FORBIDDEN, Json(refusal.to_json())));
+                }
+                return Ok(unavailable());
+            }
+        }
         if let Some(((origin, issuer), room, proxy)) = proved_room {
             let routes = if proxy { &root.proxies } else { &root.routes };
             let binding = reply.1.0["binding"]["host"].as_str().and_then(|host| routes.get(host))

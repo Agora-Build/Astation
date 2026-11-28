@@ -195,6 +195,7 @@ class MobileDelegatedProtocolTest {
     }
 
     @Test fun ackDeadline() = acknowledgments("deadline")
+    @Test fun ackLateRevocationTime() = acknowledgments("late-start")
     @Test fun ackDurableRestartAndReplicas() = acknowledgments("durable")
     @Test fun ackPerEffectAndCrossAccountRefusal() = acknowledgments("per-effect")
     @Test fun ackPortalRefusalsAndReportingStop() = acknowledgments("portal-refusals")
@@ -217,8 +218,15 @@ class MobileDelegatedProtocolTest {
         fun transition(on: AckLedgerHandle, step: JSONObject): AckTransition? {
             val result = when {
                 step.has("control_record") -> on.record(records.getValue(step.getString("control_record")).getJSONObject("record").toString(),
-                    if (step.has("revoked_at_ms")) step.number("revoked_at_ms") else now,
+                    if (step.has("revoked_at_ms")) step.number("revoked_at_ms") else null,
                     step.getJSONArray("covered_hosts").strings(), now)
+                step.has("learn_revoked_at") -> {
+                    fun learn() = on.learnRevokedAt(step.getString("learn_revoked_at"), step.number("revoked_at_ms"), now)
+                    if (step.has("refused")) {
+                        refuses(step.getString("refused")) { learn() }
+                        null
+                    } else learn()
+                }
                 step.has("control_ack") -> {
                     val link = setup.getJSONObject("links").getJSONObject(step.getString("link"))
                     val association = LinkAssociationInfo(link.getString("account_id"), link.getString("genesis_hash"),
@@ -246,11 +254,11 @@ class MobileDelegatedProtocolTest {
         }
         fun sendable(id: String) = assertTrue(ledger.pendingReports().any { it.reportId == id })
 
-        try {
-            for ((index, step) in fixture.getJSONArray("steps").objects().withIndex()) vector("ack-$suffix step $index") {
+        fun runSteps(steps: JSONArray) {
+            for ((index, step) in steps.objects().withIndex()) vector("ack-$suffix step $index") {
                 val before = ledger.toJson()
                 when {
-                    step.has("control_record") || step.has("control_ack") || step.has("tick") -> {
+                    step.has("control_record") || step.has("control_ack") || step.has("learn_revoked_at") || step.has("tick") -> {
                         val change = transition(ledger, step)
                         assertEquals("A transition must not mutate its input", before, ledger.toJson())
                         if (change != null) {
@@ -269,6 +277,44 @@ class MobileDelegatedProtocolTest {
                         assertTrue(requireNotNull(transition(own(AckLedgerHandle.fromJson(committed)), inner)).made.isEmpty())
                     }
                     step.has("advance_ms") -> now += step.number("advance_ms")
+                    step.has("branch") -> {
+                        val saved = committed
+                        val savedTime = now
+                        val savedClient = client
+                        runSteps(step.getJSONArray("branch"))
+                        committed = saved
+                        ledger = own(AckLedgerHandle.fromJson(saved))
+                        now = savedTime
+                        client = savedClient
+                    }
+                    step.has("either_order") -> {
+                        val inputs = step.getJSONArray("either_order").objects()
+                        assertEquals(2, inputs.size)
+                        fun applyOrder(steps: List<JSONObject>): Pair<String, List<String>> {
+                            var state = own(AckLedgerHandle.fromJson(committed))
+                            val reports = mutableListOf<String>()
+                            for (input in steps) {
+                                val change = requireNotNull(transition(state, input))
+                                assertTrue(change.alerts.isEmpty())
+                                reports.addAll(change.made.map { it.reportId })
+                                state = change.next
+                            }
+                            return state.toJson() to reports
+                        }
+                        val ordered = applyOrder(inputs)
+                        assertEquals(ordered, applyOrder(inputs.reversed()))
+                        assertEquals(step.getJSONArray("made").strings(), ordered.second)
+                        committed = ordered.first
+                        ledger = own(AckLedgerHandle.fromJson(committed))
+                    }
+                    step.has("expect_start") -> {
+                        val revocations = JSONObject(committed).getJSONObject("revocations")
+                        val starts = JSONObject()
+                        for (principal in revocations.keys()) {
+                            starts.put(principal, revocations.getJSONObject(principal).getLong("revoked_at_ms"))
+                        }
+                        jsonEqual(step.getJSONObject("expect_start"), starts)
+                    }
                     step.has("restart") -> {
                         ledger = own(AckLedgerHandle.fromJson(committed))
                         assertEquals(committed, ledger.toJson())
@@ -316,7 +362,9 @@ class MobileDelegatedProtocolTest {
                     else -> error("Unknown fixture step: $step")
                 }
             }
-        } finally { handles.asReversed().forEach { it.close() } }
+        }
+        try { runSteps(fixture.getJSONArray("steps")) }
+        finally { handles.asReversed().forEach { it.close() } }
     }
 
     private fun intent(value: ReportIntentInfo): JSONObject {

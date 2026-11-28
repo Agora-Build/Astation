@@ -9,6 +9,10 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin migrate-room-owners <genesis_hash>\n\
        station-relay-server admin delegated-recovery status|fence\n\
+       station-relay-server admin delegated-recovery release-signing-hold\n\
+       station-relay-server admin delegated-recovery review-publication <process-export> [<process-export> ...]\n\
+       station-relay-server admin delegated-recovery publish <review_hash> <process-export> [<process-export> ...]\n\
+       station-relay-server admin delegated-recovery list-roots [after_genesis_hash]\n\
        station-relay-server admin delegated-recovery restore-report-stop <evidence_hash>\n\
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
@@ -23,12 +27,15 @@ announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
 replica drops the cached key at once. Bindings are kept.\n\
 \n\
 delegated-recovery uses DATABASE_URL, PUBLIC_BASE_URL and\n\
-STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read; fence\n\
+STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read. list-roots\n\
+compares the fenced Station with STATION_SIGNING_CEILING_DATABASE_URL. fence\n\
 durably stops delegated serving, signing and reporting. prepare retains the old\n\
 evidence and reserves a replacement feed behind a closed fence. retain-stops adds\n\
 native stop evidence to that exact preparation. retain-native imports a complete\n\
 native export, keeping unsigned intent and destinations separate. retain-resigned\n\
-retains fresh manager copies for the replacement feed. None resumes them.";
+retains fresh manager copies for the replacement feed. review-publication verifies\n\
+the signed process exports and returns a review hash. publish rechecks the files\n\
+and hash, installs every recovered feed and reopens the generation.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -171,9 +178,19 @@ async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std:
 }
 
 async fn delegated_recovery(args: &[String]) -> i32 {
-    use crate::remote_api::recovery::delegated_recovery::{generation, inspect, inspect_root, Binding};
+    use crate::remote_api::recovery::delegated_recovery::{canonical_genesis, generation, inspect, inspect_root, list_roots, Binding};
     let (fence, root, files, plan_or_hash) = match args {
-        [command] if command == "status" => (false, None, None, None),
+        [command] if matches!(command.as_str(), "status" | "release-signing-hold") => (false, None, None, None),
+        [command, paths @ ..] if command == "review-publication" && !paths.is_empty()
+            && paths.iter().all(|file| !file.is_empty()) => (false, None, Some(paths), None),
+        [command, hash, paths @ ..] if command == "publish" && canonical_genesis(hash)
+            && !paths.is_empty() && paths.iter().all(|file| !file.is_empty()) =>
+                (false, None, Some(paths), Some(hash)),
+        [command, rest @ ..] if command == "list-roots"
+            && (rest.is_empty() || rest.len() == 1 && canonical_genesis(&rest[0])) =>
+        {
+            (false, None, None, None)
+        }
         [command] if command == "fence" => (true, None, None, None),
         [command, hash] if command == "restore-report-stop"
             && crate::remote_api::recovery::delegated_recovery::canonical_genesis(hash) =>
@@ -241,6 +258,66 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if args[0] == "release-signing-hold" {
+        let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+            eprintln!("release-signing-hold requires the independent signing database");
+            return 1;
+        };
+        return match crate::remote_api::recovery::delegated_recovery::plan::publication::reconcile_signing_hold(
+            &pool, &binding, &signing,
+        ).await {
+            Ok(()) => { println!("Signing hold reconciled."); 0 }
+            Err(_) => { eprintln!("Check the Station generation, active publication and signing database."); 1 }
+        };
+    }
+    if matches!(args[0].as_str(), "review-publication" | "publish") {
+        use crate::remote_api::recovery::delegated_recovery::plan::{author_roster, publication};
+        let mut lists = publication::ProcessLists::default();
+        for file in files.expect("validated publication inputs") {
+            let Ok(bytes) = read_stop_evidence(std::path::Path::new(file), author_roster::INPUT_LIMIT).await else {
+                eprintln!("could not read bounded native process export");
+                return 1;
+            };
+            if lists.add(bytes).is_err() {
+                eprintln!("invalid process export or combined process lists exceed the per-list limit");
+                return 1;
+            }
+        }
+        let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+            eprintln!("recovery publication requires the independent signing database");
+            return 1;
+        };
+        let Ok(Some(portal)) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+            eprintln!("recovery publication requires the Portal reporting configuration");
+            return 1;
+        };
+        let Ok(Some(vault)) = crate::station_integrations::configured_service_vault() else {
+            eprintln!("recovery publication requires the service wrapping key");
+            return 1;
+        };
+        return match publication::operator_publication(&pool, &binding, &portal, &signing, &vault,
+            lists, plan_or_hash.map(String::as_str)).await {
+            Ok(report) => { println!("{report}"); 0 }
+            Err(_) => {
+                eprintln!("check status and inspect each list's committed receipt; for a closed generation, refresh prepare and review-publication with the signed process exports");
+                1
+            }
+        };
+    }
+    if args[0] == "list-roots" {
+        let Ok(Some(signing)) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+            eprintln!("list-roots requires the independent signing database");
+            return 1;
+        };
+        let Ok(portal) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+            eprintln!("invalid Portal reporting configuration");
+            return 1;
+        };
+        return match list_roots(&pool, &binding, &signing, portal.as_ref(), args.get(1).map(String::as_str)).await {
+            Ok(page) => { println!("{page}"); 0 }
+            Err(_) => { eprintln!("could not list recovery roots; check the closed generation and both databases"); 1 }
+        };
+    }
     if let Some((command, genesis)) = root {
         let report = if let Some(files) = files {
             use crate::remote_api::recovery::delegated_recovery::plan::{author_roster, native, signatures, stops};
@@ -502,6 +579,8 @@ mod tests {
         assert_eq!(main(&["delegated-recovery".into()]).await, 2);
         assert_eq!(main(&["delegated-recovery".into(), "resume".into()]).await, 2);
         assert_eq!(main(&["delegated-recovery".into(), "fence".into(), "extra".into()]).await, 2);
+        assert_eq!(main(&["delegated-recovery".into(), "list-roots".into(), "bad-cursor".into()]).await, 2);
+        assert_eq!(main(&["delegated-recovery".into(), "list-roots".into(), "0".repeat(64), "extra".into()]).await, 2);
         for command in ["inspect", "prepare"] {
             for genesis in ["", "not-a-hash", &"A".repeat(64), &"g".repeat(64), &"0".repeat(63)] {
                 assert_eq!(main(&["delegated-recovery".into(), command.into(), genesis.into()]).await, 2);

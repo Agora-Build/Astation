@@ -41,6 +41,44 @@ impl NativeAuthority {
 }
 
 impl RelayHub {
+    pub(crate) async fn channel_proxy_current(&self, binding: &HostBinding) -> bool {
+        let Some(proxy) = &binding.proxy else { return true; };
+        let target = &binding.connection;
+        if target.replica == self.replica_id() {
+            return self.host_binding(&target.conn).as_ref() == Some(binding)
+                && self.proxy_current(&target.conn).await;
+        }
+        let Some((delivery, rx)) = self.channels().delivery() else { return false; };
+        let message = InboxMessage::CheckChannelProxy {
+            connection_id: target.conn.clone(), generation: proxy.generation.clone(),
+            reply_to: self.replica_id().to_owned(), delivery: delivery.clone(),
+        };
+        let sent = self.inner.bus.send_inbox(&target.replica, message).await.is_ok();
+        let current = sent && matches!(tokio::time::timeout(Duration::from_secs(2), rx).await, Ok(Ok(true)));
+        self.channels().delivered(&delivery, false);
+        current
+    }
+
+    /// A suspended, still-authenticated proxy keeps its generation for recovery.
+    /// The writer rechecks both proofs before delivering the notice or a refusal.
+    pub(super) async fn hold_suspended_proxy(&self, binding: &HostBinding, request: Option<&str>) -> bool {
+        if binding.proxy.is_none() { return false; }
+        let Some(store) = self.inner.recovery.get() else { return false };
+        store.with_host_suspension(binding, |_| async {
+            if !self.proxy_current(&binding.connection.conn).await { return false; }
+            let refusal = request.and_then(|text| {
+                use atem_client::control::{CallRefused, RefusalCode, RefusedCall, ToStation};
+                let call = match ToStation::decode(text.as_bytes()).ok()? {
+                    ToStation::ControlSync(_) => RefusedCall::ControlSync,
+                    ToStation::MembershipFetch(_) => RefusedCall::MembershipFetch,
+                    ToStation::ControlAck(_) => RefusedCall::ControlAck,
+                };
+                Some(CallRefused { call, code: RefusalCode::Forbidden }.to_json().ok()?.to_string())
+            }).unwrap_or_default();
+            self.local().send_scoped(binding, crate::cluster::local::FrameScope::ProxySuspension, refusal)
+        }).await == Some(true)
+    }
+
     pub(super) async fn proxy_current(&self, connection: &str) -> bool {
         let authority = self
             .inner
@@ -170,11 +208,13 @@ async fn run(
         .local()
         .register(&id, &params.room, SocketRole::NativeProxy);
     let (sink, mut stream) = socket.split();
-    let mut writer = tokio::spawn(write_loop_checked(
+    let channels = Arc::new(host_suspension::RoutedHostChannels::default());
+    let mut writer = tokio::spawn(write_host_loop(
         sink,
         outbox,
         params.room.clone(),
         Some(hub.clone()),
+        Some(channels.clone()),
     ));
     let challenge = new_relay_challenge();
     hub.local().send(
@@ -239,6 +279,7 @@ async fn run(
                 // Track before queueing the verdict; cleanup retires it even if
                 // admission to the bounded writer fails.
                 binding = Some(route.clone());
+                let _ = channels.binding.set(route.clone());
                 hub.inner
                     .proxy_authorities
                     .lock()
@@ -260,7 +301,8 @@ async fn run(
                 }
                 hub.delegated_heads(&route).await.then_some(())
             }
-            Err(crate::remote_api::recovery::HostRouteError::Refused(frame)) => {
+            Err(crate::remote_api::recovery::HostRouteError::Refused(frame)
+                | crate::remote_api::recovery::HostRouteError::Suspended(frame)) => {
                 hub.local().send_required(&id, frame.to_string());
                 None
             }
@@ -295,8 +337,10 @@ async fn run(
                         .await
                         .is_none()
                     {
+                        if hub.hold_suspended_proxy(route, Some(&text)).await { continue; }
                         break;
                     }
+                    channels.host_reply(&text);
                     match tokio::time::timeout(
                         Duration::from_secs(30),
                         hub.delegated_call(&id, &text),
@@ -311,6 +355,7 @@ async fn run(
                                 hub.remote_channel_reply(&hub.me(&id), &text).await;
                             }
                         }
+                        _ if hub.hold_suspended_proxy(route, Some(&text)).await => {},
                         _ => break,
                     }
                 }

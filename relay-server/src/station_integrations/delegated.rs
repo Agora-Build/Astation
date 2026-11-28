@@ -1,9 +1,22 @@
 use super::*;
 use crate::remote_api::recovery::delegated::{
-    Command, LedgerUpdate, ReportControlEvent, ServiceDesired,
+    Command, LedgerUpdate, ReportControlEvent, ServiceDesired, ServiceReconciliation,
 };
 use crate::remote_api::recovery::delegated_recovery::plan::reporting_history::reconcile_report_restart;
-use atem_client::control::{AckLedger, ReportAnswer};
+use atem_client::control::{AckLedger, ReportAnswer, ReportIntent};
+use super::binding_reports::BindingReport;
+
+#[derive(Clone, Copy)]
+enum ReportQueue<'a> {
+    Revocation { genesis: &'a str, owner: &'a str },
+    Ownership,
+}
+
+
+enum PendingReport<'a> {
+    Revocation { genesis: &'a str, owner: &'a str, intent: ReportIntent },
+    Ownership(BindingReport),
+}
 
 impl StationIntegrations {
     pub(super) async fn reconcile_delegated_services(&self) {
@@ -34,6 +47,19 @@ impl StationIntegrations {
     }
 
     async fn reconcile_delegated_service(&self, id: &str) -> Result<(), ()> {
+        loop {
+            match self.reconcile_service_once(id).await? {
+                ServiceReconciliation::Current => return Ok(()),
+                ServiceReconciliation::FeedChanged => {
+                    self.app.recovery.notify_delegated_change();
+                    return Ok(());
+                }
+                ServiceReconciliation::TimeSavedWithControlsPending => continue,
+            }
+        }
+    }
+
+    async fn reconcile_service_once(&self, id: &str) -> Result<ServiceReconciliation, ()> {
         let context = self.context(id).await.map_err(|_| ())?;
         let principal = self.owner_principal(&context.owner).await.map_err(|_| ())?;
         let mut tx = self.policies.0.begin().await.map_err(|_| ())?;
@@ -51,25 +77,18 @@ impl StationIntegrations {
         if checkpoint.binding != self.binding {
             return Err(());
         }
-        let policy = checkpoint.owned(id, &context.owner, chrono::Utc::now().timestamp())?;
+        let now = chrono::Utc::now().timestamp();
+        let policy = checkpoint.owned(id, &context.owner, now)?;
         // Expiry changes API access only and cannot release an earlier hold.
-        let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
-        let signer = crate::service_keys::load_approved_in(
-            &mut tx,
-            &self.vault,
-            &context,
-            policy.r9_svc.as_deref().ok_or(())?,
-        )
-        .await?;
-        let recovery = &self.app.recovery;
-        let published = recovery
-            .reconcile_service_in(&mut tx, &principal, &context, &signer, desired, &checkpoint)
+        let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(ServiceReconciliation::Current) };
+        if desired == ServiceDesired::Active && !policy.confirms_control_release(now) {
+            return Ok(ServiceReconciliation::Current);
+        }
+        let result = self.app.recovery
+            .reconcile_service_in(&mut tx, &principal, &context, &self.vault, desired, &checkpoint)
             .await?;
         tx.commit().await.map_err(|_| ())?;
-        if published {
-            recovery.notify_delegated_change();
-        }
-        Ok(())
+        Ok(result)
     }
 
     pub(super) async fn run_delegated_reports(self: Arc<Self>) {
@@ -89,6 +108,10 @@ impl StationIntegrations {
         }
         let mut after = String::new();
         loop {
+            if self.app.recovery.active_delegated_binding().is_some_and(|fence| fence.origin == self.binding.station_origin)
+                && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+                self.deliver_reports(ReportQueue::Ownership).await;
+            }
             let Some(accounts) = self.app.recovery.delegated_accounts(&after).await else {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -162,6 +185,10 @@ impl StationIntegrations {
     }
 
     async fn deliver_delegated_reports(&self, genesis: &str, owner: &str) {
+        self.deliver_reports(ReportQueue::Revocation { genesis, owner }).await;
+    }
+
+    async fn deliver_reports(&self, queue: ReportQueue<'_>) {
         // Re-read after each settlement: a final cannot overtake a per-host
         // report, including when another replica settles that report first.
         for _ in 0..8 {
@@ -183,37 +210,28 @@ impl StationIntegrations {
             let Ok(mut events) = serde_json::from_value::<Vec<ReportControlEvent>>(value) else {
                 return;
             };
-            let Ok((status, Json(snapshot))) = self
-                .app
-                .recovery
-                .delegated_operation_in(&mut tx, genesis, owner, Command::ReportingControl(events.clone()))
-                .await else { return };
-            if status != StatusCode::OK {
-                return;
-            }
-            if events.last()
-                != Some(&ReportControlEvent::Resume(
-                    self.binding.report_client_id.clone(),
-                ))
-            {
-                let _ = tx.commit().await;
-                return;
-            }
-            let Ok(ledger) = AckLedger::from_json(&snapshot["ledger"]) else {
-                return;
-            };
-            if ledger.stopped_client_id().is_some() {
-                let _ = tx.commit().await;
-                return;
-            }
-            let Some(intent) = ledger.pending_reports().into_iter().find(|intent| {
-                snapshot["reports"].as_array().is_some_and(|due| {
-                    due.iter()
-                        .any(|value| value["report_id"] == intent.report_id)
-                })
-            }) else {
-                let _ = tx.commit().await;
-                return;
+            let resumed = events.last() == Some(&ReportControlEvent::Resume(self.binding.report_client_id.clone()));
+            let pending = match queue {
+                ReportQueue::Revocation { genesis, owner } => {
+                    let Ok((status, Json(snapshot))) = self.app.recovery.delegated_operation_in(
+                        &mut tx, genesis, owner, Command::ReportingControl(events.clone())).await else { return };
+                    if status != StatusCode::OK { return; }
+                    let Ok(ledger) = AckLedger::from_json(&snapshot["ledger"]) else { return };
+                    let due = ledger.pending_reports().into_iter().find(|intent| {
+                        snapshot["reports"].as_array().is_some_and(|reports| reports.iter()
+                            .any(|value| value["report_id"] == intent.report_id))
+                    });
+                    let Some(intent) = due.filter(|_| resumed && ledger.stopped_client_id().is_none()) else {
+                        let _ = tx.commit().await;
+                        return;
+                    };
+                    PendingReport::Revocation { genesis, owner, intent }
+                }
+                ReportQueue::Ownership => {
+                    if !resumed { return; }
+                    let Ok(Some(report)) = BindingReport::next(&mut tx, &self.binding).await else { return };
+                    PendingReport::Ownership(report)
+                }
             };
             let claim = uuid::Uuid::new_v4().to_string();
             if sqlx::query("UPDATE station_delegated_reporting SET in_flight=$1 WHERE binding=$2")
@@ -249,45 +267,42 @@ impl StationIntegrations {
             if saved_claim.as_ref() != Some(&claim) {
                 return;
             }
-            let result = self.portal.delegated_report(&intent).await;
-            let update = match result.answer {
-                ReportAnswer::Confirm => LedgerUpdate::Confirm(intent.report_id),
-                ReportAnswer::Refuse => {
-                    tracing::error!(report_id = %intent.report_id, "delegated report permanently refused");
-                    LedgerUpdate::Refuse(intent.report_id)
-                }
-                ReportAnswer::StopReporting => {
-                    tracing::error!(client_id = %self.binding.report_client_id, "delegated reporting stopped by Portal");
-                    events.push(ReportControlEvent::Stop(
-                        self.binding.report_client_id.clone(),
-                    ));
-                    if sqlx::query("UPDATE station_delegated_reporting SET events=$1,in_flight=NULL WHERE binding=$2")
-                        .bind(serde_json::to_value(&events).unwrap()).bind(&key)
-                        .execute(&mut *tx).await.is_err() { return; }
-                    // Persist the Station-wide fence even if the account's next
-                    // transaction fails. It applies the journal on its next read.
-                    if tx.commit().await.is_err() {
-                        return;
-                    }
-                    let _ = self
-                        .app
-                        .recovery
-                        .delegated_operation(genesis, owner, Command::ReportingControl(events))
-                        .await;
-                    return;
-                }
-                ReportAnswer::Retry => LedgerUpdate::Retry {
-                    id: intent.report_id,
-                    retry_after_ms: result.retry_after_ms,
-                },
+            let result = match &pending {
+                PendingReport::Revocation { intent, .. } => self.portal.delegated_report(
+                    &crate::integration_portal::delegated_report_body(intent)).await,
+                PendingReport::Ownership(report) => self.portal.delegated_report(&report.body).await,
             };
-            let Ok((status, _)) = self
-                .app
-                .recovery
-                .delegated_operation_in(&mut tx, genesis, owner, Command::Ledger(update))
-                .await else { return };
-            if status != StatusCode::OK {
+            if result.answer == ReportAnswer::StopReporting {
+                tracing::error!(client_id = %self.binding.report_client_id, "delegated reporting stopped by Portal");
+                events.push(ReportControlEvent::Stop(self.binding.report_client_id.clone()));
+                if sqlx::query("UPDATE station_delegated_reporting SET events=$1,in_flight=NULL WHERE binding=$2")
+                    .bind(serde_json::to_value(&events).unwrap()).bind(&key)
+                    .execute(&mut *tx).await.is_err() || tx.commit().await.is_err() { return; }
+                if let ReportQueue::Revocation { genesis, owner } = queue {
+                    let _ = self.app.recovery.delegated_operation(genesis, owner, Command::ReportingControl(events)).await;
+                }
                 return;
+            }
+            match pending {
+                PendingReport::Ownership(report) => {
+                    if result.answer == ReportAnswer::Refuse {
+                        tracing::error!(report_id = %report.body["reportId"], "ownership report permanently refused");
+                    }
+                    if report.settle(&mut tx, &self.binding, &result).await.is_err() { return; }
+                }
+                PendingReport::Revocation { genesis, owner, intent } => {
+                    let update = match result.answer {
+                        ReportAnswer::Confirm => LedgerUpdate::Confirm(intent.report_id),
+                        ReportAnswer::Refuse => {
+                            tracing::error!(report_id = %intent.report_id, "delegated report permanently refused");
+                            LedgerUpdate::Refuse(intent.report_id)
+                        }
+                        ReportAnswer::Retry => LedgerUpdate::Retry { id: intent.report_id, retry_after_ms: result.retry_after_ms },
+                        ReportAnswer::StopReporting => unreachable!("client stop settled above"),
+                    };
+                    let Ok((StatusCode::OK, _)) = self.app.recovery
+                        .delegated_operation_in(&mut tx, genesis, owner, Command::Ledger(update)).await else { return };
+                }
             }
             if sqlx::query("UPDATE station_delegated_reporting SET in_flight=NULL WHERE binding=$1")
                 .bind(&key)
@@ -309,6 +324,10 @@ impl StationIntegrations {
         }
     }
 }
+
+#[cfg(all(test, feature = "delegated-host-work"))]
+#[path = "binding_report_tests.rs"]
+mod binding_report_tests;
 
 #[cfg(all(test, feature = "delegated-host-work"))]
 #[path = "signing_ceiling_tests.rs"]
@@ -824,6 +843,201 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_revocation_uses_portal_time_after_station_downtime() {
+        check_portal_revocation_time(DateArrival::AtIntake).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_updates_existing_revoke_without_signing_again() {
+        check_portal_revocation_time(DateArrival::AfterKeyRemoval).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_survives_failed_interrupt_and_retry() {
+        check_portal_revocation_time(DateArrival::WithInterrupt).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_late_portal_time_survives_a_signing_clock_rollback() {
+        check_portal_revocation_time(DateArrival::DuringClockRollback).await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DateArrival { AtIntake, AfterKeyRemoval, WithInterrupt, DuringClockRollback }
+
+    async fn check_portal_revocation_time(arrival: DateArrival) {
+        use super::super::tests::{append_body, fixture, request, signed_action};
+        let (database, runtime, f) = fixture().await;
+        let genesis = f.log.genesis_hash().to_hex();
+        runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        let fingerprint = draft["fingerprint"].as_str().unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        policy(&runtime, "ready", fingerprint, None).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        // The ordinary feed carries the stop. The authenticated checkpoint dates it.
+        policy(&runtime, "revoking", fingerprint, Some(false)).await;
+        let revoked_at = chrono::Utc::now() - chrono::Duration::hours(25);
+        let read_pool = database.reconnect(1).await;
+        let stored = async || {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT state->'delegated'->$2 FROM remote_recovery_roots WHERE genesis_hash=$1",
+            ).bind(&genesis).bind(&runtime.binding.station_origin).fetch_one(&read_pool).await.unwrap()
+        };
+        let principal = format!("service:svc-{ID}");
+        let first = if arrival != DateArrival::AtIntake {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+            if arrival == DateArrival::DuringClockRollback {
+                let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+                sqlx::query("UPDATE remote_recovery_roots SET state=jsonb_set(state,
+                    ARRAY['delegated',$2,'signing_high_water',$3],to_jsonb($4::bigint)) WHERE genesis_hash=$1")
+                    .bind(&genesis).bind(&runtime.binding.station_origin).bind(&principal).bind(future)
+                    .execute(&database.pool).await.unwrap();
+            }
+            let feed = stored().await;
+            let revoke = feed["records"].as_array().unwrap().last().unwrap();
+            assert_eq!(revoke["body"]["action"], "revoke");
+            assert_eq!(feed["ledger"]["revocations"][&principal]["revoked_at_ms"], revoke["body"]["issued_at"]);
+            if arrival == DateArrival::AfterKeyRemoval {
+                signed_action(&runtime, &f, atem_client::membership::Action::Remove {
+                    device_id: format!("svc-{ID}"),
+                }).await;
+                runtime.report_revocations().await;
+                let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")
+                    .fetch_one(&read_pool).await.unwrap();
+                assert_eq!(keys, 0);
+            } else {
+                policy(&runtime, "revoked", fingerprint, Some(true)).await;
+            }
+            Some(feed)
+        } else {
+            None
+        };
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let mut row = serde_json::to_value(&previous.integrations[ID]).unwrap();
+        row["id"] = json!(ID);
+        row["revokedAt"] = json!(revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
+            "at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "integrations":[row]}});
+        let snapshot = crate::integration_checkpoint::PortalCheckpoint::parse(
+            source.to_string().as_bytes(), &runtime.binding).unwrap();
+        let next = previous.apply_checkpoint(snapshot, chrono::Utc::now().timestamp()).unwrap();
+        assert_eq!(previous.known_revocation_ms(ID), Ok(None));
+        let mut other_key = next.clone();
+        other_key.integrations.get_mut(ID).unwrap().r9_svc = Some("b".repeat(64));
+        assert_eq!(other_key.known_revocation_ms(ID), Ok(None));
+        let mut legacy = next.clone();
+        legacy.portal_snapshot.as_mut().unwrap().integrations.get_mut(ID).unwrap().revoked_at = None;
+        assert_eq!(legacy.known_revocation_ms(ID), Ok(None));
+        runtime.policies.commit(&previous, &next).await.unwrap();
+        if arrival == DateArrival::WithInterrupt {
+            sqlx::raw_sql("CREATE FUNCTION refuse_interrupt() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'test reservation failure'; END $$;
+                CREATE TRIGGER refuse_interrupt BEFORE UPDATE ON station_service_signing_ceilings
+                FOR EACH ROW EXECUTE FUNCTION refuse_interrupt()").execute(&database.pool).await.unwrap();
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+            sqlx::query("DROP TRIGGER refuse_interrupt ON station_service_signing_ceilings")
+                .execute(&database.pool).await.unwrap();
+        } else if arrival == DateArrival::DuringClockRollback {
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        } else {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+        }
+        let learned = stored().await;
+        assert_eq!(learned["ledger"]["revocations"][&principal]["revoked_at_ms"], revoked_at.timestamp_millis());
+        let reports = AckLedger::from_json(&learned["ledger"]).unwrap().pending_reports();
+        assert_eq!(reports.len(), 1);
+        let final_report = reports[0].report.to_json();
+        assert_eq!(final_report["integration_id"], ID);
+        assert_eq!(final_report["outcome"], "deadline_passed");
+        if let Some(first) = first {
+            assert_eq!(first["records"], learned["records"]);
+            assert_eq!(first["signing_high_water"], learned["signing_high_water"]);
+        }
+        if arrival == DateArrival::DuringClockRollback {
+            assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        } else {
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+        }
+        let retried = stored().await;
+        if arrival == DateArrival::WithInterrupt {
+            let records = retried["records"].as_array().unwrap();
+            assert_eq!(records.len(), learned["records"].as_array().unwrap().len() + 1);
+            assert_eq!(records.last().unwrap()["body"]["action"], "interrupt_running");
+            assert_eq!(retried["ledger"]["revocations"], learned["ledger"]["revocations"]);
+            runtime.reconcile_delegated_service(ID).await.unwrap();
+            assert_eq!(stored().await, retried);
+        } else {
+            assert_eq!(retried, learned);
+        }
+        read_pool.close().await;
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_ordinary_feed_carries_hold_and_first_revocation_time() {
+        use super::super::tests::{append_body, fixture, request};
+        use crate::integration_feed::FeedPage;
+        let (db, runtime, f) = fixture().await;
+        let genesis = f.log.genesis_hash().to_hex();
+        runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        let mut row = serde_json::to_value(&runtime.policies.load(&runtime.binding).await.unwrap().integrations[ID]).unwrap();
+        row["id"] = json!(ID);
+        row["r9Svc"] = draft["fingerprint"].clone();
+        row["state"] = json!("expired");
+        row["expiresAt"] = json!("2000-01-01T00:00:00.000Z");
+        let poll = async |row: &Value| {
+            let old = runtime.policies.load(&runtime.binding).await.unwrap();
+            let cursor = old.cursor + 1;
+            let mut page = json!({"cursor":cursor,"changes":[{"id":cursor,
+                "integrationId":ID,"kind":"integration_reconciled","integration":row}]});
+            if old.cursor == 0 { page["integrations"] = json!([row]); }
+            let now = chrono::Utc::now().timestamp();
+            let next = old.apply(old.cursor, FeedPage::parse(&serde_json::to_vec(&page).unwrap()).unwrap(), now)?;
+            assert!(next.current(ID, OWNER, now).is_err(), "expired API grant");
+            runtime.policies.commit(&old, &next).await?;
+            runtime.reconcile_delegated_service(ID).await
+        };
+        for held in [true, true, false, false] {
+            row["held"] = json!(held);
+            poll(&row).await.unwrap();
+        }
+        let at = chrono::Utc::now() - chrono::Duration::hours(25);
+        row.as_object_mut().unwrap().remove("held");
+        row["state"] = json!("revoking");
+        row["revokedAt"] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        row["interruptRunning"] = json!(false);
+        poll(&row).await.unwrap();
+        row["state"] = json!("revoked");
+        row["interruptRunning"] = json!(true);
+        let mut conflicting = row.clone();
+        conflicting["revokedAt"] = json!("2026-01-01T00:00:00.000Z");
+        assert!(poll(&conflicting).await.is_err());
+        row.as_object_mut().unwrap().remove("revokedAt");
+        poll(&row).await.unwrap();
+        let saved = runtime.policies.load(&runtime.binding).await.unwrap();
+        assert_eq!(saved.known_revocation_ms(ID), Ok(Some(at.timestamp_millis() as u64)));
+        let records = feed(&runtime, &genesis).await;
+        let actions: Vec<_> = records.iter().map(|r| r["body"]["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["cover", "hold", "release", "revoke", "interrupt_running"]);
+        let ledger_time: i64 = sqlx::query_scalar(
+            "SELECT (state->'delegated'->$2->'ledger'->'revocations'->$3->>'revoked_at_ms')::bigint
+             FROM remote_recovery_roots WHERE genesis_hash=$1",
+        ).bind(&genesis).bind(&runtime.binding.station_origin).bind(format!("service:svc-{ID}"))
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(ledger_time, at.timestamp_millis());
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_service_lifecycle_signs_once_and_retains_key_until_r9_removal() {
         use super::super::tests::{append_body, fixture, request, signed_action};
         use atem_client::{
@@ -864,8 +1078,45 @@ mod tests {
             "expiry cannot release a hold"
         );
         policy(&runtime, "ready", fingerprint, None).await;
+        let set_expiry = async |expires: &str| {
+            let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+            let mut next = previous.clone();
+            next.revision += 1;
+            next.integrations.get_mut(ID).unwrap().expires_at = expires.into();
+            runtime.policies.commit(&previous, &next).await.unwrap();
+        };
+        let elapsed = "2000-01-01T00:00:00Z";
+        set_expiry(elapsed).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        assert_eq!(feed(&runtime, &genesis).await.len(), 2, "an elapsed ready grant must preserve the hold");
+
+        // Let the signing store finish the reservation only once the grant has expired.
+        sqlx::raw_sql("CREATE FUNCTION wait_for_grant_expiry() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE deadline timestamptz;
+            BEGIN
+                SELECT (checkpoint::jsonb->'integrations'->substring(NEW.service_id FROM 5)->>'expiresAt')::timestamptz
+                    INTO STRICT deadline FROM station_integration_policy;
+                PERFORM pg_sleep_until(LEAST(deadline, clock_timestamp() + interval '5 seconds'));
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER delay_reservation BEFORE UPDATE ON station_service_signing_ceilings
+            FOR EACH ROW EXECUTE FUNCTION wait_for_grant_expiry()")
+            .execute(&database.pool).await.unwrap();
+        let ceilings = runtime.app.recovery.signing_ceilings.get().unwrap();
+        let reservation = async || ceilings.reservations(f.log.account_id(), &genesis).await.unwrap()[0].highest_ms;
+        let before = reservation().await;
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(3);
+        set_expiry(&deadline.to_rfc3339()).await;
+        assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        assert!(reservation().await > before);
+        assert_eq!(feed(&runtime, &genesis).await.len(), 2);
+        sqlx::query("DROP TRIGGER delay_reservation ON station_service_signing_ceilings")
+            .execute(&database.pool).await.unwrap();
+
+        set_expiry("2099-01-01T00:00:00Z").await;
         runtime.reconcile_delegated_service(ID).await.unwrap();
         policy(&runtime, "revoking", fingerprint, Some(false)).await;
+        set_expiry(elapsed).await;
         runtime.reconcile_delegated_service(ID).await.unwrap();
         runtime.report_revocations().await;
         let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")

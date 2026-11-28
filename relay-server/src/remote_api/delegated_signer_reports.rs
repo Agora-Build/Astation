@@ -3,8 +3,10 @@ use super::{checkpoint_for_owner, invalid, review_source_evidence, source_hash, 
 use atem_client::member_report::{
     verify_signer_report, SignerReportChallenge, VerifiedSignerReport,
 };
+use atem_client::membership::{Head, Membership};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
+use std::collections::BTreeMap;
 
 pub(crate) enum SubmitError {
     Changed,
@@ -21,6 +23,10 @@ impl From<sqlx::Error> for SubmitError {
 
 const MAX_REPORTS: usize = 256;
 
+fn exported_processes(input: &Value) -> Option<Vec<&str>> {
+    input.get("processes")?.as_array()?.iter().map(Value::as_str).collect()
+}
+
 pub(crate) async fn submit(
     pool: &PgPool,
     binding: &Binding,
@@ -30,9 +36,10 @@ pub(crate) async fn submit(
 ) -> Result<Value, SubmitError> {
     let object = input
         .as_object()
-        .filter(|v| v.len() == 2)
+        .filter(|v| v.len() == 3)
         .ok_or(SubmitError::Invalid)?;
     let report = object.get("report").ok_or(SubmitError::Invalid)?;
+    let processes = exported_processes(input).ok_or(SubmitError::Invalid)?;
     let records = object
         .get("records")
         .and_then(Value::as_array)
@@ -89,6 +96,7 @@ pub(crate) async fn submit(
         || (evidence["evidence_hash"] != recovery.evidence_hash().to_hex()
             && external_source_hash.as_ref() != Some(&source.external_source_hash))
         || head != log.head().to_json()
+        || !super::covers_retained_membership(&evidence)
     {
         return Err(SubmitError::Changed);
     }
@@ -115,6 +123,7 @@ pub(crate) async fn submit(
         report.to_string().as_bytes(),
         &challenge,
         &exported,
+        &processes,
         wall,
     )
     .map_err(|_| SubmitError::Invalid)?;
@@ -153,10 +162,10 @@ pub(crate) async fn submit(
 pub(super) async fn visit(
     db: &mut PgConnection,
     plan: &super::Prepared,
-    log: &atem_client::membership::Membership,
+    heads: &BTreeMap<u64, Membership>,
     origin: &str,
     generation: i64,
-    mut accept: impl FnMut(VerifiedSignerReport, String) -> Result<(), sqlx::Error>,
+    mut accept: impl FnMut(VerifiedSignerReport, String, &Membership) -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
     use futures_util::TryStreamExt;
     let mut rows = sqlx::query_as::<_, (i64, Value, Value, String, i64)>(
@@ -169,7 +178,7 @@ pub(super) async fn visit(
     while let Some((connection, raw, input, hash, accepted)) = rows.try_next().await? {
         count += 1;
         if count > MAX_REPORTS
-            || input.as_object().is_none_or(|object| object.len() != 2)
+            || input.as_object().is_none_or(|object| object.len() != 3)
             || source_hash(&input)? != hash
         {
             return Err(invalid());
@@ -195,18 +204,21 @@ pub(super) async fn visit(
             .iter()
             .map(Value::to_string)
             .collect();
+        let head = Head::from_json(&input["report"]["body"]["head"]).ok_or_else(invalid)?;
+        let log = heads.get(&head.seq).ok_or_else(invalid)?;
         let verified = verify_signer_report(
             log,
             input["report"].to_string().as_bytes(),
             &challenge,
             &exported,
+            &exported_processes(&input).ok_or_else(invalid)?,
             when,
         )
         .map_err(|_| invalid())?;
         if !verified.at_head {
             return Err(invalid());
         }
-        accept(verified, hash)?;
+        accept(verified, hash, log)?;
     }
     Ok(())
 }

@@ -9,7 +9,7 @@ use sqlx::{PgConnection, PgPool};
 
 #[path = "route_ownership.rs"]
 pub(super) mod route_ownership;
-pub(crate) use route_ownership::{migrate as migrate_room_owners, observe_registration, observe_rooms};
+pub(crate) use route_ownership::{binding_rooms, migrate as migrate_room_owners, observe_registration, observe_rooms};
 
 #[path = "delegated_recovery_plan.rs"]
 pub(crate) mod plan;
@@ -145,10 +145,15 @@ async fn has_delegated_history(
     signing: Option<&SigningCeilings>,
 ) -> Result<bool, sqlx::Error> {
     // As with retained feeds, changing the public origin cannot turn a restored
-    // Station into a fresh installation. Plans and observations reference the fence.
+    // Station into a fresh installation. Recovery archives can outlive the
+    // live journal and remain under the previous origin's fence.
     let retained: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM station_delegated_reporting)
+             OR EXISTS (SELECT 1 FROM station_delegated_reporting_history)
+             OR EXISTS (SELECT 1 FROM station_delegated_recovery_plans)
+             OR EXISTS (SELECT 1 FROM station_delegated_observed_reservations WHERE highest_ms > 0)
              OR EXISTS (SELECT 1 FROM station_applied_binding_releases)
+             OR EXISTS (SELECT 1 FROM station_native_binding_transitions)
              OR EXISTS (SELECT 1 FROM station_verifier_rosters)
              OR EXISTS (SELECT 1 FROM station_integration_policy WHERE recovery_generation IS NOT NULL)
              OR EXISTS (SELECT 1 FROM remote_recovery_roots WHERE state->'delegated' <> '{}'::jsonb)",
@@ -166,6 +171,80 @@ pub(crate) async fn inspect(pool: &PgPool, origin: &str) -> Result<Option<Status
         .bind(origin)
         .fetch_optional(pool)
         .await
+}
+
+#[path = "delegated_binding_inventory.rs"]
+mod binding_inventory;
+
+/// Merge the first page from each source before choosing the continuation.
+pub(crate) async fn list_roots(
+    pool: &PgPool,
+    binding: &Binding,
+    signing: &SigningCeilings,
+    portal: Option<&crate::integration_feed::FeedBinding>,
+    after: Option<&str>,
+) -> Result<Value, sqlx::Error> {
+    use std::collections::BTreeMap;
+
+    const PAGE_SIZE: usize = 64;
+    let limit = (PAGE_SIZE + 1) as i64;
+    if after.is_some_and(|cursor| !canonical_genesis(cursor)) {
+        return Err(invalid_root());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut *tx).await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'").execute(&mut *tx).await?;
+    binding.lock_mode(&mut tx, false).await?;
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT genesis_hash FROM remote_recovery_roots
+         WHERE $1::text IS NULL OR genesis_hash COLLATE \"C\" > $1
+         ORDER BY genesis_hash COLLATE \"C\" LIMIT $2",
+    )
+    .bind(after).bind(limit).fetch_all(&mut *tx).await?;
+    let mut roots = BTreeMap::new();
+    for genesis in retained {
+        roots.insert(genesis, (true, 0, 0));
+    }
+    if let Some(scope) = portal {
+        if scope.station_origin != binding.origin || scope.validate().is_err() {
+            return Err(invalid_root());
+        }
+        for genesis in crate::service_keys::list_recovery_roots(&mut tx, scope, after, limit).await? {
+            if !canonical_genesis(&genesis) {
+                return Err(invalid_root());
+            }
+            roots.entry(genesis).or_insert((false, 0, 0));
+        }
+    }
+    let binding_discovery = match portal {
+        _ if !crate::account_identity::built_in_station(&binding.origin) => "not_applicable",
+        None => "reporting_unconfigured",
+        Some(scope) => {
+            for genesis in binding_inventory::list(&mut tx, scope, after, PAGE_SIZE + 1).await? {
+                roots.entry(genesis).or_insert((false, 0, 0));
+            }
+            "retained"
+        }
+    };
+    for (genesis, registered, reserved) in signing.root_registrations(after, limit).await? {
+        if !canonical_genesis(&genesis) {
+            return Err(invalid_root());
+        }
+        let row = roots.entry(genesis).or_insert((false, 0, 0));
+        row.1 = registered;
+        row.2 = reserved;
+    }
+    let more = roots.len() > PAGE_SIZE;
+    let mut page = Vec::new();
+    for (genesis, (present, registered, reserved)) in roots.into_iter().take(PAGE_SIZE) {
+        page.push(json!({"genesis_hash":genesis, "root_present":present,
+            "registered_keys":registered, "keys_with_reservations":reserved}));
+    }
+    let next = page.last().filter(|_| more).map(|row| &row["genesis_hash"]);
+    tx.commit().await?;
+    Ok(json!({"origin":binding.origin, "generation":binding.generation.to_string(),
+        "binding_discovery":binding_discovery, "checked_service_contexts":portal.is_some(),
+        "roots":page, "next_after":next}))
 }
 
 /// Inspect one retained account root and its fence in the same database snapshot,
@@ -206,6 +285,23 @@ pub(crate) async fn inspect_root(
             let log = Membership::from_stored(&root.account, &hash, &root.membership)
                 .map_err(|_| invalid_root())?;
             let mut report = root_inspection(&root, binding, &log)?;
+            // The live feed can advance after reopening. Read the original
+            // publication hashes in the same snapshot as its generation fence.
+            let receipt: Option<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('plan_id',plan_id,'candidate_feed_id',candidate_feed_id,
+                    'cut_hash',published_cut_hash,'feed_hash',published_feed_hash)
+                 FROM station_delegated_recovery_plans
+                 WHERE origin=$1 AND generation=$2 AND genesis_hash=$3 AND published_cut_hash IS NOT NULL
+                   AND retained->>'account_subject'=$4 AND retained->>'account_id'=$5",
+            )
+            .bind(&binding.origin)
+            .bind(binding.generation)
+            .bind(genesis)
+            .bind(&owner)
+            .bind(&root.account)
+            .fetch_optional(&mut *tx)
+            .await?;
+            report["publication_receipt"] = receipt.unwrap_or(Value::Null);
             if let Some(source) = portal.filter(|p| crate::integration_checkpoint::PortalCheckpoint::built_in(p)) {
                 report["route_ownership"] = route_ownership::inspect(&mut tx, &root, &log, &owner, source).await?;
             }

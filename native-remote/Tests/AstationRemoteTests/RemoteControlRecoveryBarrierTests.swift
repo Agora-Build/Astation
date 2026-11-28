@@ -19,6 +19,115 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
                 sourceHash: c.sourceHash, evidenceHash: c.evidenceHash))
     }
 
+    func testProcessAttachmentSurvivesRelaunchAndPrecedesSigning() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        func fields() throws -> [String: Any] {
+            try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+                format: nil) as? [String: Any])
+        }
+        let current = verifierReportProcess()
+        let prior = RemoteRecoveryKit.base64URL(Data(repeating: 75, count: 16))
+        var saved = try fields()
+        XCTAssertEqual(saved["processAttachments"] as? [String: Int], [current: 0])
+        saved["processAttachments"] = [prior: 0]
+        f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+        XCTAssertThrowsError(try RemoteControlSigningJournal(log: f.log, memberID: "manager",
+            read: { f.authorBytes["manager"] }, persist: { _ in throw RemoteControlPublicationError.storageUncertain }))
+        XCTAssertEqual(f.keys.signs, 0)
+        let journal = try f.readAuthorJournal("manager")
+        XCTAssertTrue(journal.canEstablishInitialPin)
+        XCTAssertEqual(try fields()["processAttachments"] as? [String: Int], [prior: 0, current: 1])
+        let afterAttach = f.authorBytes
+        XCTAssertEqual(try f.readAuthorJournal("manager").revision, 1)
+        XCTAssertEqual(f.authorBytes, afterAttach)
+        _ = try f.sign(body)
+        XCTAssertFalse(try f.readAuthorJournal("manager").canEstablishInitialPin)
+        XCTAssertEqual(try fields()["processAttachments"] as? [String: Int], [prior: 0, current: 1])
+    }
+
+    func testLegacyJournalMigrationKeepsItsBarrierAndLeavesEarlierProcessesUnknown() throws {
+        let f = try ControlPublicationFixture(), c = try context(f), now = f.clock.wallMs
+        let original = try f.readAuthorJournal("manager")
+        let ch = try challenge(c, now: now)
+        let reviewed = try original.holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
+        var saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+            format: nil) as? [String: Any])
+        saved["version"] = 2
+        saved.removeValue(forKey: "processAttachments")
+        var barriers = try XCTUnwrap(saved["barriers"] as? [String: [String: Any]])
+        barriers[f.origin]?.removeValue(forKey: "processes")
+        saved["barriers"] = barriers
+        f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+        let migrated = try f.readAuthorJournal("manager")
+        XCTAssertEqual(migrated.id, original.id)
+        XCTAssertFalse(migrated.canEstablishInitialPin)
+        XCTAssertThrowsError(try migrated.requireStopChange(origin: f.origin))
+        let stored = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+            format: nil) as? [String: Any])
+        XCTAssertEqual(stored["processAttachments"] as? [String: UInt64], [verifierReportProcess(): original.revision + 1])
+        XCTAssertThrowsError(try migrated.finishReport(context: c, reviewed: reviewed, log: f.log,
+            nowMs: { now }, current: { true }, sign: f.keys.sign))
+        XCTAssertNil(try migrated.exposedSubmission(for: c, log: f.log))
+        XCTAssertThrowsError(try migrated.holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: []))
+        XCTAssertEqual(f.keys.signs, 0)
+        XCTAssertThrowsError(try f.readAuthorJournal("manager").requireStopChange(origin: f.origin))
+    }
+
+    func testAnotherProcessAttachmentPreservesExposedRetryAndAdvancesNextReport() throws {
+        let f = try ControlPublicationFixture(), now = f.clock.wallMs
+        let stop = try f.body()
+        _ = try f.prepare(stop)
+        let record = try f.sign(stop)
+        _ = try f.prepare(f.hostBody())
+        let c = try context(f), journal = try f.readAuthorJournal("manager"), ch = try challenge(c, now: now)
+        let reviewed = try journal.holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
+        let first = try journal.finishReport(context: c, reviewed: reviewed, log: f.log, nowMs: { now },
+            current: { true }, sign: f.keys.sign)
+        let before = try verifySignerReport(log: f.log, reportJson: first.report, expectedChallengeJson: ch,
+            exportedRecordsJson: [record], exportedProcesses: first.processes, nowMs: now)
+
+        // A second SDK process acquires the same journal while the first is still alive.
+        var saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.authorBytes["manager"]),
+            format: nil) as? [String: Any])
+        let attachment = journal.revision + 1
+        let other = RemoteRecoveryKit.base64URL(Data(repeating: 76, count: 16))
+        saved["processAttachments"] = [verifierReportProcess(): 0, other: attachment]
+        saved["revision"] = attachment
+        f.authorBytes["manager"] = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+
+        let reopened = try f.readAuthorJournal("manager"), signs = f.keys.signs
+        let retained = try XCTUnwrap(reopened.exposedSubmission(for: c, log: f.log))
+        XCTAssertEqual(retained.report, first.report)
+        XCTAssertEqual(retained.records, [record])
+        XCTAssertEqual(retained.processes, first.processes)
+        XCTAssertEqual(first.processes, [verifierReportProcess()])
+        let retry = try reopened.holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
+        XCTAssertEqual(retry, reviewed)
+        let retried = try reopened.finishReport(context: c, reviewed: retry, log: f.log, nowMs: { now },
+            current: { true }, sign: f.keys.sign)
+        XCTAssertEqual(retried.report, first.report)
+        XCTAssertEqual(f.keys.signs, signs)
+
+        let next = try challenge(c, now: now + 1)
+        let fresh = try reopened.holdForReport(context: c, challengeJSON: next, log: f.log,
+            slot: "astation-macos", nowMs: now + 1, outboxes: [f.journal], recoveryCopies: [])
+        let result = try reopened.finishReport(context: c, reviewed: fresh, log: f.log, nowMs: { now + 1 },
+            current: { true }, sign: f.keys.sign)
+        let after = try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: next,
+            exportedRecordsJson: [record], exportedProcesses: result.processes, nowMs: now + 1)
+        XCTAssertEqual(Set(after.processes), [verifierReportProcess(), other])
+        XCTAssertGreaterThanOrEqual(after.journal.revision, attachment)
+        XCTAssertEqual(after.journal.recordsHash, before.journal.recordsHash)
+        XCTAssertEqual(after.journal.draftsHash, before.journal.draftsHash)
+        XCTAssertEqual(result.records, [record])
+        XCTAssertThrowsError(try reopened.requireStopChange(origin: f.origin))
+    }
+
     func testReportCommitsSignedAndDraftSetsIndependentlyAndFreezesBothAfterReopen() throws {
         let f = try ControlPublicationFixture(), host = try f.hostBody(), stop = try f.body()
         _ = try f.prepare(host)
@@ -39,7 +148,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
             nowMs: { now }, current: { true }, sign: { _ in XCTFail("a retry must use the retained signature"); return Data() })
         XCTAssertEqual(retried.report, signed)
         let verified = try verifySignerReport(log: f.log, reportJson: signed, expectedChallengeJson: ch,
-            exportedRecordsJson: [record], nowMs: now)
+            exportedRecordsJson: [record], exportedProcesses: result.processes, nowMs: now)
         XCTAssertEqual(verified.journal.records, 1)
         XCTAssertEqual(verified.journal.drafts, 2)
         XCTAssertEqual(verified.journal.revision + 1, writer.revision)
@@ -83,7 +192,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
                 nowMs: { now }, current: { true }, sign: f.keys.sign)
             XCTAssertEqual(result.records, [record])
             return try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: ch,
-                exportedRecordsJson: result.records, nowMs: now)
+                exportedRecordsJson: result.records, exportedProcesses: result.processes, nowMs: now)
         }
 
         let firstReport = try confirm(first)
@@ -159,7 +268,7 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         let result = try reopened.finishReport(context: c, reviewed: retry, log: f.log, nowMs: { now },
             current: { true }, sign: { _ in XCTFail("exposure was already committed"); return Data() })
         _ = try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: ch,
-            exportedRecordsJson: [], nowMs: now)
+            exportedRecordsJson: [], exportedProcesses: result.processes, nowMs: now)
         XCTAssertEqual(f.keys.signs, 1)
     }
 

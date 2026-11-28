@@ -11,6 +11,8 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public let expiresAt: String
     public let role: String
     public let interruptRunning: Bool?
+    public let pendingHostRevocation: Bool?
+    public let stationRemoved: Bool?
 
     func validate() throws {
         guard Self.validID(id), !name.isEmpty, name.utf8.count <= 320,
@@ -99,13 +101,36 @@ public struct PortalIntegrationHTTP: Sendable {
 
     public func owned(stationOrigin: String, now: Date = Date()) async throws -> [PortalIntegrationRecord] {
         guard PortalIntegrationRecord.validOrigin(stationOrigin) else { throw AccountLoginError.configuration }
+        return try await listedIntegrations().filter {
+            $0.role == "owner" && $0.stationOrigin == stationOrigin
+        }.map { try $0.validate(); return $0 }
+    }
+
+    /// The picker operates on the selected Station. Removed Stations may still owe the owner host confirmations.
+    public func accessOverview(stationOrigin: String) async throws
+        -> (selected: [PortalIntegrationRecord], pendingElsewhere: [PortalIntegrationRecord]) {
+        guard PortalIntegrationRecord.validOrigin(stationOrigin) else { throw AccountLoginError.configuration }
+        var selected: [PortalIntegrationRecord] = []
+        var pending: [PortalIntegrationRecord] = []
+        for record in try await listedIntegrations() where record.role == "owner" {
+            if record.stationOrigin == stationOrigin {
+                try record.validate()
+                selected.append(record)
+            } else if record.stationRemoved == true, record.pendingHostRevocation == true,
+                      record.state == "revoked", record.r9Svc != nil {
+                try record.validate()
+                pending.append(record)
+            }
+        }
+        return (selected, pending)
+    }
+
+    private func listedIntegrations() async throws -> [PortalIntegrationRecord] {
         struct List: Decodable { let integrations: [PortalIntegrationRecord]; let stale: Bool }
         let result: List = try await request(path: "/api/v1/integrations")
         guard !result.stale, result.integrations.count <= 500,
               Set(result.integrations.map(\.id)).count == result.integrations.count else { throw AccountLoginError.unavailable }
-        return try result.integrations.filter {
-            $0.role == "owner" && $0.stationOrigin == stationOrigin
-        }.map { try $0.validate(); return $0 }
+        return result.integrations
     }
 
     public func stations(cursor: String? = nil, limit: Int = 100) async throws -> PortalStationDirectoryPage {
@@ -163,7 +188,7 @@ public struct PortalIntegrationHTTP: Sendable {
         try result.validate()
         guard result.id == mirror.integrationID, result.stationOrigin == mirror.stationOrigin,
               result.role == "owner", ["revoking", "revoked"].contains(result.state),
-              result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
+              result.pendingHostRevocation != true, result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
             throw AccountLoginError.changed
         }
         return .confirmed(result)

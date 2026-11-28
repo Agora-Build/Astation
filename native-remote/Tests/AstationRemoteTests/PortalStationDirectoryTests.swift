@@ -106,6 +106,40 @@ final class PortalStationDirectoryTests: XCTestCase {
         XCTAssertThrowsError(try PortalStationDirectoryPage.decode(JSONSerialization.data(withJSONObject: duplicate)))
     }
 
+    func testRemovingCustomStationRetainsItsOriginWithoutOfferingNewIntegrations() throws {
+        var page = try object()
+        let original = try XCTUnwrap(page["stations"] as? [[String: Any]])
+        var removing = original[1]
+        removing["status"] = "removing"
+        removing["integrationsEnabled"] = false
+        removing["removalStartedAt"] = "2026-11-24T10:00:00.000Z"
+        removing["completeBy"] = "2026-11-25T12:00:00.000Z"
+        func decode(_ row: [String: Any]) throws -> PortalStationDirectoryEntry {
+            page["stations"] = [row]
+            let parsed = try PortalStationDirectoryPage.decode(JSONSerialization.data(withJSONObject: page))
+            return try XCTUnwrap(parsed.stations.first)
+        }
+        let station = try decode(removing)
+        XCTAssertEqual(station.origin, original[1]["origin"] as? String)
+        XCTAssertEqual(station.completeBy, removing["completeBy"] as? String)
+        XCTAssertFalse(station.availableForIntegrations)
+        // A single-step removal still has no interval. During rollout an active
+        // directory row can also carry both nullable fields.
+        var active = original[1]
+        active["removalStartedAt"] = NSNull()
+        active["completeBy"] = NSNull()
+        XCTAssertTrue(try decode(active).availableForIntegrations)
+        XCTAssertNil(try decode(original[3]).removalStartedAt)
+        for change: [String: Any] in [["completeBy": NSNull()], ["removalStartedAt": NSNull()],
+            ["completeBy": "2026-11-23T12:00:00.000Z"], ["integrationsEnabled": true],
+            ["status": "active"], ["removedAt": "2026-11-24T12:00:00.000Z"]] {
+            XCTAssertThrowsError(try decode(removing.merging(change) { _, new in new }))
+        }
+        var partial = removing
+        partial.removeValue(forKey: "completeBy")
+        XCTAssertThrowsError(try decode(partial))
+    }
+
     func testNativeBearerTraversesOnlyTheVersionedPortalAPIAndPreservesLostStations() async throws {
         let http = DirectoryHTTP([(try page(id: "first", cursor: "opaque_next"), 200), (try example(), 200)])
         let directory = try await client(http, readOnly: true).stationDirectory()

@@ -46,7 +46,7 @@ pub(super) async fn retained(
         ORIGIN,
         &f.log,
         &held,
-        f.created,
+        None,
         &["host-a".into()],
         f.created,
     )
@@ -68,7 +68,7 @@ pub(super) async fn retained(
         ORIGIN,
         &f.log,
         &native,
-        f.created,
+        None,
         &["host-a".into()],
         f.created,
     )
@@ -279,6 +279,7 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     assert_eq!(authors["member:phone"]["reports"], json!([]));
     assert_eq!(second["known_authors"]["complete_history"], false);
     let history = &second["known_history"];
+    assert_eq!(history["membership_gaps"], json!([]));
     let records = history["records"].as_array().expect("known obligations");
     assert_eq!(records.len(), 2);
     for record in original["delegated"][ORIGIN]["records"].as_array().unwrap() {
@@ -301,6 +302,92 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
         assert!(!second.to_string().contains(private), "{private}");
     }
     restart.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_requires_restored_membership_to_cover_every_retained_head() {
+    use super::super::super::delegated_recovery::plan::{review_for_owner, signer_challenges, snapshot_stops};
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, mut f, genesis, first) = retained(&database).await;
+    let initial = saved(&database.pool, &genesis).await;
+    let replace = async |state: &Value| {
+        sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+            .bind(state).bind(&genesis).execute(&database.pool).await.unwrap();
+    };
+    let mut demoted = initial.clone();
+    let later_log = demote_manager(&mut f);
+    demoted["membership"] = later_log.to_stored();
+    replace(&demoted).await;
+    first.initialize(&database.pool, true).await.unwrap();
+    let known = prepare(&database.pool, &first, &genesis).await.unwrap();
+
+    let peer = database.reconnect(2).await;
+    let removal = Action::Remove { device_id: "svc-test".into() };
+    let entry = sign_entry(&f.keys, &KeyId::new("manager"), f.log.draft("phone", f.created, &removal)).unwrap();
+    let fork = f.log.evaluate_objects(&[entry.object().clone()], &HostNow {
+        wall_ms: f.created, mono_ms: 0, boot_id: "test".into(),
+    });
+    assert_eq!(fork.appended, 1, "{:?}", fork.stop);
+    let mut diverged = initial.clone();
+    diverged["membership"] = fork.next.to_stored();
+    for (generation, restored, reason) in [(2, &initial, "restored_head_behind"), (4, &diverged, "divergent_history")] {
+        replace(restored).await;
+        let binding = Binding::new(ORIGIN, generation).unwrap();
+        binding.initialize(&peer, true).await.unwrap();
+        let review = prepare(&peer, &binding, &genesis).await.unwrap();
+        let gaps = review["known_history"]["membership_gaps"].as_array().unwrap();
+        assert_eq!(gaps.first(), Some(&json!({
+            "generation":1, "plan_id":known["plan_id"], "membership_head":later_log.head().to_json(), "reason":reason
+        })));
+        assert!(review_for_owner(&peer, &binding, &genesis, "alice").await.is_err());
+        let request = signer_challenges::Request::parse(&json!({
+            "signer":"member:phone", "slot":"mac", "expected":review["membership_head"],
+            "recovery":{"generation":generation.to_string(), "plan_id":review["plan_id"],
+                "candidate_feed_id":review["candidate_feed_id"], "source_hash":review["source_hash"],
+                "evidence_hash":review["evidence_hash"]}
+        })).unwrap();
+        assert!(matches!(signer_challenges::mint(&peer, &binding, &genesis, "alice", request).await,
+            Err(signer_challenges::MintError::ContextChanged)));
+        assert!(snapshot_stops::stage(&peer, &binding, &genesis, review["reconstruction_hash"].as_str().unwrap()).await.is_err());
+        assert_eq!(saved(&peer, &genesis).await, *restored);
+        if generation == 2 {
+            // Deliver the signed extension through the ordinary membership append.
+            // Keep the original checkpoint and open a fresh report round in this plan.
+            let mut previous = f.log.head();
+            for entry in later_log.entries().iter().filter(|e| e.seq > f.log.head().seq) {
+                assert_eq!(store.append_test_entry(&genesis, "alice", entry.clone(), previous).await, StatusCode::OK);
+                previous = Head { seq: entry.seq, hash: entry.hash() };
+            }
+            assert!(review_for_owner(&peer, &binding, &genesis, "alice").await.is_err());
+            let advanced = prepare(&peer, &binding, &genesis).await.unwrap();
+            assert_eq!(advanced["plan_id"], review["plan_id"]);
+            assert_eq!(advanced["candidate_feed_id"], review["candidate_feed_id"]);
+            assert_eq!(advanced["source_hash"], review["source_hash"]);
+            assert_eq!(advanced["known_history"]["membership_gaps"], json!([]));
+            assert_ne!(advanced["evidence_hash"], review["evidence_hash"]);
+            assert_eq!(prepare(&database.pool, &binding, &genesis).await.unwrap(), advanced);
+            for stale in [&initial, &diverged] {
+                replace(stale).await;
+                assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+            }
+            replace(&demoted).await;
+            assert_eq!(prepare(&peer, &binding, &genesis).await.unwrap(), advanced);
+            let corrected = Binding::new(ORIGIN, 3).unwrap();
+            corrected.initialize(&peer, true).await.unwrap();
+            let current = prepare(&peer, &corrected, &genesis).await.unwrap();
+            assert_eq!(current["known_history"]["membership_gaps"], json!([]));
+            assert_eq!(review_for_owner(&peer, &corrected, &genesis, "alice").await.unwrap()["membership_head"],
+                later_log.head().to_json());
+        }
+    }
+    let effects: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM station_delegated_signer_challenges),
+        (SELECT count(*) FROM station_delegated_snapshot_stops)").fetch_one(&peer).await.unwrap();
+    assert_eq!(effects, (0, 0));
+    peer.close().await;
     drop(store);
     database.cleanup().await;
 }

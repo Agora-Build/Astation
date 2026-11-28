@@ -93,7 +93,7 @@ public struct RemoteStationSignerChallenge: Sendable {
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryOriginalsTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -246,6 +246,83 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         return review
     }
 
+    public func controlRecoveryOriginals(for review: RemoteControlRecoveryPreparation) async throws -> [String] {
+        let context = review.context
+        try context.validate()
+        guard context.stationOrigin == stationOrigin, RemoteRecoveryKit.validHash(review.reconstructionHash) else {
+            throw RemoteChannelError.invalidInput
+        }
+        let endpoint = path(context.genesisHash, "control/recovery/\(context.planID)/originals")
+        var records: [String] = []
+        var lastID = ""
+        var size = 0
+        while true {
+            var url = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
+            url.queryItems = [URLQueryItem(name: "review", value: review.reconstructionHash),
+                              URLQueryItem(name: "offset", value: String(records.count))]
+            let (_, bytes) = try await perform(url: url.url!, method: "GET")
+            let page = try Self.dictionary(bytes)
+            guard Set(page.keys) == ["plan_id", "reconstruction_hash", "offset", "records", "more"],
+                  page["plan_id"] as? String == context.planID,
+                  page["reconstruction_hash"] as? String == review.reconstructionHash,
+                  let offset = page["offset"] as? NSNumber, CFGetTypeID(offset) != CFBooleanGetTypeID(),
+                  offset.stringValue == String(records.count),
+                  let rows = page["records"] as? [[String: Any]], rows.count <= 64,
+                  let more = page["more"] as? NSNumber, CFGetTypeID(more) == CFBooleanGetTypeID(),
+                  records.count + rows.count <= 4096, !more.boolValue || (!rows.isEmpty && records.count + rows.count < 4096)
+            else { throw RemoteRecoveryTransportError.invalidResponse }
+            for row in rows {
+                let json = try Self.json(row)
+                let body = try parseControlRecord(recordJson: json)
+                size += json.utf8.count
+                guard size <= 16 * 1024 * 1024, RemoteControlRecoveryContext.validUUID(body.recordId),
+                      body.recordId > lastID else { throw RemoteRecoveryTransportError.invalidResponse }
+                lastID = body.recordId
+                records.append(json)
+            }
+            if !more.boolValue { return records }
+        }
+    }
+
+    func reserveRecoveryCopy(context: RemoteControlRecoveryContext, original: String,
+        manager: String, issuedAt: UInt64?, after: UInt64) async throws -> UInt64 {
+        try context.validate()
+        let body = try parseControlRecord(recordJson: original)
+        guard stationOrigin == context.stationOrigin, RemoteRecoveryKit.validID(manager),
+              body.accountId == context.accountID, body.genesisHash == context.genesisHash,
+              body.origin == nil || body.origin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let hash = SHA256.hash(data: Data(try canonicalJson(json: original).utf8)).map { String(format: "%02x", $0) }.joined()
+        var request: [String: Any] = ["manager":manager, "original_record_id":body.recordId, "original_hash":hash,
+            "expected":["seq":context.membershipHead.seq, "hash":context.membershipHead.hash] as [String: Any],
+            "recovery":["generation":String(context.generation), "plan_id":context.planID, "source_hash":context.sourceHash,
+                        "candidate_feed_id":context.candidateFeedID, "evidence_hash":context.evidenceHash]]
+        guard after <= 9_007_199_254_740_991, after == 0 || issuedAt == nil else { throw RemoteChannelError.invalidInput }
+        if let issuedAt { request["issued_at"] = issuedAt }
+        if after > 0 { request["after_issued_at"] = after }
+        let (status, bytes) = try await perform(url: path(context.genesisHash, "control/recovery/copy-reservations"),
+            method: "POST", body: Self.encode(request), allowConflict: true)
+        if status == 409 {
+            guard bytes.count <= 4096, try Self.json(Self.dictionary(bytes)) == #"{"error":{"code":"recovery_plan_changed"}}"# else {
+                throw RemoteRecoveryTransportError.invalidResponse
+            }
+            throw RemoteRecoveryCopyReservationError.changed
+        }
+        guard bytes.count <= 4096 else { throw RemoteRecoveryTransportError.invalidResponse }
+        let reply = try Self.dictionary(bytes)
+        guard let number = reply["issued_at"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.stringValue == String(number.uint64Value), number.uint64Value <= 9_007_199_254_740_991,
+              number.uint64Value > max(body.issuedAt, after), issuedAt == nil || issuedAt == number.uint64Value else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        request.removeValue(forKey: "after_issued_at")
+        request["issued_at"] = number.uint64Value
+        request["origin"] = stationOrigin
+        request["account_id"] = context.accountID
+        request["genesis_hash"] = context.genesisHash
+        guard try Self.json(request) == Self.json(reply) else { throw RemoteRecoveryTransportError.invalidResponse }
+        return number.uint64Value
+    }
+
     public func planEnd(for held: RemoteControlRecoveryContext) async throws -> RemoteStationPlanEnd? {
         try held.validate()
         guard held.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
@@ -296,11 +373,12 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         return RemoteStationSignerChallenge(context: context, json: json, challenge: challenge)
     }
 
-    static func submissionBytes(report: String, records: [String]) throws -> Data {
-        guard records.reduce(report.utf8.count, { $0 + $1.utf8.count }) <= 262_144 else {
+    static func submissionBytes(report: String, records: [String], processes: [String]) throws -> Data {
+        let recordSize = records.reduce(report.utf8.count, { $0 + $1.utf8.count })
+        guard processes.reduce(recordSize, { $0 + $1.utf8.count }) <= 262_144 else {
             throw RemoteControlPublicationError.full
         }
-        let bytes = try Self.encode(["report": Self.object(report), "records": records.map { try Self.object($0) }])
+        let bytes = try Self.encode(["report": Self.object(report), "records": records.map { try Self.object($0) }, "processes": processes])
         guard bytes.count <= 262_144 else { throw RemoteControlPublicationError.full }
         return bytes
     }
@@ -311,7 +389,7 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         let context = submission.context
         try context.validate()
         guard context.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
-        let bytes = try Self.submissionBytes(report: submission.report, records: submission.records)
+        let bytes = try Self.submissionBytes(report: submission.report, records: submission.records, processes: submission.processes)
         let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         let (status, reply) = try await perform(url: path(context.genesisHash, "control/recovery/signer-reports"),
             method: "POST", body: bytes, allowConflict: true)

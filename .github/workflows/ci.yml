@@ -35,7 +35,9 @@ jobs:
           ref: ${{ inputs.head_sha || '' }}
 
       # Match the verified Apple SDK's SOURCE.json; mixed Rust runtimes fail to link.
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.1
 
       - name: Select Xcode 26.2 (Foundation Models SDK)
         run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer

@@ -10,7 +10,7 @@ WITH candidates AS (
     WHERE current_policy.binding=$4 AND (r.issuer,r.portal_origin,r.station_origin)=($1,$2,$3)
       AND b->>'bindingState'='bound' AND r.version < 9007199254740991
     ORDER BY r.account_id,r.genesis,r.release_id
-), releases AS (
+), eligible AS (
     SELECT r.* FROM candidates r
     WHERE NOT EXISTS (
         SELECT 1 FROM station_integration_policy p
@@ -19,6 +19,12 @@ WITH candidates AS (
           AND (other->>'accountId',other->>'genesisHash')=(r.account_id,r.genesis)
           AND ((other->>'version')::bigint > r.version
             OR ((other->>'version')::bigint=r.version AND other <> r.binding))
+    ) AND NOT EXISTS (
+        SELECT 1 FROM station_native_binding_transitions n
+        WHERE (n.issuer,n.portal_origin,n.station_origin,n.account_id,n.genesis)=
+              (r.issuer,r.portal_origin,r.station_origin,r.account_id,r.genesis)
+          AND (n.version > r.version OR
+              (n.version=r.version AND (n.report - 'state' - 'reportId') <> r.binding))
     ) AND NOT EXISTS (
         SELECT 1 FROM station_applied_binding_releases a
         WHERE (a.issuer,a.portal_origin,a.station_origin,a.account_id,a.genesis)=
@@ -31,10 +37,31 @@ WITH candidates AS (
           AND later.version > r.version
     )
     ORDER BY r.account_id,r.genesis LIMIT 64
+), locked_roots AS MATERIALIZED (
+    -- Host admission locks the root before checking policy. If that writer
+    -- is waiting on our policy lock, defer the release to the next poll.
+    SELECT root.genesis_hash, root.state
+    FROM remote_recovery_roots root JOIN eligible e
+      ON e.genesis=root.genesis_hash AND e.account_id=root.state->>'account'
+    ORDER BY root.genesis_hash FOR UPDATE OF root SKIP LOCKED
+), releases AS (
+    SELECT e.*, COALESCE((
+        SELECT jsonb_agg(connection ORDER BY connection) FROM (
+            SELECT value->'connection' AS connection FROM jsonb_each(locked.state->'routes')
+            UNION SELECT value->'connection' FROM jsonb_each(locked.state->'proxies')
+        ) links
+    ), '[]'::jsonb) AS retired
+    FROM eligible e LEFT JOIN locked_roots locked ON locked.genesis_hash=e.genesis
+    WHERE locked.genesis_hash IS NOT NULL OR NOT EXISTS (
+        SELECT 1 FROM remote_recovery_roots existing WHERE existing.genesis_hash=e.genesis
+    )
+), cleared AS (
+    UPDATE remote_recovery_roots root SET state=root.state || '{"routes":{},"proxies":{}}'::jsonb,
+        updated_at=now() FROM locked_roots locked WHERE root.genesis_hash=locked.genesis_hash
 )
 INSERT INTO station_applied_binding_releases
-    (issuer,portal_origin,station_origin,release_id,account_id,genesis,version,report)
-SELECT issuer,portal_origin,station_origin,release_id,account_id,genesis,version+1,
+    (issuer,portal_origin,station_origin,release_id,account_id,genesis,version,retired_routes,report)
+SELECT issuer,portal_origin,station_origin,release_id,account_id,genesis,version+1,retired,
        jsonb_build_object('state','binding_changed','account',account,'accountId',account_id,
            'genesisHash',genesis,'bindingId',binding_id,'version',version+1,'bindingState','released',
            'reportId','binding_changed:' || encode(sha256(convert_to(

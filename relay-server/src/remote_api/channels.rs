@@ -34,6 +34,8 @@ pub(crate) struct Envelope<'a> {
 }
 
 impl<'a> Envelope<'a> {
+    pub(crate) fn event(&self) -> &str { &self.event }
+
     pub(crate) fn parse(text: &'a str) -> Option<Self> {
         if text.len() > MAX_BYTES {
             return None;
@@ -206,6 +208,11 @@ impl ChannelBroker {
             .remove(handle);
     }
 
+    pub(crate) fn host_connections(&self) -> Vec<ConnRef> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.values()
+            .map(|route| route.target.clone()).collect()
+    }
+
     pub(crate) fn host_disconnected(&self, target: &ConnRef) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.retain(|_, route| {
             if &route.target == target {
@@ -215,6 +222,15 @@ impl ChannelBroker {
                 true
             }
         });
+    }
+
+    pub(crate) fn retire_channels(&self, source: &ConnRef, handles: &[String]) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for handle in handles {
+            if inner.routes.get(handle).is_some_and(|route| &route.target == source) {
+                if let Some(route) = inner.routes.remove(handle) { let _ = route.close.send(true); }
+            }
+        }
     }
 
     pub(crate) fn delivery(&self) -> Option<(String, oneshot::Receiver<bool>)> {
@@ -383,9 +399,23 @@ async fn serve(
                 let Some(reply) = reply else { break };
                 let is_close = Envelope::parse(&reply.text).is_some_and(|e| e.event == "close");
                 if is_close { guard.notify_host = false; }
-                let result = tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(reply.text))).await;
+                let write = || tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(reply.text)));
+                // A peer may have disabled the account after queue admission.
+                // Hold the proved association through the bounded socket write.
+                let sent = if let Some(binding) = &binding {
+                    // The credential stays with the proxy socket. Never wait
+                    // for the other replica while holding the recovery lock.
+                    hub.channel_proxy_current(binding).await &&
+                        matches!(recovery.with_host_route(binding, write).await, Some(Ok(Ok(()))))
+                } else if let Some(route) = &owner_route {
+                    recovery.with_owner_route(route, None, || async {
+                        hub.owner_route_current(route).await && matches!(write().await, Ok(Ok(())))
+                    }).await == Some(true)
+                } else {
+                    false
+                };
                 drop(reply._bytes);
-                if !matches!(result, Ok(Ok(()))) || is_close { break; }
+                if !sent || is_close { break; }
             }
             incoming = socket.next() => {
                 match incoming {
@@ -404,6 +434,15 @@ async fn serve(
                     _ => break,
                 }
             }
+        }
+    }
+    if let Some(binding) = binding.as_ref().filter(|_| recovery.delegated_enabled()) {
+        if hub.channel_proxy_current(binding).await {
+            let suspended = recovery.with_host_suspension(binding, |_| async {
+                let close = json!({"type":"channel","event":"close","channel":open.channel,"reason":"service_suspended"});
+                let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Text(close.to_string()))).await;
+            }).await;
+            if suspended.is_some() { guard.notify_host = false; }
         }
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;

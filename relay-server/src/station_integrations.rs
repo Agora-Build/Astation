@@ -48,6 +48,7 @@ mod revocation;
 mod delegated;
 mod verifier_inventory;
 mod binding_challenges;
+mod binding_reports;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationState(pub Option<Arc<StationIntegrations>>);
@@ -149,9 +150,7 @@ impl StationIntegrations {
         let verifier =
             OidcVerifier::new(&binding.issuer, &binding.station_origin, "astation.remote")
                 .map_err(|_| ())?;
-        if crate::integration_checkpoint::PortalCheckpoint::built_in(&binding) {
-            app.recovery.set_verifier_portal(&binding)?;
-        }
+        app.recovery.set_verifier_portal(&binding)?;
         Ok(Arc::new(Self {
             app,
             binding,
@@ -218,10 +217,12 @@ impl StationIntegrations {
             self.collect_portal_checkpoint_if_due().await;
         }
         if let Some(fence) = self.app.recovery.active_delegated_binding() {
-            if caught_up && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding)
-                && self.policies.apply_binding_releases(&self.binding, fence).await.is_err()
-            {
-                tracing::warn!("could not apply pending Portal binding releases");
+            if caught_up && crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+                match self.policies.apply_binding_releases(&self.binding, fence).await {
+                    Ok(0) => {}
+                    Ok(_) => self.app.recovery.notify_delegated_change(),
+                    Err(()) => tracing::warn!("could not apply pending Portal binding releases"),
+                }
             }
             self.reconcile_delegated_services().await;
         }
@@ -374,11 +375,21 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
             tokio::spawn(runtime.clone().run_delegated_reports());
         }
     }
+    routes_with_runtime(runtime)
+}
+
+pub(crate) fn routes_with_runtime(runtime: Option<Arc<StationIntegrations>>) -> Router<AppState> {
     Router::new()
         .route("/agora-build/v1/changes", post(nudge))
         .route("/agora-build/v1/details", get(details))
+        .route("/agora-build/v1/binding/consent-request", get(binding_challenges::pending::next))
         .route("/agora-build/v1/logs/:genesis/binding/challenge", post(binding_challenges::mint))
+        .route("/agora-build/v1/logs/:genesis/binding/receipt", post(binding_challenges::receipt))
+        .route("/agora-build/v1/logs/:genesis/binding/commit", post(binding_challenges::commit))
+        .route("/agora-build/v1/logs/:genesis/binding/transfer-consent", post(binding_challenges::consent))
         .route("/agora-build/v1/logs/:genesis/verifiers/services", post(verifier_inventory::services))
+        .route("/agora-build/v1/logs/:genesis/verifier-requests", post(verifier_inventory::external_requests))
+        .route("/agora-build/v1/logs/:genesis/verifier-reports/:nonce", post(verifier_inventory::external_answer))
         .route(
             "/agora-build/v1/integrations/:id/provision",
             post(provision),

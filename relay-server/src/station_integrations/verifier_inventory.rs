@@ -2,6 +2,56 @@
 use super::*;
 use sqlx::PgConnection;
 
+pub(super) async fn external_requests(
+    State(IntegrationState(runtime)): State<IntegrationState>, Path(genesis): Path<String>,
+    headers: HeaderMap, body: axum::body::Body,
+) -> Response {
+    external(runtime, genesis, None, headers, body).await
+}
+
+pub(super) async fn external_answer(
+    State(IntegrationState(runtime)): State<IntegrationState>, Path((genesis, nonce)): Path<(String, String)>,
+    headers: HeaderMap, body: axum::body::Body,
+) -> Response {
+    external(runtime, genesis, Some(nonce), headers, body).await
+}
+
+async fn external(
+    runtime: Option<Arc<StationIntegrations>>, genesis: String, nonce: Option<String>,
+    headers: HeaderMap, body: axum::body::Body,
+) -> Response {
+    use crate::remote_api::recovery::ExternalVerifierRequest;
+    let Some(runtime) = runtime.filter(|r| r.app.recovery.delegated_enabled()) else { return unavailable() };
+    let Ok(_permit) = runtime.requests.try_acquire() else { return error(StatusCode::TOO_MANY_REQUESTS, "verifier_inventory_busy") };
+    let request = async {
+        let raw = match bearer_token(&headers) { Ok(raw) => raw, Err(e) => return token_error(&e, "agent.view") };
+        let token = match runtime.verifier.verify_verifier_token(raw).await {
+            Ok(token) => token, Err(e) => return token_error(&e, "agent.view"),
+        };
+        let invalid = || error(StatusCode::BAD_REQUEST, "invalid_verifier_request");
+        let limit = if nonce.is_some() { 16_640 } else { 4096 };
+        let Ok(bytes) = axum::body::to_bytes(body, limit).await else { return invalid() };
+        let Ok(input) = atem_client::canonical::StrictValue::parse(&bytes, limit) else { return invalid() };
+        let Some(fields) = input.value().as_object() else { return invalid() };
+        let operation = match nonce {
+            Some(nonce) if fields.len() == 1 => {
+                let Some(report) = fields.get("report") else { return invalid() };
+                ExternalVerifierRequest::Answer { nonce, report: report.clone() }
+            }
+            None if fields.len() == 2 => {
+                let (Some(slot), Some(expected)) = (input.value()["slot"].as_str(),
+                    atem_client::membership::Head::from_json(&input.value()["expected"])) else { return invalid() };
+                ExternalVerifierRequest::Inbox { slot: slot.to_owned(), expected }
+            }
+            _ => return invalid(),
+        };
+        match runtime.app.recovery.external_verifier(&runtime.binding, &genesis, &token, operation).await {
+            Ok(reply) => reply.into_response(), Err(_) => unavailable(),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), request).await.unwrap_or_else(|_| unavailable())
+}
+
 pub(super) async fn services(
     State(IntegrationState(runtime)): State<IntegrationState>,
     Path(genesis): Path<String>,

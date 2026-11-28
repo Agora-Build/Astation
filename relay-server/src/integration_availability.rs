@@ -14,6 +14,17 @@ pub(super) struct Availability {
     disabled: BTreeSet<String>,
 }
 
+impl super::PolicyCheckpoint {
+    /// None means that the local baseline cannot establish this account's state.
+    pub(crate) fn route_account_disabled(&self, owner: Option<&str>) -> Option<bool> {
+        let view = self.availability.as_ref()?;
+        if !view.current_at(self.cursor) || owner.is_some_and(|id| !account_id(id)) {
+            return None;
+        }
+        Some(owner.is_some_and(|id| view.disabled.contains(id)))
+    }
+}
+
 impl Availability {
     pub(super) fn from_checkpoint(cursor: u64, source: &Accounts) -> Self {
         Self {
@@ -31,11 +42,13 @@ impl Availability {
     }
 
     pub(super) fn enabled_at(&self, cursor: u64, owner: &str) -> bool {
-        self.cursor == cursor
-            && self.caught_up
-            && self.complete
+        self.current_at(cursor)
             && account_id(owner)
             && !self.disabled.contains(owner)
+    }
+
+    fn current_at(&self, cursor: u64) -> bool {
+        self.cursor == cursor && self.caught_up && self.complete
     }
 
     pub(super) fn advance(&mut self, from: u64, to: u64, changes: &[Change]) -> Result<(), ()> {
@@ -72,7 +85,7 @@ impl Availability {
                 self.complete = change.kind == "accounts_baseline";
             }
         }
-        self.caught_up = changes.len() < super::PAGE_LIMIT && to >= self.cursor;
+        self.caught_up = !super::may_have_another_page(from, to) && to >= self.cursor;
         self.cursor = self.cursor.max(to);
         Ok(())
     }

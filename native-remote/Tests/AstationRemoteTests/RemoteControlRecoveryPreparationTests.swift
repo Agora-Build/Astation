@@ -55,6 +55,56 @@ final class RemoteControlRecoveryPreparationTests: XCTestCase {
         XCTAssertThrowsError(try decode(Data(repeating: 32, count: 8_193)))
     }
 
+    @MainActor
+    func testOriginalPagesRequireSameReviewAndStrictlyIncreasingRecordIDs() async throws {
+        let review = try decode(JSONSerialization.data(withJSONObject: value()))
+        let host = try XCTUnwrap(URL(string: origin)?.host)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryHTTPStub.self]
+        let http = try RemoteRecoveryHTTP(relayURL: origin, configuration: config, accessToken: { "native-test" })
+        let fixture = try ControlPublicationFixture()
+        var records: [[String: Any]] = []
+        for _ in 0..<2 {
+            let body = try fixture.body(interrupt: false)
+            _ = try fixture.prepare(body)
+            let signed = try fixture.sign(body)
+            records.append(try XCTUnwrap(JSONSerialization.jsonObject(with: Data(signed.utf8)) as? [String: Any]))
+        }
+        func id(_ record: [String: Any]) -> String { (record["body"] as! [String: Any])["record_id"] as! String }
+        records.sort { id($0) < id($1) }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        for scenario in ["valid", "stale", "duplicate", "empty_more", "wrong_offset", "nonboolean"] {
+            RecoveryHTTPStub.install(host: host) { request in
+                let url = try XCTUnwrap(request.url)
+                XCTAssertEqual(url.path, "/api/remote/v1/logs/" + review.context.genesisHash +
+                    "/control/recovery/" + review.context.planID + "/originals")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-test")
+                let query = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+                XCTAssertEqual(query.first { $0.name == "review" }?.value, review.reconstructionHash)
+                let offset = try XCTUnwrap(Int(query.first { $0.name == "offset" }?.value ?? ""))
+                guard [0, 1].contains(offset) else { throw URLError(.badServerResponse) }
+                var page: [String: Any] = ["plan_id": review.context.planID, "reconstruction_hash": review.reconstructionHash,
+                    "records": [records[offset]], "offset": offset, "more": offset == 0]
+                if offset == 1 {
+                    switch scenario {
+                    case "stale": page["reconstruction_hash"] = String(repeating: "e", count: 64)
+                    case "duplicate": page["records"] = [records[0]]
+                    case "empty_more": page["records"] = []; page["more"] = true
+                    case "wrong_offset": page["offset"] = 0
+                    case "nonboolean": page["more"] = 0
+                    default: break
+                    }
+                }
+                return (200, try JSONSerialization.data(withJSONObject: page))
+            }
+            do {
+                let originals = try await http.controlRecoveryOriginals(for: review)
+                XCTAssertEqual(scenario, "valid")
+                XCTAssertEqual(try originals.map { try parseControlRecord(recordJson: $0).recordId }, records.map(id))
+            } catch { XCTAssertNotEqual(scenario, "valid", String(describing: error)) }
+        }
+    }
+
     func testStationSignerChallengeChecksMemberSlotLeaseAndFullRecoveryContext() async throws {
         let context = try decode(JSONSerialization.data(withJSONObject: value())).context
         let host = try XCTUnwrap(URL(string: context.stationOrigin)?.host)

@@ -795,6 +795,11 @@ pub struct PgAccountStore {
 }
 
 impl PgAccountStore {
+    #[cfg(test)]
+    pub(crate) fn with_verifier(pool: sqlx::PgPool, verifier: Arc<dyn AccountIdentityVerifier>) -> Self {
+        Self { room_ownership: None, pool, verifier }
+    }
+
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self::for_station(pool, None)
     }

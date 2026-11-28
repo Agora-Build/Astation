@@ -242,10 +242,45 @@ challenge to PostgreSQL. Replicas can return the same outstanding challenge
 after a lost response. The lease ends within 30 seconds and by token expiry.
 The request and response use the delegated gate.
 
-Issuance prepares the confirmation. Applying the signed proof requires an
-atomic nonce consumption and ownership transition, fresh policy and room
-checks, separate current-owner consent for a transfer, route invalidation
-and a durable Portal report.
+When an independent owner's consent is outstanding, the manager's first
+signed `POST /agora-build/v1/logs/{genesis}/binding/commit` returns HTTP 202
+with `{"awaiting_consent":true}` after Station stores the proof. The other
+owner uses their own Station-audience native login to call
+`GET /agora-build/v1/binding/consent-request`. The private response has one
+field, `request`, containing the next eligible SDK challenge or `null`.
+Station rechecks current room ownership, the manager signature and the
+request deadline on discovery. Each owner sees only the challenge they can
+consent to. The manager retries the saved proof during the original login
+and deadline. After expiry, the receipt endpoint distinguishes a committed
+ownership change from an expired request.
+
+For a transfer, the current owner sends the reviewed challenge as the body of
+`POST /agora-build/v1/logs/{genesis}/binding/transfer-consent` using their
+own Station-audience native login. Station compares the full challenge with
+the saved request, checks both accounts and the current ownership and
+membership, and records consent on that nonce in shared PostgreSQL. It
+returns `{"consented":true}` after commit. The earlier of the current owner's
+token expiry and the challenge expiry ends that consent. A retry during that
+period preserves the original deadline. A different recipient or binding
+version requires a new review.
+
+For the first binding of a list, the manager reviews `bind` with
+`expected_binding.state` set to `never_bound`. Station keeps a private
+digest of the rooms and their resolved owners on that nonce. Each foreign
+room owner submits the same challenge to the existing consent endpoint from
+their own native login. Consent covers that owner's rooms in the review and
+expires with the earlier of their token and the challenge. The response
+contains only `{"consented":true}`.
+
+At commit, Station locks the root and reads the room lookup again, including
+retained offline rooms and the issuer-mapped account on a proved host's
+recovery root. When the root and a registration name different owners, each
+foreign owner must consent. A change of room or owner requires a fresh challenge.
+Every resolved owner must still be enabled, and every required consent must
+still be valid. Conflicting ownership or an unmapped registration prevents the
+binding. The transition, nonce consumption, route retirement and Portal report
+share one transaction. The exact manager proof retrieves its original receipt
+after a lost response.
 
 ## Native client HTTP carriage
 
@@ -812,13 +847,23 @@ WebSocket receive and fragment-aggregation limits; control messages retain
 the shared 256 KiB / 64-record limits. A transport failure closes the proxy's
 virtual channels and retries with backoff. A closing channel remains tracked
 until the local write succeeds, so queue rejection still retires it. The local
-socket tracks at most 128 native and proxy channel handles together. Atem signs
-one challenge per local authentication generation: a subsequent Station challenge causes fresh local
-authentication on the same TCP socket, with old channels closed **before** the
-new authentication request and a new client generation. Both loopback and LAN
-reuse their existing authentication credentials; this requires no new pairing
-ceremony. An explicit host-proof refusal stops that proxy attempt and leaves
-ordinary local/LAN traffic usable. Early challenges are dropped, never buffered.
+socket tracks at most 128 native and proxy channel handles together.
+
+When the Station refuses a verified proxy proof with `service_suspended` (B-1),
+the Mac forwards the verdict to the local host. After the local write succeeds,
+it waits 30 seconds and opens a new forwarding connection to the selected
+Station. It authenticates that connection before forwarding its fresh
+challenge on the same local generation. Direct channels stay open. The host
+must verify the new route and finish its control sync before accepting delegated
+work. This path requires Atem's same-generation challenge hook for the joint check.
+
+If the host leaves a fresh challenge unanswered, the Mac waits another 30
+seconds before retrying. If the host returns a proof and the Station verdict
+is lost upstream or its write to the host fails, the Mac holds the attempt
+until the local authentication generation changes.
+An ordinary proof refusal also ends the attempt. On other upstream reconnects,
+the local server's existing authentication rules apply. A replacement local
+generation closes the previous channels before issuing its authentication request.
 
 Native forwarding additionally requires exact
 `ASTATION_LOCAL_STATION_PROXY=true`, a verified host advertising `host.delegated`,

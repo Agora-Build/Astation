@@ -6,6 +6,39 @@ pub(crate) const OWNER: &str = "ab01234567890123456789012345";
 pub(crate) const PRINCIPAL: &str = "principal-12345678-1234-4567-89ab-123456789abc";
 pub(crate) const ID: &str = "i-01234567890123456789012345";
 
+// Transport fixtures use the same complete built-in Station policy a replica reads in production.
+pub(crate) async fn attach_test_room_owner(store: &RecoveryStore, station: &str) {
+    let pool = store.pool().unwrap();
+    let portal = FeedBinding {
+        issuer: "https://auth.example".into(),
+        portal_origin: "https://portal.example".into(),
+        station_origin: station.into(),
+        report_client_id: "s-01234567890123456789012345".into(),
+    };
+    store.set_verifier_portal(&portal).unwrap();
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,'alice') ON CONFLICT DO NOTHING")
+        .bind(&portal.issuer).bind(OWNER).execute(&pool).await.unwrap();
+    let policies = PolicyStore(pool);
+    let before = policies.load(&portal).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    if before.recent_d27_read(now) {
+        return;
+    }
+    let body = json!({"changes":[],"cursor":0,"checkpoint":{"at":"2026-11-24T10:00:00.000Z",
+        "integrations":[],"bindings":[],"pendingReleases":[],"accounts":{"complete":true,"disabled":[]}}});
+    let source = crate::integration_checkpoint::PortalCheckpoint::parse(
+        body.to_string().as_bytes(),
+        &portal,
+    )
+    .unwrap();
+    let page = serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[]})).unwrap();
+    let live = before.apply(0, page, now / 1000).unwrap();
+    policies.commit(&before, &live).await.unwrap();
+    let mut checkpoint = live.apply_checkpoint(source, now / 1000).unwrap();
+    checkpoint.record_completed_read(now, now);
+    policies.commit(&live, &checkpoint).await.unwrap();
+}
+
 pub(crate) async fn fixture() -> (
     crate::test_database::TestDatabase,
     Arc<StationIntegrations>,
@@ -624,23 +657,52 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
     fence.initialize(&db.pool,true).await.unwrap();
     let replica = db.reconnect(2).await;
     let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding), Some(&runtime.vault));
-    for (state, expected) in [
-        ("paused",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
-        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
-        ("expired",json!({"status":"pre_expiry_state_unresolved"})),
-        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+    let future = "2099-01-01T00:00:00.000Z";
+    let elapsed = "2000-01-01T00:00:00.000Z";
+    let held_review = json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]});
+    let released_review = json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]});
+    let unknown = json!({"status":"pre_expiry_state_unresolved"});
+    for (state, expires_at, held, expected) in [
+        ("paused", elapsed, None, &held_review),
+        ("expired", future, None, &unknown),
+        ("ready", elapsed, None, &unknown),
+        ("expired", elapsed, Some(true), &held_review),
+        ("expired", elapsed, Some(false), &released_review),
+        ("ready", future, None, &released_review),
     ] {
         let previous = runtime.policies.load(&runtime.binding).await.unwrap();
-        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+        let mut source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
             "id":ID,"ownerAccount":OWNER,"state":state,"scopes":["agent.view"],"r9Svc":draft["fingerprint"],
-            "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+            "expiresAt":expires_at,"quotaPerSecond":10
         }]}});
+        if let Some(held) = held { source["checkpoint"]["integrations"][0]["held"] = json!(held); }
         let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
         let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
         runtime.policies.commit_for_recovery(&previous,&next,Some(&fence)).await.unwrap();
         let result = review().await.unwrap();
-        assert_eq!(result["portal_service_evidence"]["services"][0]["snapshot_review"],expected);
+        let service = &result["portal_service_evidence"]["services"][0];
+        assert_eq!(&service["snapshot_review"], expected);
+        assert_eq!(service["observation"].get("held").and_then(Value::as_bool), held);
         assert_eq!(result["recovery_ready"], false);
+    }
+    // An authenticated snapshot alone cannot renew the ordinary policy lease.
+    let fresh = runtime.policies.load(&runtime.binding).await.unwrap();
+    let snapshot = fresh.portal_snapshot.clone().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for (received, release) in [(now - crate::integration_feed::MAX_POLICY_AGE_SECS, false),
+                                (now + 600, false), (now, true)] {
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let mut next = previous.apply_checkpoint(snapshot.clone(), now).unwrap();
+        next.received_at = received;
+        runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+        let prepared = review().await.unwrap();
+        let service = &prepared["portal_service_evidence"]["services"][0];
+        assert_eq!(service["observation"]["state"], "ready");
+        if release {
+            assert_eq!(service["snapshot_review"]["fresh_actions"][1]["action"], "release");
+        } else {
+            assert_eq!(service["snapshot_review"], json!({"status":"owner_availability_unresolved"}));
+        }
     }
     sqlx::query("UPDATE station_integration_provisioning SET context=jsonb_set(context::jsonb,'{genesis}',to_jsonb(repeat('a',64)))::text")
         .execute(&db.pool).await.unwrap();
@@ -712,12 +774,28 @@ async fn postgres_delegated_recovery_commits_to_this_lists_owner_binding() {
                 "state":"ready","scopes":["agent.view"],"r9Svc":draft["fingerprint"],
                 "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}],
             "accounts":{"complete":complete,"disabled":if disabled { vec![OWNER] } else { vec![] }},
+            "pendingReleases":[],
             "bindings":[{"account":owner,"accountId":fixture.log.account_id(),"genesisHash":genesis,
                 "bindingId":id,"version":version,"bindingState":state}]}});
         let snapshot =
             PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding)
                 .unwrap();
-        let next = old.apply_checkpoint(snapshot, old.received_at).unwrap();
+        let mut next = old.apply_checkpoint(snapshot.clone(), old.received_at).unwrap();
+        if version == 1 {
+            let now = chrono::Utc::now().timestamp_millis();
+            next.record_completed_read(now - 60_000, now);
+            runtime.policies.commit_for_recovery(&old, &next, Some(&fence)).await.unwrap();
+            let stale = review().await.unwrap();
+            let evidence = &stale["portal_service_evidence"];
+            assert_eq!(evidence["owner_availability"], "enabled");
+            assert_eq!(evidence["owner_binding"]["state"], "bound");
+            assert_eq!(evidence["services"][0]["snapshot_review"],
+                json!({"status":"owner_availability_unresolved"}));
+            old = next;
+            next = old.apply_checkpoint(snapshot, old.received_at).unwrap();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        next.record_completed_read(now, now);
         runtime
             .policies
             .commit_for_recovery(&old, &next, Some(&fence))

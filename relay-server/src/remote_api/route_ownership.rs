@@ -1,5 +1,5 @@
 //! Ownership evidence for proved routes on the built-in Station.
-use super::super::HostBinding;
+use super::super::{HostBinding, RouteService};
 use super::{invalid_root, Membership, Root};
 use crate::auth::session_id_for_room;
 use crate::identity_store::BINDING_TTL_SECS;
@@ -435,4 +435,233 @@ pub(super) async fn inspect(
         "binding_matches_root_owner":binding.filter(|_| !competing).and_then(|b|owner.map(|o|o == b.account)),
         "binding_version":binding.map(|row|row.version),"retained_routes":hosts}),
     )
+}
+
+/// Check the signed-in service owner inside the transaction that admits the
+/// proof or dispatches the frame. The caller holds the proved root lock.
+pub(in crate::remote_api::recovery) async fn route_service(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    principal: &str,
+    account: &str,
+    genesis: &str,
+    room: &str,
+) -> Result<RouteService, sqlx::Error> {
+    let policy = PolicyStore::lock_for_binding(db, station)
+        .await
+        .map_err(|_| invalid_root())?;
+    if !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) {
+        return Ok(RouteService::Unavailable);
+    }
+    let binding = policy.effective_binding(db, account, genesis).await?;
+    if policy
+        .has_competing_binding(db, account, genesis, binding.as_ref())
+        .await
+        .map_err(|_| invalid_root())?
+    {
+        return Ok(RouteService::Unavailable);
+    }
+    let owner = match binding {
+        Some(row) if row.binding_state == "bound" => Some(row.account),
+        Some(_) => None,
+        None => legacy_owner(db, station, genesis, room, principal).await?,
+    };
+    let Some(disabled) = policy.route_account_disabled(owner.as_deref()) else {
+        return Ok(RouteService::Unavailable);
+    };
+    // Disabled observations reserve cursor + 1 for that account. A higher
+    // floor, or a higher global cut, means another replica has newer evidence.
+    let behind: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM station_delegated_availability_fences
+         WHERE issuer=$1 AND portal_origin=$2 AND station_origin=$3
+           AND ((account='' AND minimum_cursor>$5)
+             OR (account=$4 AND minimum_cursor>$5+$6)))"
+    )
+    .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+    .bind(owner.as_deref()).bind(policy.cursor as i64).bind(i64::from(disabled))
+    .fetch_one(db).await?;
+    if behind || !policy.recent_d27_read(chrono::Utc::now().timestamp_millis()) {
+        return Ok(RouteService::Unavailable);
+    }
+    Ok(match owner {
+        None => RouteService::NoOwner,
+        Some(_) if disabled => RouteService::Disabled,
+        Some(_) => RouteService::Allowed,
+    })
+}
+
+async fn legacy_owner(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    genesis: &str,
+    room: &str,
+    principal: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let mut rows = room_owners(db, station, genesis, &[room], principal).await?;
+    let Some(row) = rows.pop() else {
+        return Err(invalid_root());
+    };
+    match row.owner() {
+        LegacyOwner::Conflict => Err(invalid_root()),
+        LegacyOwner::Account(owner) => Ok(Some(owner.to_owned())),
+        LegacyOwner::Unmapped | LegacyOwner::Unknown => Ok(None),
+    }
+}
+
+enum LegacyOwner<'a> {
+    Account(&'a str),
+    Unknown,
+    Unmapped,
+    Conflict,
+}
+
+#[derive(sqlx::FromRow)]
+struct Lookup {
+    room: String,
+    retained: Option<String>,
+    conflicted: bool,
+    direct: Option<String>,
+    registered: bool,
+    session_owner: Option<String>,
+    has_session: bool,
+    root_owner: Option<String>,
+}
+
+impl Lookup {
+    fn owner(&self) -> LegacyOwner<'_> {
+        if self.conflicted {
+            return LegacyOwner::Conflict;
+        }
+        if self.registered && self.direct.is_none()
+            || self.has_session && self.session_owner.is_none()
+        {
+            return LegacyOwner::Unmapped;
+        }
+        if session_id_for_room(&self.room).is_some() && !self.has_session && self.retained.is_none()
+        {
+            // An expired session does not establish the room's owner.
+            return if self.registered {
+                LegacyOwner::Unmapped
+            } else {
+                LegacyOwner::Unknown
+            };
+        }
+        let mut owners = [
+            self.retained.as_deref(),
+            self.direct.as_deref(),
+            self.session_owner.as_deref(),
+        ]
+        .into_iter()
+        .flatten();
+        if let Some(owner) = owners.next() {
+            return if account_id(owner) && owners.all(|s| s == owner) {
+                LegacyOwner::Account(owner)
+            } else {
+                LegacyOwner::Conflict
+            };
+        }
+        self.root_owner
+            .as_deref()
+            .filter(|owner| account_id(owner))
+            .map_or(LegacyOwner::Unknown, LegacyOwner::Account)
+    }
+}
+
+async fn room_owners(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    genesis: &str,
+    rooms: &[&str],
+    principal: &str,
+) -> Result<Vec<Lookup>, sqlx::Error> {
+    let sessions: Vec<_> = rooms.iter().map(|room| session_id_for_room(room)).collect();
+    sqlx::query_as(
+        "SELECT q.room, r.account_subject AS retained, COALESCE(r.conflicted,false) AS conflicted,
+            direct_id.subject AS direct, direct.astation_id IS NOT NULL AS registered,
+            session_id.subject AS session_owner, s.session_id IS NOT NULL AS has_session,
+            root_owner.subject AS root_owner
+         FROM unnest($4::text[],$5::text[]) AS q(room,session)
+         LEFT JOIN station_proved_room_owners r ON (r.issuer,r.station_origin,r.genesis_hash,r.room)=($1,$2,$3,q.room)
+         LEFT JOIN astation_accounts direct ON direct.astation_id=q.room
+         LEFT JOIN account_identities direct_id ON direct_id.issuer=$1 AND direct_id.principal=direct.agora_user
+         LEFT JOIN session_bindings s ON s.session_id=q.session
+            AND s.last_used_at>floor(extract(epoch FROM statement_timestamp()))::bigint-$7
+         LEFT JOIN astation_accounts a ON a.astation_id=s.astation_id
+         LEFT JOIN account_identities session_id ON session_id.issuer=$1 AND session_id.principal=a.agora_user
+         LEFT JOIN account_identities root_owner ON root_owner.issuer=$1 AND root_owner.principal=$6")
+        .bind(&station.issuer).bind(&station.station_origin).bind(genesis).bind(rooms).bind(sessions)
+        .bind(principal).bind(BINDING_TTL_SECS).fetch_all(db).await
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct BindingRooms {
+    pub rooms: BTreeMap<String, Option<String>>,
+    pub proved_root_owner: Option<String>,
+}
+
+/// The caller holds the root lock. A registration can already hold a room
+/// lock while waiting for that root, so return a retry instead of waiting.
+pub(crate) async fn binding_rooms(
+    db: &mut PgConnection,
+    station: &FeedBinding,
+    genesis: &str,
+) -> Result<Option<BindingRooms>, sqlx::Error> {
+    let (principal, proved_root_owner, rooms): (String, Option<String>, Vec<String>) = sqlx::query_as(
+        "SELECT account_subject, CASE WHEN COALESCE(state->'routes','{}'::jsonb)<>'{}'::jsonb
+            OR COALESCE(state->'proxies','{}'::jsonb)<>'{}'::jsonb OR EXISTS
+                (SELECT 1 FROM station_room_proofs WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3))
+            THEN (SELECT subject FROM account_identities WHERE issuer=$1 AND principal=account_subject)
+            END, ARRAY(
+            SELECT room FROM station_proved_room_owners WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3)
+            UNION SELECT room FROM station_room_proofs WHERE (issuer,station_origin,genesis_hash)=($1,$2,$3)
+            UNION SELECT jsonb_array_elements_text(jsonb_path_query_array(state, '$.routes.*.room')
+                                               || jsonb_path_query_array(state, '$.proxies.*.room')))
+         FROM remote_recovery_roots WHERE genesis_hash=$3")
+        .bind(&station.issuer).bind(&station.station_origin).bind(genesis).fetch_one(&mut *db).await?;
+    let locked: bool = sqlx::query_scalar(
+        "SELECT COALESCE(bool_and(pg_try_advisory_xact_lock_shared(hashtextextended(room,739185))),true)
+         FROM unnest($1::text[]) AS q(room)")
+        .bind(&rooms).fetch_one(&mut *db).await?;
+    if !locked {
+        return Ok(None);
+    }
+    let rooms: Vec<_> = rooms.iter().map(String::as_str).collect();
+    let mut result = BTreeMap::new();
+    for row in room_owners(db, station, genesis, &rooms, &principal).await? {
+        let account = match row.owner() {
+            LegacyOwner::Account(owner) => Some(owner.to_owned()),
+            LegacyOwner::Unknown => None,
+            LegacyOwner::Conflict | LegacyOwner::Unmapped => return Ok(None),
+        };
+        result.insert(row.room, account);
+    }
+    // A proved host's own durable root association and its room registration
+    // may name different accounts. Preserve both ownership checks on first bind.
+    Ok(Some(BindingRooms { rooms: result, proved_root_owner }))
+}
+
+impl super::super::RecoveryStore {
+    pub(crate) async fn retired_binding_connections(
+        &self,
+        candidates: &[crate::cluster::ConnRef],
+    ) -> Result<Vec<crate::cluster::ConnRef>, sqlx::Error> {
+        let Some(station) = self.verifier_portal.get().filter(|station|
+            self.active_delegated_binding().is_some_and(|fence| fence.origin == station.station_origin)
+                && crate::account_identity::built_in_station(&station.station_origin)
+        ) else { return Ok(Vec::new()) };
+        let pool = self.pool.as_ref().ok_or_else(invalid_root)?;
+        let retired: Vec<sqlx::types::Json<crate::cluster::ConnRef>> = sqlx::query_scalar(
+            "SELECT c FROM jsonb_array_elements($4) c WHERE EXISTS (
+                SELECT 1 FROM station_native_binding_transitions t
+                WHERE (t.issuer,t.portal_origin,t.station_origin)=($1,$2,$3)
+                  AND t.retired_routes @> jsonb_build_array(c)
+                UNION ALL
+                SELECT 1 FROM station_applied_binding_releases r
+                WHERE (r.issuer,r.portal_origin,r.station_origin)=($1,$2,$3)
+                  AND r.retired_routes @> jsonb_build_array(c))",
+        )
+        .bind(&station.issuer).bind(&station.portal_origin).bind(&station.station_origin)
+        .bind(sqlx::types::Json(candidates)).fetch_all(pool).await?;
+        Ok(retired.into_iter().map(|row| row.0).collect())
+    }
 }

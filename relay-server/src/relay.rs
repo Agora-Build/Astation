@@ -42,6 +42,7 @@ use crate::AppState;
 
 mod verification;
 mod delegated;
+mod host_suspension;
 pub(crate) mod proxy;
 
 /// A room code as it may appear in logs: the first 4 characters plus "…".
@@ -389,9 +390,11 @@ impl RelayHub {
         }
         let binding = self.host_binding(connection);
         let send = || async {
-            if let Some(binding) = binding.as_ref().filter(|b| b.proxy.is_some()) {
-                if !self.proxy_current(connection).await { return false; }
-                return self.local().send_scoped(binding, crate::cluster::local::FrameScope::HostRoute, frame);
+            if let Some(binding) = &binding {
+                if binding.proxy.is_some() && !self.proxy_current(connection).await { return false; }
+                if binding.proxy.is_some() || (required && self.inner.recovery.get().is_some_and(|s| s.delegated_enabled())) {
+                    return self.local().send_scoped(binding, crate::cluster::local::FrameScope::HostRoute, frame);
+                }
             }
             if required {
                 self.local().send_required(connection, frame)
@@ -404,7 +407,7 @@ impl RelayHub {
                 return false;
             };
             let sent = store.with_host_route(binding, send).await;
-            if sent.is_none() && !self.keep_verification(connection).await {
+            if sent.is_none() && !self.hold_suspended_proxy(binding, None).await && !self.keep_verification(connection).await {
                 self.local()
                     .close_with(connection, CLOSE_TRY_AGAIN, "host route changed");
             }
@@ -421,8 +424,13 @@ impl RelayHub {
             };
             store
                 .with_host_route(&binding, || async {
-                    (binding.proxy.is_none() || self.proxy_current(&source.conn).await)
-                        && self.channels().reply(handle, source, frame)
+                    let current = match &binding.proxy {
+                        None => true,
+                        Some(_) if source.replica == self.replica_id() => self.proxy_current(&source.conn).await,
+                        Some(proxy) => matches!(self.room(&binding.room).await, Ok(Some(room))
+                            if room.verified && room.owner.as_ref() == Some(&proxy.native)),
+                    };
+                    current && self.channels().reply(handle, source, frame)
                 })
                 .await
                 .unwrap_or(false)
@@ -443,7 +451,7 @@ impl RelayHub {
         }
     }
 
-    async fn owner_route_current(&self, route: &crate::remote_api::recovery::OwnerRoute) -> bool {
+    pub(crate) async fn owner_route_current(&self, route: &crate::remote_api::recovery::OwnerRoute) -> bool {
         matches!(self.room(&route.room).await, Ok(Some(room)) if room.owner.is_some()
             && room.atems.get(&route.host) == Some(&route.connection))
     }
@@ -894,6 +902,13 @@ impl RelayHub {
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
                     }
                     BusEvent::Inbox(InboxMessage::ChannelDelivered { delivery, accepted }) => hub.channels().delivered(&delivery, accepted),
+                    BusEvent::Inbox(InboxMessage::CheckChannelProxy { connection_id, generation, reply_to, delivery }) => {
+                        let same = hub.host_binding(&connection_id).and_then(|b| b.proxy)
+                            .is_some_and(|proxy| proxy.generation == generation);
+                        let accepted = same && hub.local().contains(&connection_id) && hub.proxy_current(&connection_id).await;
+                        let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
+                    }
+                    BusEvent::Inbox(InboxMessage::RetireChannels { source, handles }) => hub.channels().retire_channels(&source, &handles),
                     BusEvent::Inbox(InboxMessage::ChannelReply { handle, source, frame, reply_to, delivery }) => {
                         let accepted = hub.channel_reply_checked(&handle, &source, &frame).await;
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
@@ -1125,7 +1140,7 @@ impl RelayHub {
         for binding in &bindings {
             if let Some(store) = self.inner.recovery.get() {
                 let current = store.with_host_route(binding, || async { () }).await.is_some();
-                if !current && !self.keep_verification(&binding.connection.conn).await {
+                if !current && !self.hold_suspended_proxy(binding, None).await && !self.keep_verification(&binding.connection.conn).await {
                     self.local().close_with(&binding.connection.conn, CLOSE_TRY_AGAIN, "host route changed");
                 }
             }
@@ -2644,20 +2659,46 @@ where S: futures_util::Sink<Message> + Unpin {
     write_loop_checked(ws_sink, outbox, code, None).await
 }
 
+#[cfg(all(test, feature = "delegated-host-work"))]
 async fn write_socket_frame<S>(sink: &mut S, frame: crate::cluster::local::SocketFrame, hub: Option<&RelayHub>) -> bool
 where S: futures_util::Sink<Message> + Unpin {
+    write_host_frame(sink, frame, hub, None).await
+}
+
+async fn write_host_frame<S>(sink: &mut S, frame: crate::cluster::local::SocketFrame, hub: Option<&RelayHub>, channels: Option<&host_suspension::RoutedHostChannels>) -> bool
+where S: futures_util::Sink<Message> + Unpin {
     use crate::cluster::local::FrameScope;
-    let Some((scope, binding)) = frame.route else { return sink.send(Message::Text(frame.text)).await.is_ok() };
+    if let Some((FrameScope::ProxySuspension, binding)) = &frame.route {
+        let (Some(hub), Some(channels)) = (hub, channels) else { return false };
+        if channels.binding.get() != Some(binding) || binding.proxy.is_none() { return false; }
+        // The policy can recover between queue admission and dispatch.
+        return channels.notify(hub, sink, &frame.text).await.unwrap_or(true);
+    }
+    let proxy_heads = frame.route.as_ref().is_some_and(|(scope, binding)|
+        *scope == FrameScope::DelegatedFeed && binding.proxy.is_some())
+        && serde_json::from_str::<serde_json::Value>(&frame.text).is_ok_and(|v| v["op"] == "heads");
+    let send = || async move {
+        match channels {
+            Some(channels) => channels.write(sink, frame.text).await,
+            None => sink.send(Message::Text(frame.text)).await.is_ok(),
+        }
+    };
+    let Some((scope, binding)) = frame.route else { return send().await };
     let Some(hub) = hub else { return false };
     let Some(store) = hub.inner.recovery.get() else { return false };
     let write = || async {
         if hub.host_binding(&binding.connection.conn).as_ref() != Some(&binding)
             || !hub.delegated_peer_current(&binding).await { return None; }
-        Some(sink.send(Message::Text(frame.text)).await.is_ok())
+        let sent = send().await;
+        if sent && proxy_heads {
+            if let Some(channels) = channels { channels.served_heads(); }
+        }
+        Some(sent)
     };
     let written = match scope {
         FrameScope::HostRoute => store.with_host_route(&binding, write).await,
         FrameScope::DelegatedFeed => store.with_delegated_route(&binding, write).await,
+        FrameScope::ProxySuspension => unreachable!("handled before ordinary route writes"),
     }.flatten();
     match written {
         Some(sent) => sent,
@@ -2668,7 +2709,12 @@ where S: futures_util::Sink<Message> + Unpin {
     }
 }
 
-async fn write_loop_checked<S>(mut ws_sink: S, mut outbox: SocketOutbox, code: String, hub: Option<RelayHub>)
+async fn write_loop_checked<S>(ws_sink: S, outbox: SocketOutbox, code: String, hub: Option<RelayHub>)
+where S: futures_util::Sink<Message> + Unpin {
+    write_host_loop(ws_sink, outbox, code, hub, None).await
+}
+
+async fn write_host_loop<S>(mut ws_sink: S, mut outbox: SocketOutbox, code: String, hub: Option<RelayHub>, channels: Option<Arc<host_suspension::RoutedHostChannels>>)
 where
     S: futures_util::Sink<Message> + Unpin,
 {
@@ -2691,9 +2737,14 @@ where
                     // `close_with` dropped the sender, so the queue is finite;
                     // the flush is bounded so a stalled client can't hold it.
                     let flush = async {
+                        if close_code == CLOSE_TRY_AGAIN {
+                            if let (Some(channels), Some(hub)) = (&channels, &hub) {
+                                if let Some(sent) = channels.notify(hub, &mut ws_sink, "").await { return sent; }
+                            }
+                        }
                         while let Ok(text) = outbox.frames.try_recv() {
                             outbox.sent(&text);
-                            if !write_socket_frame(&mut ws_sink, text, hub.as_ref()).await {
+                            if !write_host_frame(&mut ws_sink, text, hub.as_ref(), channels.as_deref()).await {
                                 return false;
                             }
                         }
@@ -2717,7 +2768,7 @@ where
                     Some(text) => {
                         // Off the queue: its bytes no longer count toward the cap.
                         outbox.sent(&text);
-                        if !write_socket_frame(&mut ws_sink, text, hub.as_ref()).await {
+                        if !write_host_frame(&mut ws_sink, text, hub.as_ref(), channels.as_deref()).await {
                             tracing::debug!("WS write failed for {}", mask_code(&code));
                             let _ = ws_sink.send(Message::Close(Some(CloseFrame {
                                 code: CLOSE_TRY_AGAIN, reason: "host authorization changed".into(),
@@ -2786,7 +2837,9 @@ async fn handle_ws(
     });
 
     // The writer runs from the start, so a refusal below still reaches the client.
-    let mut write_task = tokio::spawn(write_loop_checked(ws_sink, outbox, code.clone(), Some(hub.clone())));
+    let channels = (role == "atem" && recovery.delegated_enabled())
+        .then(|| Arc::new(host_suspension::RoutedHostChannels::default()));
+    let mut write_task = tokio::spawn(write_host_loop(ws_sink, outbox, code.clone(), Some(hub.clone()), channels.clone()));
 
     // Upgraded after the drain listed the sockets (SeqCst: a socket is
     // either listed or sees the flag here): close it with 1012 before it
@@ -2958,6 +3011,7 @@ async fn handle_ws(
                 ("atem", _) => {
                     // A replaced or removed Atem socket is no longer registered here.
                     if !local.contains(&connection_id) {
+                        flush_writer = reader_close.borrow().is_some();
                         tracing::debug!(
                             "Dropping stale Atem connection: code={} atem_id={}",
                             mask_code(&code),
@@ -2998,6 +3052,7 @@ async fn handle_ws(
                                     .publish_host_route(&binding, Some(disposition["verdict"].to_string()))
                                     .await;
                                 if let Some(Ok(AtemJoin::Joined { owner, .. })) = exposed {
+                                    if let Some(channels) = &channels { let _ = channels.binding.set(binding.clone()); }
                                     carrier_a = true;
                                     local.set_role(
                                         &connection_id,
@@ -3008,6 +3063,7 @@ async fn handle_ws(
                                     hub.room_changed(&code).await;
                                     if !hub.delegated_heads(&binding).await {
                                         local.close_with(&connection_id, CLOSE_TRY_AGAIN, "Station synchronization unavailable");
+                                        flush_writer = true;
                                         break;
                                     }
                                     if let Some(owner) = owner {
@@ -3028,6 +3084,11 @@ async fn handle_ws(
                                 } else {
                                     break;
                                 }
+                            }
+                            Ok(Err(crate::remote_api::recovery::HostRouteError::Suspended(frame))) => {
+                                local.send_required(&connection_id, frame.to_string());
+                                flush_writer = true;
+                                break;
                             }
                             Ok(Err(crate::remote_api::recovery::HostRouteError::Refused(refusal))) => {
                                 if !carrier_a {
@@ -3054,9 +3115,12 @@ async fn handle_ws(
                             .is_none()
                         {
                             if hub.verification_ingress(&connection_id, &text, true).await { continue; }
+                            local.close_with(&connection_id, CLOSE_TRY_AGAIN, "host route changed");
+                            flush_writer = true;
                             break;
                         }
                         if hub.verification_ingress(&connection_id, &text, false).await { continue; }
+                        if let Some(channels) = &channels { channels.host_reply(&text); }
                         hub.begin_verification(&connection_id, &text).await;
                         let context = crate::remote_api::push_ingress::HostContext {
                             room: code.clone(),
@@ -3292,6 +3356,9 @@ async fn handle_ws(
     // Stop queue admission before dropping the local binding fence, including
     // while directory cleanup is awaiting another replica or an unavailable store.
     local.evict(&connection_id);
+    if flush_writer {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut write_task).await;
+    }
     hub.inner.host_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection_id);
     hub.inner.verifications.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection_id);
 
@@ -3338,9 +3405,6 @@ async fn handle_ws(
 
     // Drop our sender: the writer flushes what is queued and closes the socket.
     local.evict(&connection_id);
-    if flush_writer {
-        let _ = tokio::time::timeout(Duration::from_secs(2), &mut write_task).await;
-    }
     write_task.abort();
     tracing::info!("WS disconnected: role={} code={}", role, mask_code(&code));
 }

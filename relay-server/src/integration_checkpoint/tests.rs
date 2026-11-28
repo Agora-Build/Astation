@@ -63,6 +63,51 @@ fn exact_checkpoint_retains_accounts_bindings_and_unknown_legacy_revocation_time
 }
 
 #[test]
+fn held_is_an_optional_boolean_for_nonterminal_integrations() {
+    for built_in in [true, false] {
+        let config = binding(built_in);
+        let mut value = source(built_in);
+        value["checkpoint"]["integrations"][0]["state"] = json!("expired");
+        for held in [true, false] {
+            value["checkpoint"]["integrations"][0]["held"] = json!(held);
+            let cut = parse(&value, &config).unwrap();
+            assert_eq!(cut.integrations[ID].policy.held, Some(held));
+        }
+        for malformed in [Value::Null, json!("false"), json!(0)] {
+            value["checkpoint"]["integrations"][0]["held"] = malformed;
+            assert!(parse(&value, &config).is_err());
+        }
+        let row = &mut value["checkpoint"]["integrations"][0];
+        row["state"] = json!("revoked");
+        row["revokedAt"] = Value::Null;
+        row["interruptRunning"] = json!(false);
+        row["held"] = json!(false);
+        assert!(parse(&value, &config).is_err());
+    }
+}
+
+#[test]
+fn a_more_recent_checkpoint_hold_blocks_an_ordinary_release_even_after_expiry() {
+    let config = binding(false);
+    let mut cut = source(false);
+    let row = &mut cut["checkpoint"]["integrations"][0];
+    row["state"] = json!("expired");
+    row["expiresAt"] = json!("2000-01-01T00:00:00.000Z");
+    row["held"] = json!(false);
+    let ordinary = json!({"changes":[],"cursor":0,"integrations":[row]});
+    let now = 1_800_000_000;
+    let policy = PolicyCheckpoint::empty(config.clone()).unwrap()
+        .apply(0, serde_json::from_value(ordinary).unwrap(), now).unwrap();
+    assert!(policy.allows_control_release(ID, OWNER, now));
+    for held in [true, false] {
+        cut["checkpoint"]["integrations"][0]["held"] = json!(held);
+        let next = policy.apply_checkpoint(parse(&cut, &config).unwrap(), now).unwrap();
+        assert_eq!(next.allows_control_release(ID, OWNER, now), !held);
+        assert!(next.current(ID, OWNER, now).is_err());
+    }
+}
+
+#[test]
 fn incomplete_accounts_never_mean_an_absent_account_is_enabled() {
     let mut value = source(true);
     value["checkpoint"]["accounts"]["complete"] = json!(false);
@@ -694,6 +739,84 @@ fn release_for(row: &Value, id: &str) -> Value {
     release
 }
 
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_inventory_recovers_native_only_lists_across_report_credentials() {
+    use crate::remote_api::recovery::delegated_recovery::{inspect_root, list_roots, Binding as Fence};
+    use crate::service_signing_ceilings::SigningCeilings;
+    use crate::test_database::TestDatabase;
+
+    let db = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let independent = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    let signing = SigningCeilings::fixture(independent.pool.clone()).await;
+    let store = PolicyStore(db.pool.clone());
+    let prior = binding(true);
+    let current = FeedBinding { report_client_id: format!("s-{}", "2".repeat(26)), ..prior.clone() };
+    let fence = Fence::new(&current.station_origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    let hash = |i: u32| format!("{i:064x}");
+    let row = |i| json!({"account":OWNER, "accountId":"native-account", "genesisHash":hash(i),
+        "bindingId":format!("bind-{i}"), "version":1, "bindingState":"bound"});
+
+    let old_rows: Vec<_> = (1..=65).map(row).collect();
+    save_release_checkpoint(&store, &prior, json!(old_rows), None).await;
+    store.deny(&prior).await.unwrap();
+    save_release_checkpoint(&store, &current, json!([row(1)]), None).await;
+    let issuer = FeedBinding { issuer: "https://other-auth.example".into(), ..current.clone() };
+    let portal = FeedBinding { portal_origin: "https://other-portal.example".into(), ..current.clone() };
+    let prod = FeedBinding { station_origin: "https://station.agora.build".into(), ..current.clone() };
+    for foreign in [&issuer, &portal, &prod] {
+        save_release_checkpoint(&store, foreign, json!([row(80)]), Some(json!([release_for(&row(81), "foreign")]))).await;
+    }
+
+    // The native transition and the Portal release request name lists missing from every cut.
+    let report = json!({"state":"binding_changed","accountId":"native-account","genesisHash":hash(66),
+        "version":1,"bindingState":"bound"});
+    sqlx::query("INSERT INTO station_native_binding_transitions
+        (issuer,portal_origin,station_origin,account_id,genesis,version,nonce,proof_hash,report,retired_routes)
+        VALUES ($1,$2,$3,'native-account',$4,1,'test-nonce',$5,$6,'[]')")
+        .bind(&prior.issuer).bind(&prior.portal_origin).bind(&prior.station_origin)
+        .bind(hash(66)).bind(vec![0u8; 32]).bind(report).execute(&db.pool).await.unwrap();
+    save_release_checkpoint(&store, &current, json!([row(1)]),
+        Some(json!([release_for(&row(67), "pending"),release_for(&row(68), "checkpoint-only")]))).await;
+    sqlx::query("DELETE FROM station_binding_release_requests WHERE release_id='checkpoint-only'")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'member','{}')")
+        .bind(hash(1)).execute(&db.pool).await.unwrap();
+    signing.register_new_key("native-account", &hash(2), "service", "key").await.unwrap();
+
+    let replica = db.reconnect(1).await;
+    let first = list_roots(&db.pool, &fence, &signing, Some(&current), None).await.unwrap();
+    assert_eq!(first["binding_discovery"], "retained");
+    assert_eq!(first["next_after"], hash(64));
+    let second = list_roots(&replica, &fence, &signing, Some(&current), Some(&hash(64))).await.unwrap();
+    assert!(second["next_after"].is_null());
+    let rows: Vec<_> = [&first, &second].iter().flat_map(|p| p["roots"].as_array().unwrap()).collect();
+    assert_eq!(rows.len(), 68);
+    for (i, result) in (1..=68).zip(rows) {
+        assert_eq!(*result, json!({"genesis_hash":hash(i),"root_present":i==1,
+            "registered_keys":u64::from(i==2),"keys_with_reservations":0}));
+    }
+    assert_eq!(list_roots(&replica, &fence, &signing, Some(&current), None).await.unwrap(), first);
+    let missing = inspect_root(&db.pool, &fence, &hash(66), Some(&current)).await.unwrap();
+    assert!(missing["root"].is_null());
+    assert_eq!(missing["recovery_ready"], false);
+    let partial = list_roots(&replica, &fence, &signing, None, None).await.unwrap();
+    assert_eq!(partial["binding_discovery"], "reporting_unconfigured");
+    assert_eq!(partial["roots"].as_array().unwrap().len(), 2);
+    assert!(list_roots(&replica, &fence, &signing, Some(&prod), None).await.is_err());
+
+    // A credential cannot lend its checkpoint to another storage key.
+    sqlx::query("UPDATE station_integration_policy SET checkpoint=jsonb_set(checkpoint::jsonb,
+        '{portal_snapshot,binding,report_client_id}',to_jsonb($1::text))::text WHERE binding=$2")
+        .bind(&current.report_client_id).bind(prior.storage_key().unwrap()).execute(&db.pool).await.unwrap();
+    assert!(list_roots(&replica, &fence, &signing, Some(&current), None).await.is_err());
+    replica.close().await;
+    db.cleanup().await;
+    independent.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
@@ -716,9 +839,25 @@ async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
     let peer = PolicyStore(db.reconnect(2).await);
     save_release_checkpoint(&peer, &rotated, rows.clone(), Some(pending)).await;
     // Failure at the write leaves the journal retryable and no partial new version.
+    let genesis = "b".repeat(64);
+    let host = json!({"conn":"relay","replica":"one"});
+    let proxy = json!({"conn":"proxy","replica":"two"});
+    let root = json!({"account":"acct-1","routes":{"host":{"connection":host}},
+        "proxies":{"host":{"connection":proxy}},"other":"preserved"});
+    sqlx::query("INSERT INTO remote_recovery_roots(genesis_hash,account_subject,state) VALUES ($1,'principal',$2)")
+        .bind(&genesis).bind(&root).execute(&db.pool).await.unwrap();
+    let mut writer = peer.0.begin().await.unwrap();
+    sqlx::query("SELECT genesis_hash FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE")
+        .bind(&genesis).execute(&mut *writer).await.unwrap();
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), store.apply_binding_releases(&station, &fence))
+        .await.unwrap(), Ok(0), "busy host root is retried without blocking its writer");
+    writer.rollback().await.unwrap();
     sqlx::query("ALTER TABLE station_applied_binding_releases ADD CONSTRAINT reject_write CHECK(false)")
         .execute(&db.pool).await.unwrap();
     assert!(store.apply_binding_releases(&station, &fence).await.is_err());
+    let saved: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(&genesis).fetch_one(&peer.0).await.unwrap();
+    assert_eq!(saved, root, "a failed release preserves its live connections");
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_applied_binding_releases")
         .fetch_one(&db.pool).await.unwrap();
     assert_eq!(count, 0);
@@ -731,7 +870,14 @@ async fn postgres_binding_release_applies_once_and_recovers_the_exact_report() {
     assert_eq!(a.unwrap() + b.unwrap(), 1);
     peer.0.close().await;
     let restarted = PolicyStore(db.reconnect(2).await);
-    let genesis = "b".repeat(64);
+    let saved: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(&genesis).fetch_one(&restarted.0).await.unwrap();
+    assert_eq!(saved, json!({"account":"acct-1","routes":{},"proxies":{},"other":"preserved"}));
+    let retired: Vec<Value> = sqlx::query_scalar::<_, sqlx::types::Json<Vec<Value>>>(
+        "SELECT retired_routes FROM station_applied_binding_releases WHERE release_id='release-3'")
+        .fetch_one(&restarted.0).await.unwrap().0;
+    assert_eq!(retired.len(), 2);
+    assert!(retired.contains(&host) && retired.contains(&proxy));
     let report_id = "binding_changed:7dfbbee91cf11a9b4d23acfaca028c777bf50cfca7e84291a21b43b6323bef1f";
     let expected = json!({"reportId":report_id,"state":"binding_changed","bindingState":"released",
         "account":OWNER,"genesisHash":genesis,"accountId":"acct-1","bindingId":"bind-1","version":4});

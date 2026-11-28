@@ -1,5 +1,6 @@
 import CStationCore
 import AppKit
+import Combine
 import Foundation
 import Network
 import AtemClient
@@ -57,10 +58,14 @@ class AstationHubManager: ObservableObject {
     var needsAccountSignIn: Bool { signedInAccount == nil || accountSignInRequired || stationAccountSignInRequired }
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
-    private var accountGeneration = UUID() {
+    @Published private var accountGeneration = UUID() {
         didSet { verifierReportTasks.values.forEach { $0.cancel() } }
     }
     var integrationAccountGeneration: UUID { accountGeneration }
+    var integrationAccountChanges: AnyPublisher<Void, Never> {
+        $accountGeneration.combineLatest($signedInAccount, $accountSignInRequired)
+            .map { _ in () }.eraseToAnyPublisher()
+    }
     private struct StationRegistrationContext: Equatable {
         let socket: String
         let account: UUID
@@ -719,7 +724,7 @@ class AstationHubManager: ObservableObject {
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
     var sendDirectChannel: ((Data, String, @escaping (Error?) -> Void) -> Void)?
-    var sendDirectStationProxy: ((Data, String, @escaping (Error?) -> Void) -> Void)?
+    var sendDirectStationProxy: ((Data, String, Bool, @escaping (Error?) -> Void) -> Void)?
     var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
@@ -2686,11 +2691,11 @@ class AstationHubManager: ObservableObject {
                     throw RemoteChannelError.staleLink
                 }
                 return text
-            }, writeLocal: { [weak self] bytes, completion in
+            }, writeLocal: { [weak self] bytes, retryChallenge, completion in
                 guard let self, current(), let send = self.sendDirectStationProxy else {
                     completion(RemoteChannelError.staleLink); return
                 }
-                send(bytes, id, completion)
+                send(bytes, id, retryChallenge, completion)
             }, closeLocal: { [weak self] bytes in
                 self?.sendDirectChannel?(bytes, id) { _ in }
             })

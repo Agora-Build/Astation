@@ -138,6 +138,7 @@ async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_pu
     assert_eq!(signatures["records"].as_array().unwrap().len(), 1);
     assert_eq!(signatures["records"][0]["current_review"], true);
     assert_eq!(signatures["records"][0]["verification"], "valid");
+    assert_eq!(signatures["pending_copy_exports"], json!([]), "the authorized original is carried unchanged");
     let matched = obligation(&first, source.record_id());
     assert_eq!(matched["requirement"], "signed_copy_retained");
     assert_eq!(matched["copy_record_id"], copy["body"]["record_id"]);
@@ -715,6 +716,14 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
     );
     assert_eq!(demoted.appended, 1);
     let mut root = initial["remote_recovery_roots"][0]["state"].clone();
+    root["membership"] = added.next.to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&root).bind(&genesis).execute(&database.pool).await.unwrap();
+    let advanced = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let carried = &advanced["recovery_signatures"]["records"][0];
+    assert_eq!(carried["verification"], "valid");
+    assert_eq!(carried["current_review"], false);
+    assert_eq!(advanced["plan_id"], plan["plan_id"]);
     root["membership"] = demoted.next.to_stored();
     sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
         .bind(root)
@@ -723,10 +732,11 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
         .await
         .unwrap();
     let changed = saved(&database.pool).await;
-    assert!(
-        prepare(&database.pool, &binding, &genesis).await.is_err(),
-        "a changed source cannot reuse its old plan"
-    );
+    let moved = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    assert_eq!(moved["plan_id"], plan["plan_id"]);
+    assert_ne!(moved["evidence_hash"], advanced["evidence_hash"]);
+    assert_eq!(moved["recovery_signatures"]["records"][0]["verification"], "removed_manager");
+    assert_eq!(obligation(&moved, source.record_id())["requirement"], "fresh_manager_signature");
     assert_eq!(saved(&database.pool).await, changed);
     let next_binding = Binding::new(ORIGIN, 2).unwrap();
     next_binding.initialize(&database.pool, true).await.unwrap();
@@ -900,7 +910,7 @@ async fn postgres_delegated_restore_preserves_carried_stops_and_their_old_feed_i
     let revoke = feed.records[1].clone();
     let interrupt = record(&f, feed, &uuid::Uuid::new_v4().to_string(),
         ControlAction::InterruptRunning { revoke_seq: None });
-    feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).unwrap();
+    feed.publish(ORIGIN, &f.log, &interrupt, None, &[], f.created).unwrap();
 
     // Restore the state a replacement feed keeps: both original signatures
     // and the ledger survive; the old hold would need a fresh signature.
@@ -909,7 +919,7 @@ async fn postgres_delegated_restore_preserves_carried_stops_and_their_old_feed_i
     let review = feed.recovery_review(ORIGIN, &f.log).unwrap();
     assert_eq!(review["records"].as_array().unwrap().len(), 2);
     assert!(review["records"].as_array().unwrap().iter().all(|r| r["verification"] == "valid"));
-    assert!(feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).is_err());
+    assert!(feed.publish(ORIGIN, &f.log, &interrupt, None, &[], f.created).is_err());
     feed.records.push(hold);
     assert!(feed.recovery_review(ORIGIN, &f.log).is_err());
     feed.records.pop();

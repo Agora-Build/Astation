@@ -73,7 +73,10 @@ impl CutProxy {
     }
 
     fn url(&self) -> String {
-        format!("redis://127.0.0.1:{}/", self.port)
+        let mut url = url::Url::parse(&test_url()).expect("valid local Redis test URL");
+        url.set_host(Some("127.0.0.1")).expect("loopback host");
+        url.set_port(Some(self.port)).expect("proxy port");
+        url.to_string()
     }
 
     fn cut(&self) {
@@ -486,7 +489,17 @@ async fn redis_racing_astations_leave_exactly_one_owner() {
     assert_eq!(result_one["status"], "verified");
     assert_eq!(result_two["status"], "verified");
 
-    let owner = one.state.relay.room(code).await.unwrap().unwrap().owner.expect("an owner");
+    // Each socket receives its auth result before its promotion commits.
+    // Read the winner after both candidates have left the pending set.
+    let owner = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let room = one.state.relay.room(code).await.unwrap().unwrap();
+            if room.pending.is_empty() {
+                return room.owner.expect("an owner after both promotions");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("both promotions committed");
     let (winner, loser) = if owner.replica == one.id() {
         (&mut on_one, &mut on_two)
     } else {

@@ -373,6 +373,45 @@ still needs its separately authorized carrier; its report cannot be inferred
 from a native process or a Station-managed service. No report secret or private
 key is uploaded, and no new signing/execution gate is enabled by these routes.
 
+### Fetching a challenge with an integration token
+
+With delegated host work enabled, an external service posts
+`{"slot":"sdk","expected":{"seq":...,"hash":"..."}}` to
+`/agora-build/v1/logs/{genesis}/verifier-requests`. The bearer is its existing
+five-minute Agora.Build integration access token with `agent.view` and this
+Station as its sole audience. Station derives the service member from
+`client_id`. The caller supplies the slot and its own pinned head.
+
+Station compares the token owner and `r9_svc` fingerprint with its authenticated
+Portal feed, the owner of the recovery root and the service in signed membership.
+The last completed feed read must have started less than 60 seconds ago. A
+built-in Station also checks the account and device-list binding. Another report
+credential that has already observed a newer cursor prevents delivery until the
+local feed catches up.
+
+A successful response is `{"challenges":[...]}`. Station commits the time of the
+first fetch before sending it. Retrying the fetch preserves the original
+receipt and expiry. Pause, revocation, owner disablement or service-key
+replacement invalidates the affected challenges. Resuming requires a fresh
+nonce. Rotating the integration's OAuth client key preserves the R9 service
+grant. Foreign roots, owners and fingerprints return the same 404. Responses
+carry `Cache-Control: no-store`.
+
+After a successful fetch, the integration posts `{"report":<signed SDK report>}`
+to `/agora-build/v1/logs/{genesis}/verifier-reports/{nonce}`. Station checks the
+token, original grant, signed membership and SDK proof again. A successful
+commit returns `{"accepted":true}`. A valid retry from the same signed process
+gets the same receipt within the original deadline, including when its log has
+advanced or its signature bytes differ. Station retains the first report and
+its original head. A native manager reading or retrying
+the challenge must still have access to its original Portal grant.
+
+If two SDK processes answered the same fetched challenge, Station retains both
+signed reports so the manager can authenticate the conflict. The second answer
+and subsequent retries return HTTP 409 with `verifier_process_conflict`. The
+integration receives no other process's report. The manager holds the slot
+until its reviewed process conflict is resolved.
+
 ### Manager review of a member's verifier processes
 
 In the Mac app, open **Manage Host Senders** and choose **Review Member

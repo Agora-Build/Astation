@@ -1,10 +1,11 @@
 //! Reconcile every retained checkpoint. A newer restored source cannot erase
 //! known stops, clock reservations or unresolved reporting evidence.
-use super::super::super::{delegated::Stored, MAX_STATE};
+use super::super::super::{delegated::{recovery_record_review, Stored}, MAX_STATE};
 use super::super::Binding;
 use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepared};
 use atem_client::{
-    control::{principal_key_of, verify_control, ControlCheck, ControlRecord, RefusalReason},
+    channel::HeadRelation,
+    control::{principal_key_of, verify_control, ControlCheck, ControlPrincipal, ControlRecord, RefusalReason},
     membership::{Action, MemberKind, Membership},
     Hash32,
 };
@@ -56,10 +57,11 @@ pub(super) struct History {
     pub review: Value,
     pub signed: BTreeMap<String, Value>,
     pub authors: Value,
+    pub author_round: super::author_history::AuthorRound,
     pub new_export_digests: BTreeMap<String, String>,
     pub confirmation_hashes: Vec<String>,
-    // One latest verified export per signer, slot and process, in this plan.
-    pub latest_exports: Vec<(Hash32, Vec<String>)>,
+    // The latest verified export from each signer's journal in this plan.
+    pub latest_exports: Vec<(atem_client::membership::Head, Hash32, Vec<String>)>,
 }
 
 pub(super) async fn inspection(
@@ -72,9 +74,11 @@ pub(super) async fn inspection(
     // The caller holds the deployment fence and account root through commit;
     // every prepare/import uses these same locks, including other replicas.
     let (count, bytes): (i64, i64) = sqlx::query_as(
-        "SELECT count(*)::bigint,COALESCE(sum(octet_length(retained::text)),0)::bigint \
-         FROM station_delegated_recovery_plans \
-         WHERE origin=$1 AND genesis_hash=$2 AND generation <= $3",
+        "WITH plans AS (SELECT plan_id,octet_length(retained::text) AS bytes
+         FROM station_delegated_recovery_plans WHERE origin=$1 AND genesis_hash=$2 AND generation <= $3)
+         SELECT count(*)::bigint,COALESCE(sum(bytes),0)::bigint FROM
+         (SELECT bytes FROM plans UNION ALL SELECT octet_length(m.membership::text)
+          FROM station_delegated_recovery_memberships m JOIN plans USING(plan_id)) AS sources",
     )
     .bind(&binding.origin)
     .bind(log.genesis_hash().to_hex())
@@ -84,6 +88,8 @@ pub(super) async fn inspection(
     if count == 0 || count > MAX_CHECKPOINTS || bytes > MAX_STATE as i64 {
         return Err(invalid());
     }
+    super::service_components::check_size(connection, &binding.origin, &log.genesis_hash().to_hex(), None, None)
+        .await?;
     let checkpoints: Vec<Historical> = sqlx::query_as(
         "SELECT generation,abandoned,plan_id,candidate_feed_id,source_hash,retained \
          FROM station_delegated_recovery_plans \
@@ -98,6 +104,7 @@ pub(super) async fn inspection(
         .as_str()
         .ok_or_else(invalid)?;
     let mut summaries = Vec::new();
+    let mut membership_gaps = Vec::new();
     let mut records = BTreeMap::new();
     // Keep a key's authenticated signatures even if the restored list predates
     // its enrollment. Record IDs and today's authority are reviewed separately.
@@ -107,7 +114,9 @@ pub(super) async fn inspection(
     let mut retained_feed_ids = BTreeSet::new();
     let mut found_current = false;
     let mut journals = super::author_history::JournalHistory::default();
+    let mut author_round = super::author_history::AuthorRound::default();
     let mut current_authors = None;
+    let mut candidate_services_hash = None;
     let mut prior_authors = Vec::new();
     let mut new_export_digests = BTreeMap::new();
     let mut confirmation_hashes = Vec::new();
@@ -135,9 +144,24 @@ pub(super) async fn inspection(
         if old_log.frozen().is_some() {
             return Err(invalid());
         }
+        let old_review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, &old_log)?;
+        let heads = super::memberships::history(connection, &checkpoint, old_log).await?;
+        let latest = heads.last_key_value().ok_or_else(invalid)?.1;
+        // Both logs have been verified. When the retained log is longer, compare
+        // the overlapping entry too: length alone cannot distinguish a fork.
+        let gap = match HeadRelation::of(log, latest.head()) {
+            HeadRelation::Same | HeadRelation::HostBehind => None,
+            HeadRelation::HostAhead if HeadRelation::of(latest, log.head()) == HeadRelation::HostBehind => {
+                Some("restored_head_behind")
+            }
+            _ => Some("divergent_history"),
+        };
+        if let Some(reason) = gap {
+            membership_gaps.push(json!({"generation":generation,"plan_id":checkpoint.plan_id,
+                "membership_head":latest.head().to_json(),"reason":reason}));
+        }
         // Validate the historical checkpoint, then classify every obligation
         // under current authority. Removed managers never regain authority.
-        let old_review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, &old_log)?;
         let review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, log)?;
         if let Some(feed_id) = review["retained_feed_id"].as_str() {
             retained_feed_ids.insert(feed_id.to_owned());
@@ -161,7 +185,7 @@ pub(super) async fn inspection(
         if values.len() != reviews.len() || values.len() != old_reviews.len() {
             return Err(invalid());
         }
-        for entry in old_log.entries() {
+        for entry in latest.entries() {
             let member = match &entry.action {
                 Action::Add { member } | Action::RecoveryAdd { member } | Action::Genesis { member, .. }
                     if matches!(member.kind, MemberKind::Service { .. }) => member,
@@ -193,13 +217,22 @@ pub(super) async fn inspection(
             let lower = lower_bounds.entry(principal.clone()).or_default();
             *lower = (*lower).max(value.as_u64().ok_or_else(invalid)?);
         }
-        let mut authors = operator_review.then(|| super::author_history::inventory(&old_log));
+        let mut authors = operator_review.then(|| super::author_history::inventory(latest));
+        if let Some(members) = &authors {
+            for signer in members.keys() { author_round.require(signer); }
+        }
         let mut hashes = Vec::new();
         let current_plan = checkpoint.plan_id == prepared.plan_id;
-        signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
+        signer_reports::visit(connection, &checkpoint, &heads, &binding.origin, generation, |verified, hash, accepted_log| {
+            if operator_review {
+                author_round.observe(&verified, current_plan);
+                journals.observe(&verified.signer, &verified.journal, &verified.processes, generation, current_plan,
+                    verified.records.iter().map(ControlRecord::record_id));
+            }
             if current_plan {
-                latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
-                    (verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
+                // A successor can report the same exclusive journal from a different slot.
+                latest_exports.insert((verified.signer.clone(), verified.journal.id),
+                    (verified.head, verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
             }
             for record in verified.records {
                 // Checkpoint records and older plans already contribute to the base.
@@ -208,7 +241,7 @@ pub(super) async fn inspection(
                 }
                 // Signing a journal export does not establish authority for its target.
                 // Keep the original verified clock across later membership changes.
-                if matches!(verify_control(&record, &old_log),
+                if matches!(verify_control(&record, accepted_log),
                     ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager))
                 {
                     let lower = lower_bounds.entry(record.principal().name()).or_default();
@@ -217,13 +250,14 @@ pub(super) async fn inspection(
                 add_record(&mut records, &record, stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
-                journals.observe(&verified.signer, &verified.journal, generation, current_plan);
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
                     "connection": verified.connection, "slot": verified.slot,
                     "process": atem_client::encoding::b64u(&verified.process), "journal": verified.journal.to_json(),
+                    "attached_processes": verified.processes.iter().map(|p| atem_client::encoding::b64u(p)).collect::<Vec<_>>(),
                     "missing_early_range": verified.journal.since > first, "submission_hash": hash,
+                    "signed_head": verified.head.to_json(),
                     "signed_evidence_hash": verified.recovery.evidence_hash().to_hex(),
                 }));
             }
@@ -238,6 +272,29 @@ pub(super) async fn inspection(
             "generation": generation, "plan_id": checkpoint.plan_id,
             "candidate_feed_id": checkpoint.candidate_feed_id, "source_hash": checkpoint.source_hash,
         });
+        let components = super::service_components::visit(connection, &checkpoint, &binding.origin, &heads, |record| {
+            let ControlPrincipal::Service(service) = record.principal() else { return Err(invalid()); };
+            let key = record.principal_key().ok_or_else(invalid)?.to_hex();
+            let highest = service_keys.entry((service.clone(), key)).or_default();
+            *highest = Some(highest.map_or(record.issued_at(), |v| v.max(record.issued_at())));
+            let lower = lower_bounds.entry(record.principal().name()).or_default();
+            *lower = (*lower).max(record.issued_at());
+            add_record(&mut records, &record, recovery_record_review(&record, log))
+        }).await?;
+        if !components.is_empty() {
+            let hash = source_hash(&json!(components))?;
+            if current_plan {
+                // Station signs after the native author round. Its own output
+                // changes the snapshot, while the confirmed author inputs stay fixed.
+                candidate_services_hash = Some(hash);
+            } else {
+                retained_feed_ids.insert(checkpoint.candidate_feed_id.clone());
+                commitment["service_components"] = hash.into();
+            }
+        }
+        if heads.len() > 1 {
+            commitment["observed_membership"] = source_hash(&latest.to_stored())?.into();
+        }
         if checkpoint.plan_id == prepared.plan_id {
             current_authors = authors;
         } else {
@@ -246,15 +303,22 @@ pub(super) async fn inspection(
             }
             if let Some(members) = authors {
                 prior_authors.push(json!({"generation": generation, "plan_id": checkpoint.plan_id,
-                    "membership_head": old_log.head().to_json(), "members": members}));
+                    "membership_head": latest.head().to_json(), "members": members}));
             }
         }
         commitments.push(commitment);
-        summaries.push(json!({
+        let mut summary = json!({
             "generation": generation, "plan_id": checkpoint.plan_id,
-            "source_hash": checkpoint.source_hash, "membership_head": old_log.head().to_json(),
+            "source_hash": checkpoint.source_hash, "membership_head": retained.membership["head"],
             "retained_feed_id": review["retained_feed_id"], "inspection": review["inspection"],
-        }));
+        });
+        if heads.len() > 1 {
+            summary["observed_membership_head"] = latest.head().to_json();
+        }
+        if !components.is_empty() {
+            summary["service_components"] = json!(components);
+        }
+        summaries.push(summary);
     }
     if !found_current || retained_feed_ids.contains(&prepared.candidate_feed_id) {
         return Err(invalid());
@@ -278,8 +342,9 @@ pub(super) async fn inspection(
             stops::review(&record, log, &binding.origin)?,
         )?;
     }
-    let report = json!({
+    let mut report = json!({
         "checkpoints": summaries,
+        "membership_gaps": membership_gaps,
         "observed_service_keys": service_keys.into_iter().map(|((service, key), highest)| json!({
             "service_id":service, "key_fingerprint":key, "highest_signed_ms":highest
         })).collect::<Vec<_>>(),
@@ -289,6 +354,9 @@ pub(super) async fn inspection(
         "complete_history": false,
         "signing_clock_complete": false,
     });
+    if let Some(hash) = candidate_services_hash {
+        report["candidate_service_components_hash"] = hash.into();
+    }
     Ok(History {
         review: report,
         signed: records
@@ -297,6 +365,7 @@ pub(super) async fn inspection(
             .collect(),
         authors: json!({"members": current_authors, "prior_plans": prior_authors,
             "journal_gaps": journals.gaps(), "complete_history": false}),
+        author_round,
         new_export_digests,
         confirmation_hashes,
         latest_exports: latest_exports.into_values().collect(),

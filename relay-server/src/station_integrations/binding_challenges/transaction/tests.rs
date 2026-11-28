@@ -1,0 +1,639 @@
+use super::*;
+use crate::cluster::{local::SocketRole, ConnRef, SINGLE_REPLICA_ID};
+use crate::remote_api::push_ingress::tests::Fixture;
+use crate::remote_api::recovery::{HostBinding, HostRouteError, ProxyBinding, RecoveryStore};
+use crate::station_integrations::tests::{fixture_at_station, ID, OWNER, PRINCIPAL};
+use atem_client::control::ToStation;
+use atem_client::host_route::{
+    host_route_message, sign_host_route_as, HostChallenge, HostRouteBody, RouteKind,
+};
+use axum::body::{to_bytes, Body};
+use axum::http::Request;
+use tower::ServiceExt;
+
+async fn admit(
+    store: &RecoveryStore,
+    f: &Fixture,
+    kind: RouteKind,
+) -> Result<HostBinding, HostRouteError> {
+    let challenge = HostChallenge::new("phone");
+    let proof = host_route_message(
+        &sign_host_route_as(
+            kind,
+            &f.keys,
+            &f.host_key,
+            &HostRouteBody::at(&f.log, "host-a", "host-a", &challenge),
+        )
+        .unwrap(),
+    )
+    .to_string();
+    let connection = ConnRef::new(&uuid::Uuid::new_v4().to_string(), SINGLE_REPLICA_ID);
+    match kind {
+        RouteKind::Relay => {
+            store
+                .admit_host(&proof, challenge.nonce, "phone", "host-a", connection)
+                .await
+        }
+        RouteKind::Proxy => {
+            store
+                .admit_proxy(
+                    &proof,
+                    challenge.nonce,
+                    "phone",
+                    "host-a",
+                    connection,
+                    ProxyBinding {
+                        session: "session".into(),
+                        generation: "epoch".into(),
+                        native: ConnRef::new("native", "replica"),
+                    },
+                    PRINCIPAL,
+                )
+                .await
+        }
+    }
+    .map(|(binding, _)| binding)
+}
+
+async fn ack(
+    store: &RecoveryStore,
+    f: &Fixture,
+    binding: &HostBinding,
+    origin: &str,
+) -> StatusCode {
+    let feed = serde_json::to_value(binding).unwrap()["delegated_feed"]["feed_id"].clone();
+    let message = json!({"type":"relay","op":"control_ack","account_id":f.log.account_id(),
+        "genesis_hash":binding.genesis,"host_id":"host-a","host_trust_gen":1,"origin":origin,
+        "feed_id":feed,"cursor":0,"results":[]});
+    let ToStation::ControlAck(parsed) = ToStation::decode(message.to_string().as_bytes()).unwrap()
+    else {
+        unreachable!()
+    };
+    store.acknowledge_delegated(binding, parsed).await.0
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_binding_commit_rechecks_both_logins_and_retains_one_transition() {
+    let auth = crate::account_identity::tests::Fixture::new().await;
+    let origin = "https://station-dev.agora.build";
+    let (db, runtime, fixture) = fixture_at_station(&auth.issuer, None, origin).await;
+    let before = runtime.policies.load(&runtime.binding).await.unwrap();
+    let portal = json!({"changes":[],"cursor":before.cursor,"checkpoint":{
+        "at":"2026-11-24T10:00:00.000Z","integrations":[{
+            "id":ID,"ownerAccount":OWNER,"state":"awaiting_approval","scopes":["agent.view","agent.prompt","agent.approve"],
+            "r9Svc":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}],
+        "accounts":{"complete":true,"disabled":[]},"bindings":[],"pendingReleases":[]}});
+    let snapshot =
+        PortalCheckpoint::parse(portal.to_string().as_bytes(), &runtime.binding).unwrap();
+    let mut checkpoint = before
+        .apply_checkpoint(snapshot, before.received_at)
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    checkpoint.record_completed_read(now, now);
+    runtime.policies.commit(&before, &checkpoint).await.unwrap();
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let account = fixture.log.account_id();
+    let app = Router::new()
+        .route("/binding/consent-request", get(super::super::pending::next))
+        .route("/logs/:genesis/binding/challenge", post(super::super::mint))
+        .route(
+            "/logs/:genesis/binding/consent",
+            post(super::super::consent),
+        )
+        .route("/logs/:genesis/binding/commit", post(super::super::commit))
+        .route(
+            "/logs/:genesis/binding/receipt",
+            post(super::super::receipt),
+        )
+        .with_state(IntegrationState(Some(runtime.clone())));
+    let send = async |path: &str, body: &Value, claims: &Value| {
+        let access = auth.token(auth.header(), claims.clone());
+        let req = Request::post(format!("/logs/{genesis}/binding/{path}"))
+            .header("Authorization", format!("Bearer {access}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 16_384).await.unwrap();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    let discover = async |claims: &Value| {
+        let token = auth.token(auth.header(), claims.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/binding/consent-request")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 8192).await.unwrap())
+                .unwrap(),
+        )
+    };
+    let sign = |body: &Value| {
+        let challenge = StationBindingChallenge::parse(body.to_string().as_bytes()).unwrap();
+        let request = station_binding_request(
+            &fixture.log,
+            &challenge,
+            challenge.signer(),
+            origin,
+            challenge.claims(),
+            challenge.issued_at(),
+        )
+        .unwrap();
+        atem_client::station_binding::sign_station_binding(
+            &fixture.keys,
+            &atem_client::KeyId::new("manager"),
+            &request,
+        )
+        .unwrap()
+        .to_json()
+    };
+    let mut owner = auth.claims();
+    owner["aud"] = json!(origin);
+    owner["scope"] = json!("astation.remote");
+    owner["auth_time"] = owner["iat"].clone();
+    let mut new_owner = owner.clone();
+    new_owner["sub"] = json!("ab00000000000000000000000008");
+    let mut intent = json!({"action":"bind","account_id":account,"signer":"member:phone","head":fixture.log.head().to_json(),
+        "expected_binding":{"state":"never_bound"}});
+    assert_eq!(
+        send("commit", &json!({}), &owner).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(discover(&owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    if !cfg!(feature = "delegated-host-work") {
+        db.cleanup().await;
+        return;
+    }
+    runtime
+        .app
+        .recovery
+        .configure_delegated(origin, 1)
+        .await
+        .unwrap();
+    let (status, issued) = send("challenge", &intent, &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    let source = StationBindingChallenge::parse(issued.to_string().as_bytes()).unwrap();
+    let short = StationBindingChallenge::new(
+        source.action(),
+        origin,
+        source.claims(),
+        account,
+        source.genesis_hash(),
+        source.head(),
+        source.signer(),
+        source.expected_binding().clone(),
+        source.issued_at(),
+        source.issued_at() + 50,
+    )
+    .unwrap();
+    let nonce = atem_client::encoding::b64u(short.nonce());
+    sqlx::query("INSERT INTO station_binding_challenges(issuer,station_origin,subject,nonce,challenge,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6)").bind(&auth.issuer).bind(origin).bind(OWNER).bind(&nonce)
+        .bind(short.jcs()).bind(short.expires_at() as i64).execute(&db.pool).await.unwrap();
+    let short_proof = sign(&short.to_json());
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        send("receipt", &short_proof, &owner).await,
+        (
+            StatusCode::GONE,
+            json!({"error":{"code":"binding_proof_expired"}})
+        )
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM station_binding_challenges WHERE nonce=$1"
+        )
+        .bind(&nonce)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0
+    );
+    let proof = sign(&issued);
+    let refusal = (
+        StatusCode::CONFLICT,
+        json!({"error":{"code":"binding_unavailable"}}),
+    );
+    assert_eq!(send("commit", &proof, &new_owner).await, refusal);
+    let mut other_login = owner.clone();
+    other_login["auth_time"] = json!(owner["auth_time"].as_i64().unwrap() - 1);
+    assert_eq!(send("commit", &proof, &other_login).await, refusal);
+    assert_eq!(
+        send("receipt", &proof, &other_login).await,
+        (StatusCode::ACCEPTED, json!({"pending":true}))
+    );
+    assert_eq!(send("receipt", &proof, &new_owner).await, refusal);
+    let mut broken = proof.clone();
+    broken["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
+    assert_eq!(send("commit", &broken, &owner).await, refusal);
+    let replica = db.reconnect(2).await;
+    let peer = RecoveryStore::postgres(replica.clone());
+    peer.set_verifier_portal(&runtime.binding).unwrap();
+    peer.configure_delegated(origin, 1).await.unwrap();
+    let old_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
+    let old_proxy = admit(&peer, &fixture, RouteKind::Proxy).await.unwrap();
+    // A proved room appeared after review. The old proof must be refused even
+    // when it belongs to the same owner. Add two offline rooms on a peer.
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    let mut third = owner.clone();
+    third["sub"] = json!("ab00000000000000000000000009");
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'offline-a',$4),($1,$2,$3,'offline-b',$5)")
+        .bind(&auth.issuer).bind(origin).bind(&genesis)
+        .bind(new_owner["sub"].as_str().unwrap()).bind(third["sub"].as_str().unwrap())
+        .execute(&replica).await.unwrap();
+    let (status, first_bind) = send("challenge", &intent, &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(first_bind["nonce"], issued["nonce"]);
+    assert_eq!(send("consent", &first_bind, &owner).await, refusal);
+    let mut unrelated = third.clone();
+    unrelated["sub"] = json!("ab00000000000000000000000007");
+    assert_eq!(send("consent", &first_bind, &unrelated).await, refusal);
+    let proof = sign(&first_bind);
+    let waiting = (StatusCode::ACCEPTED, json!({"awaiting_consent":true}));
+    let empty = (StatusCode::OK, json!({"request":null}));
+    assert_eq!(discover(&third).await, empty);
+    let mut damaged = proof.clone();
+    damaged["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
+    assert_eq!(send("commit", &damaged, &owner).await, refusal);
+    assert_eq!(discover(&third).await, empty);
+    sqlx::raw_sql(
+        "CREATE FUNCTION fail_pending() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'pending write failed'; END $$;
+        CREATE CONSTRAINT TRIGGER fail_pending AFTER UPDATE ON station_binding_challenges
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_pending()",
+    )
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(
+        send("commit", &proof, &owner).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(discover(&new_owner).await, empty);
+    sqlx::query("DROP TRIGGER fail_pending ON station_binding_challenges")
+        .execute(&replica)
+        .await
+        .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    assert_eq!(
+        discover(&new_owner).await,
+        (StatusCode::OK, json!({"request":first_bind}))
+    );
+    assert_eq!(discover(&unrelated).await, empty);
+    assert_eq!(discover(&owner).await, empty);
+    let accepted = (StatusCode::OK, json!({"consented":true}));
+    let mut short_login = new_owner.clone();
+    short_login["exp"] = json!(chrono::Utc::now().timestamp() + 15);
+    assert_eq!(send("consent", &first_bind, &short_login).await, accepted);
+    assert_eq!(send("consent", &first_bind, &new_owner).await, accepted);
+    // A discovery query selected this nonce just before the peer consented.
+    let mut reader = replica.begin().await.unwrap();
+    assert!(super::super::pending::outstanding_proof(
+        &mut reader,
+        &runtime.binding,
+        first_bind["nonce"].as_str().unwrap(),
+        new_owner["sub"].as_str().unwrap()
+    )
+    .await
+    .unwrap()
+    .is_none());
+    reader.rollback().await.unwrap();
+    let saved: i64 = sqlx::query_scalar("SELECT expires_at FROM station_binding_room_consents")
+        .fetch_one(&replica)
+        .await
+        .unwrap();
+    assert_eq!(saved, short_login["exp"].as_i64().unwrap() * 1000);
+    assert_eq!(discover(&new_owner).await, empty);
+    assert_eq!(
+        discover(&third).await,
+        (StatusCode::OK, json!({"request":first_bind}))
+    );
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    // Another replica reassigns the outstanding owner's room after candidate selection.
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE room='offline-b'")
+        .bind(unrelated["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
+    assert_eq!(discover(&third).await, empty);
+    assert_eq!(discover(&unrelated).await, empty);
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE room='offline-b'")
+        .bind(third["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
+    assert_eq!(send("consent", &first_bind, &third).await, accepted);
+    // Adding another room of an owner who already consented requires a fresh review.
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'offline-c',$4)").bind(&auth.issuer).bind(origin).bind(&genesis)
+        .bind(third["sub"].as_str().unwrap()).execute(&replica).await.unwrap();
+    assert_eq!(discover(&new_owner).await, empty);
+    assert_eq!(discover(&third).await, empty);
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    assert_eq!(send("consent", &first_bind, &third).await, refusal);
+    assert_eq!(discover(&third).await, empty);
+    let (status, final_bind) = send("challenge", &intent, &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(final_bind["nonce"], first_bind["nonce"]);
+    let proof = sign(&final_bind);
+    let mut broken = proof.clone();
+    broken["sig"] = json!(atem_client::encoding::b64u(&[0; 64]));
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    let (one, two) = tokio::join!(
+        send("consent", &final_bind, &new_owner),
+        send("consent", &final_bind, &third)
+    );
+    assert_eq!(one, accepted);
+    assert_eq!(two, accepted);
+    sqlx::query(
+        "UPDATE station_binding_room_consents SET expires_at=auth_time*1000
+        WHERE owner_subject=$1 AND nonce=$2",
+    )
+    .bind(third["sub"].as_str().unwrap())
+    .bind(final_bind["nonce"].as_str().unwrap())
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, waiting);
+    assert_eq!(
+        discover(&third).await,
+        (StatusCode::OK, json!({"request":final_bind}))
+    );
+    assert_eq!(send("consent", &final_bind, &third).await, accepted);
+    // A peer's more recent disable wins even after both owners consent.
+    sqlx::query(
+        "INSERT INTO station_delegated_availability_fences
+        (issuer,portal_origin,station_origin,account,minimum_cursor) VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(&auth.issuer)
+    .bind(&runtime.binding.portal_origin)
+    .bind(origin)
+    .bind(third["sub"].as_str().unwrap())
+    .bind(checkpoint.cursor as i64 + 1)
+    .execute(&replica)
+    .await
+    .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    sqlx::query("DELETE FROM station_delegated_availability_fences WHERE account=$1")
+        .bind(third["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
+    // Registration and a proved route have independent ownership evidence.
+    // Even if every existing room resolves to the prospective owner, the
+    // proved host's other root owner must still consent.
+    let mut rollback = replica.begin().await.unwrap();
+    sqlx::query("UPDATE station_proved_room_owners SET account_subject=$1 WHERE genesis_hash=$2")
+        .bind(third["sub"].as_str().unwrap())
+        .bind(&genesis)
+        .execute(&mut *rollback)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO station_proved_room_owners (issuer,station_origin,genesis_hash,room,account_subject)
+        VALUES ($1,$2,$3,'phone',$4) ON CONFLICT DO NOTHING")
+        .bind(&auth.issuer).bind(origin).bind(&genesis).bind(third["sub"].as_str().unwrap())
+        .execute(&mut *rollback).await.unwrap();
+    let cut = room_consents::review(
+        &mut rollback,
+        &runtime.binding,
+        &checkpoint,
+        &genesis,
+        third["sub"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        cut.owners,
+        std::collections::BTreeSet::from([OWNER.to_owned()])
+    );
+    rollback.rollback().await.unwrap();
+
+    let mut writer = replica.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('offline-b',739185))")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    assert_eq!(send("commit", &proof, &owner).await, refusal);
+    writer.rollback().await.unwrap();
+    let hub = &runtime.app.relay;
+    let relay_socket = hub.local().register(
+        &old_relay.connection.conn,
+        "phone",
+        SocketRole::Atem {
+            atem_id: "host-a".into(),
+        },
+    );
+    let proxy_socket =
+        hub.local()
+            .register(&old_proxy.connection.conn, "phone", SocketRole::NativeProxy);
+    let consumer = crate::relay::RelayHub::new();
+    let (_, _frames, host_closed) = consumer
+        .channels()
+        .register("consumer", "alice", old_relay.connection.clone(), "one")
+        .unwrap();
+    let other = ConnRef::new(&old_relay.connection.conn, "different-replica");
+    let (_, _other_frames, other_closed) = consumer
+        .channels()
+        .register("consumer", "alice", other, "two")
+        .unwrap();
+    let old_routes = [old_relay.clone(), old_proxy.clone()];
+    let updates = runtime.app.recovery.delegated_changes();
+    let before_commit = *updates.borrow();
+    sqlx::raw_sql("CREATE FUNCTION reject_bind_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'commit fault'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_bind_commit AFTER INSERT ON station_native_binding_transitions
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_bind_commit()").execute(&replica).await.unwrap();
+    assert_eq!(
+        send("commit", &proof, &owner).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let counts = async || {
+        sqlx::query_as::<_,(i64,i64)>("SELECT
+        (SELECT count(*) FROM station_native_binding_transitions), (SELECT count(*) FROM station_binding_challenges)")
+        .fetch_one(&replica).await.unwrap()
+    };
+    assert_eq!(counts().await, (0, 3));
+    assert_eq!(*updates.borrow(), before_commit);
+    hub.close_retired_binding_connections(&peer, &old_routes)
+        .await;
+    consumer.close_retired_binding_connections(&peer, &[]).await;
+    assert!(relay_socket.close.borrow().is_none() && proxy_socket.close.borrow().is_none());
+    assert!(!*host_closed.borrow());
+    for route in [&old_relay, &old_proxy] {
+        assert!(peer.prepare_delegated(route).await);
+        assert_eq!(ack(&peer, &fixture, route, origin).await, StatusCode::OK);
+    }
+    sqlx::query("DROP TRIGGER reject_bind_commit ON station_native_binding_transitions")
+        .execute(&replica)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        send("commit", &proof, &owner),
+        send("commit", &proof, &owner)
+    );
+    assert_eq!(a.0, StatusCode::OK, "{}", a.1);
+    assert_eq!(a, b);
+    assert_eq!(send("receipt", &proof, &other_login).await, a);
+    assert_eq!(send("commit", &proof, &other_login).await, refusal);
+    assert_eq!(send("receipt", &broken, &owner).await, refusal);
+    assert_eq!(a.1["version"], 1);
+    assert_eq!(a.1["account"], OWNER);
+    assert_eq!(counts().await, (1, 2));
+    assert_eq!(
+        *updates.borrow(),
+        before_commit + 1,
+        "receipt retries do not fan out replica notifications"
+    );
+    let retired: Vec<ConnRef> = sqlx::query_scalar::<_, sqlx::types::Json<Vec<ConnRef>>>(
+        "SELECT retired_routes FROM station_native_binding_transitions WHERE version=1",
+    )
+    .fetch_one(&replica)
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(retired.len(), 2);
+    assert!(retired.contains(&old_relay.connection));
+    assert!(retired.contains(&old_proxy.connection));
+    hub.close_retired_binding_connections(&peer, &old_routes)
+        .await;
+    consumer.close_retired_binding_connections(&peer, &[]).await;
+    for outbox in [&relay_socket, &proxy_socket] {
+        assert_eq!(
+            outbox.close.borrow().as_ref().map(|v| v.0),
+            Some(crate::relay::CLOSE_TRY_AGAIN)
+        );
+    }
+    assert!(*host_closed.borrow());
+    assert!(!*other_closed.borrow());
+    for route in [&old_relay, &old_proxy] {
+        assert!(peer
+            .with_host_route(route, || std::future::ready(()))
+            .await
+            .is_none());
+        assert_eq!(
+            ack(&peer, &fixture, route, origin).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let owner_route = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
+    assert_eq!(send("commit", &broken, &owner).await, refusal);
+    assert_eq!(send("challenge", &intent, &owner).await, refusal);
+
+    // The Portal still mirrors never-bound. The next version comes from the shared local record.
+    intent["action"] = json!("transfer");
+    intent["expected_binding"] =
+        json!({"state":"bound","binding_id":a.1["bindingId"],"version":1,"owner":OWNER});
+    let (status, transfer) = send("challenge", &intent, &new_owner).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    let signed_transfer = sign(&transfer);
+    assert_eq!(discover(&owner).await, empty);
+    assert_eq!(send("commit", &signed_transfer, &new_owner).await, waiting);
+    assert_eq!(
+        discover(&owner).await,
+        (StatusCode::OK, json!({"request":transfer}))
+    );
+    assert_eq!(send("consent", &transfer, &owner).await.0, StatusCode::OK);
+    let moved = send("commit", &signed_transfer, &new_owner).await;
+    assert_eq!(moved.0, StatusCode::OK, "{}", moved.1);
+    assert_eq!(moved.1["version"], 2);
+    assert_eq!(moved.1["account"], new_owner["sub"]);
+    assert_eq!(discover(&owner).await, empty);
+    assert_eq!(send("receipt", &signed_transfer, &new_owner).await, moved);
+    assert_eq!(counts().await, (2, 2));
+    assert!(!peer.prepare_delegated(&owner_route).await);
+    let moved_relay = admit(&peer, &fixture, RouteKind::Relay).await.unwrap();
+    let moved_proxy = admit(&peer, &fixture, RouteKind::Proxy).await.unwrap();
+    let pending_disable = async |account: &str| {
+        sqlx::query(
+            "INSERT INTO station_delegated_availability_fences
+            (issuer,portal_origin,station_origin,account,minimum_cursor) VALUES ($1,$2,$3,$4,1)",
+        )
+        .bind(&auth.issuer)
+        .bind(&runtime.binding.portal_origin)
+        .bind(origin)
+        .bind(account)
+        .execute(&replica)
+        .await
+        .unwrap();
+    };
+    pending_disable(OWNER).await;
+    for route in [&moved_relay, &moved_proxy] {
+        assert!(peer.prepare_delegated(route).await);
+        assert_eq!(ack(&peer, &fixture, route, origin).await, StatusCode::OK);
+    }
+    // A disable of the new owner on a different credential fences the actual
+    // write and the ledger, even with an already admitted route.
+    pending_disable(new_owner["sub"].as_str().unwrap()).await;
+    let retained_state = async || {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1",
+        )
+        .bind(&genesis)
+        .fetch_one(&replica)
+        .await
+        .unwrap()
+    };
+    let before_disable = retained_state().await;
+    for route in [&moved_relay, &moved_proxy] {
+        assert!(peer
+            .with_host_route(route, || std::future::ready(()))
+            .await
+            .is_none());
+        assert_eq!(
+            ack(&peer, &fixture, route, origin).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_eq!(retained_state().await, before_disable);
+    sqlx::query("DELETE FROM station_delegated_availability_fences WHERE account=$1")
+        .bind(new_owner["sub"].as_str().unwrap())
+        .execute(&replica)
+        .await
+        .unwrap();
+    let report: Value =
+        sqlx::query_scalar("SELECT report FROM station_native_binding_transitions WHERE version=2")
+            .fetch_one(&replica)
+            .await
+            .unwrap();
+    assert_eq!(report["bindingState"], "bound");
+    assert_eq!(report["state"], "binding_changed");
+    assert!(report["reportId"]
+        .as_str()
+        .unwrap()
+        .starts_with("binding_changed:"));
+
+    intent["action"] = json!("unbind");
+    intent["expected_binding"] =
+        json!({"state":"bound","binding_id":a.1["bindingId"],"version":2,"owner":new_owner["sub"]});
+    let (status, unbind) = send("challenge", &intent, &new_owner).await;
+    assert_eq!(status, StatusCode::OK);
+    let stopped = send("commit", &sign(&unbind), &new_owner).await;
+    assert_eq!(stopped.0, StatusCode::OK, "{}", stopped.1);
+    assert_eq!(stopped.1["version"], 3);
+    assert_eq!(stopped.1["bindingState"], "unbound");
+    assert_eq!(counts().await, (3, 2));
+    for route in [&moved_relay, &moved_proxy] {
+        assert!(!peer.prepare_delegated(route).await);
+        assert_eq!(
+            ack(&peer, &fixture, route, origin).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+    for kind in [RouteKind::Relay, RouteKind::Proxy] {
+        assert!(admit(&peer, &fixture, kind).await.is_err());
+    }
+    assert_eq!(send("commit", &proof, &owner).await, a);
+    replica.close().await;
+    db.cleanup().await;
+}

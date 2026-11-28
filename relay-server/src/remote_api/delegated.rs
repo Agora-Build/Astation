@@ -191,11 +191,15 @@ impl Stored {
     }
 
     fn new(origin: &str, log: &Membership) -> Result<Self, Fault> {
+        Self::empty(origin, log, uuid::Uuid::new_v4().to_string())
+    }
+
+    fn empty(origin: &str, log: &Membership, feed_id: String) -> Result<Self, Fault> {
         let ledger = AckLedger::new(origin, log.account_id(), log.genesis_hash())
             .map_err(|_| Fault::Unavailable)?;
         Ok(Self {
             version: 1,
-            feed_id: uuid::Uuid::new_v4().to_string(),
+            feed_id,
             records: Vec::new(),
             ledger: ledger.to_json(),
             signing_high_water: BTreeMap::new(),
@@ -435,16 +439,10 @@ impl Stored {
         if events.len() < self.report_control_seq {
             return Err(Fault::Unavailable);
         }
-        let digest = |events: &[ReportControlEvent]| {
-            atem_client::Hash32::of(
-                &serde_json::to_vec(events).expect("serializable report control events"),
-            )
-            .to_hex()
-        };
         if self
             .report_control_hash
             .as_ref()
-            .is_some_and(|prior| prior != &digest(&events[..self.report_control_seq]))
+            .is_some_and(|prior| prior != &report_events_hash(&events[..self.report_control_seq]))
         {
             return Err(Fault::Unavailable);
         }
@@ -458,7 +456,7 @@ impl Stored {
             .next;
         }
         self.report_control_seq = events.len();
-        self.report_control_hash = Some(digest(events));
+        self.report_control_hash = Some(report_events_hash(events));
         self.ledger = ledger.to_json();
         self.update_ledger(origin, log, LedgerUpdate::Tick, now)
     }
@@ -468,7 +466,7 @@ impl Stored {
         origin: &str,
         log: &Membership,
         record: &ControlRecord,
-        revoked_at: u64,
+        revoked_at: Option<u64>,
         covered: &[String],
         now: u64,
     ) -> Result<bool, Fault> {
@@ -492,10 +490,15 @@ impl Stored {
                 };
             }
         }
-        let next = self
-            .ledger(origin, log)?
-            .record(record, revoked_at, covered, now)
+        self.check_page(origin, record, now)?;
+        let next = self.ledger(origin, log)?.record(record, revoked_at, covered, now)
             .map_err(|_| Fault::Invalid)?;
+        self.push_verified(record);
+        self.ledger = next.next.to_json();
+        Ok(true)
+    }
+
+    fn check_page(&self, origin: &str, record: &ControlRecord, now: u64) -> Result<(), Fault> {
         // Prove that the full signed record fits a page before making it visible.
         ControlSyncResult {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -507,13 +510,41 @@ impl Stored {
             records: vec![FeedEntry::new(self.records.len() as u64 + 1, record)],
         }
         .to_json()
-        .map_err(|_| Fault::Invalid)?;
+        .map(|_| ()).map_err(|_| Fault::Invalid)
+    }
+
+    fn push_verified(&mut self, record: &ControlRecord) {
         let principal = record.principal().name();
         let watermark = self.signing_high_water.entry(principal).or_default();
         *watermark = (*watermark).max(record.issued_at());
         self.records.push(record.object().to_json());
-        self.ledger = next.next.to_json();
-        Ok(true)
+    }
+
+    /// The shared snapshot checker has already classified carried stops and
+    /// fresh controls. New acknowledgments start with a fresh ledger.
+    pub(super) fn recovered(
+        origin: &str, log: &Membership, feed_id: &str, records: &[ControlRecord],
+        floors: BTreeMap<String, u64>, revocations: &BTreeMap<(String, String), u64>,
+        events: &[ReportControlEvent], now: u64,
+    ) -> Result<Self, Fault> {
+        let mut feed = Self::empty(origin, log, feed_id.to_owned())?;
+        feed.signing_high_water = floors;
+        feed.reporting_control(origin, log, events, now)?;
+        let mut ledger = feed.ledger(origin, log)?;
+        for record in records {
+            feed.check_page(origin, record, now)?;
+            let revoked_at = match (record.signer(), record.principal(), record.action()) {
+                (ControlSigner::Principal, ControlPrincipal::Service(id), ControlAction::Revoke { .. }) =>
+                    revocations.get(&(id.clone(), record.principal_key().ok_or(Fault::Invalid)?.to_hex()))
+                        .copied(),
+                _ => None,
+            };
+            ledger = ledger.record(record, revoked_at, &covered_hosts(log, record.principal()), now)
+                .map_err(|_| Fault::Invalid)?.next;
+            feed.push_verified(record);
+        }
+        feed.ledger = ledger.to_json();
+        Ok(feed)
     }
 
     fn plan_service(
@@ -521,7 +552,7 @@ impl Stored {
         origin: &str,
         log: &Membership,
         context: &crate::service_keys::ServiceKeyContext,
-        key: &atem_client::keys::PublicKey,
+        expected_fingerprint: &str,
         desired: ServiceDesired,
         now: u64,
     ) -> Result<(Vec<ControlBody>, u64), Fault> {
@@ -532,7 +563,8 @@ impl Stored {
         if !matches!(member.member.kind, MemberKind::Service { .. }) {
             return Err(Fault::Invalid);
         }
-        if key != &member.member.auth_key {
+        let fingerprint = principal_key_of(&member.member.auth_key).map_err(|_| Fault::Invalid)?;
+        if fingerprint.to_hex() != expected_fingerprint {
             return Err(Fault::Invalid);
         }
         let principal = ControlPrincipal::Service(context.service_id.clone());
@@ -551,6 +583,13 @@ impl Stored {
             })
             .collect();
         let previously_signed = own.iter().map(|r| r.issued_at()).max().unwrap_or(0);
+        if own.iter().any(|record| {
+            record.principal_key() != Some(fingerprint)
+                || record.about().integration_id.as_deref() != Some(context.integration_id.as_str())
+                || record.feed().map(|(station, _)| station) != Some(origin)
+        }) {
+            return Err(Fault::Invalid);
+        }
         let revoked = records.iter().any(|record| {
             record.principal() == &principal
                 && matches!(record.action(), ControlAction::Revoke { .. })
@@ -604,11 +643,10 @@ impl Stored {
         if actions.is_empty() {
             return Ok((bodies, previously_signed));
         }
-        let previous = self.signing_high_water.get(&principal.name()).copied().unwrap_or(0);
-        // Reserve successive elapsed milliseconds ending at the observed wall time.
-        // The whole cover/hold pair must fit before either signature is produced.
+        // The signer compares this range to the independent clock and the
+        // feed's signing floor after committing any learned revocation time.
         let first = now.checked_sub(actions.len() as u64 - 1).ok_or(Fault::Unavailable)?;
-        if first <= previous || now > atem_client::canonical::MAX_SAFE_INTEGER {
+        if now > atem_client::canonical::MAX_SAFE_INTEGER {
             return Err(Fault::Unavailable);
         }
         for (action, issued_at) in actions.into_iter().zip(first..=now) {
@@ -620,7 +658,7 @@ impl Stored {
                     feed_id: self.feed_id.clone(),
                 }),
                 principal: principal.clone(),
-                principal_key: Some(principal_key_of(key).map_err(|_| Fault::Invalid)?),
+                principal_key: Some(fingerprint),
                 signer: ControlSigner::Principal,
                 action,
                 record_id: uuid::Uuid::new_v4().to_string(),
@@ -645,6 +683,8 @@ pub(crate) enum ServiceDesired {
 impl ServiceDesired {
     pub(crate) fn from_policy(policy: &crate::integration_feed::IntegrationPolicy) -> Option<Self> {
         match policy.state.as_str() {
+            "expired" => policy.held.map(|held| if held { Self::Held } else { Self::Active }),
+            "provisioning" | "waiting_for_host" | "ready" if policy.held == Some(true) => Some(Self::Held),
             "provisioning" | "waiting_for_host" | "ready" => Some(Self::Active),
             "paused" => Some(Self::Held),
             "revoking" | "revoked" => Some(Self::Revoked {
@@ -655,17 +695,22 @@ impl ServiceDesired {
     }
 }
 
+pub(crate) enum ServiceReconciliation {
+    Current,
+    FeedChanged,
+    TimeSavedWithControlsPending,
+}
+
 impl super::RecoveryStore {
     pub(crate) async fn reconcile_service_in(
         &self,
         tx: &mut sqlx::PgConnection,
         owner: &str,
         context: &crate::service_keys::ServiceKeyContext,
-        signer: &crate::service_keys::ServiceSigner,
+        vault: &crate::service_keys::ServiceKeyVault,
         desired: ServiceDesired,
         checkpoint: &crate::integration_feed::PolicyCheckpoint,
-    ) -> Result<bool, ()> {
-        use atem_client::{KeyId, KeyProvider};
+    ) -> Result<ServiceReconciliation, ()> {
         let origin = self.delegated_origin.get().ok_or(())?;
         self.lock_delegated_recovery(tx).await.map_err(|_| ())?;
         let (subject, state) = Self::locked_root(tx, &context.genesis)
@@ -684,29 +729,57 @@ impl super::RecoveryStore {
         if log.frozen().is_some() {
             return Err(());
         }
-        let binding_current = || desired != ServiceDesired::Active
-            || checkpoint.binding_feed_current(log.account_id(), &context.genesis, chrono::Utc::now().timestamp_millis());
-        if !binding_current() || (desired == ServiceDesired::Active
+        let policy_allows_signing = || {
+            if desired != ServiceDesired::Active {
+                return true;
+            }
+            let now = chrono::Utc::now();
+            checkpoint.allows_control_release(&context.integration_id, &context.owner, now.timestamp())
+                && checkpoint.binding_feed_current(log.account_id(), &context.genesis, now.timestamp_millis())
+        };
+        if !policy_allows_signing() || (desired == ServiceDesired::Active
             && !checkpoint.allows_list_release_in(tx, &context.owner, log.account_id(), &context.genesis).await?)
         {
             return Err(());
         }
         ensure(&mut root, origin, &log).map_err(|_| ())?;
         let feed = root.delegated.get_mut(origin).ok_or(())?;
-        let key = signer
-            .public_key(&KeyId::new(&context.service_id))
-            .map_err(|_| ())?;
+        let fingerprint = checkpoint.integrations.get(&context.integration_id)
+            .and_then(|policy| policy.r9_svc.as_deref()).ok_or(())?;
         let (bodies, previously_signed) = feed
-            .plan_service(origin, &log, context, &key, desired, clock.wall_ms)
+            .plan_service(origin, &log, context, fingerprint, desired, clock.wall_ms)
             .map_err(|_| ())?;
-        if bodies.is_empty() {
-            return Ok(false);
+        let revoked_at = if matches!(desired, ServiceDesired::Revoked { .. }) {
+            checkpoint.known_revocation_ms(&context.integration_id)?
+        } else {
+            None
+        };
+        let first_revoke = bodies.iter().any(|body| matches!(body.action, ControlAction::Revoke { .. }));
+        if let Some(at) = revoked_at.filter(|_| !first_revoke) {
+            let principal = ControlPrincipal::Service(context.service_id.clone()).name();
+            let learned = feed.ledger(origin, &log).map_err(|_| ())?
+                .learn_revoked_at(&principal, at, clock.wall_ms).map_err(|_| ())?.next.to_json();
+            if learned != feed.ledger {
+                feed.ledger = learned;
+                super::finish_root(&mut root, &log, clock.wall_ms).map_err(|_| ())?;
+                Self::save_root(tx, &context.genesis, owner, root).await.map_err(|_| ())?;
+                // A later interrupt may need a private key or a signing reservation.
+                // Persist the original time even if that separate operation fails.
+                return Ok(if bodies.is_empty() {
+                    ServiceReconciliation::Current
+                } else {
+                    ServiceReconciliation::TimeSavedWithControlsPending
+                });
+            }
         }
+        if bodies.is_empty() {
+            return Ok(ServiceReconciliation::Current);
+        }
+        let signer = crate::service_keys::load_approved_in(tx, vault, context, fingerprint).await?;
         let covered = covered_hosts(&log, &bodies[0].principal);
         let store = self.signing_ceilings.get().ok_or(())?;
         // A recovery review may have observed a reservation that never reached
         // the feed. Require the signing store to cover it before reserving more.
-        let fingerprint = principal_key_of(&key).map_err(|_| ())?.to_hex();
         let (floor, conflicting_key): (i64, bool) = sqlx::query_as(
             "SELECT COALESCE(MAX(highest_ms) FILTER (WHERE key_hash=$5),0),
                     COALESCE(BOOL_OR(key_hash<>$5 AND highest_ms>0),false)
@@ -720,12 +793,14 @@ impl super::RecoveryStore {
             return Err(());
         }
         let required_floor = previously_signed.max(u64::try_from(floor).map_err(|_| ())?);
-        for record in signer.sign_control_batch(store, &bodies, required_floor).await? {
+        let mark = store.live_mark(log.account_id(), &context.genesis, &context.service_id, fingerprint,
+            required_floor, feed.signing_high_water.get(&bodies[0].principal.name()).copied().unwrap_or(0)).await?;
+        for record in signer.sign_control_batch(store, &log, &feed.feed_id, &bodies, &mark, policy_allows_signing).await? {
             feed.publish(
                 origin,
                 &log,
                 &record,
-                clock.wall_ms,
+                revoked_at,
                 &covered,
                 clock.wall_ms,
             )
@@ -737,10 +812,10 @@ impl super::RecoveryStore {
             .map_err(|_| ())?;
         // A signing reservation can wait on the independent store. Returning
         // an error rolls back this publication if the feed aged out meanwhile.
-        if !binding_current() {
+        if !policy_allows_signing() {
             return Err(());
         }
-        Ok(true)
+        Ok(ServiceReconciliation::FeedChanged)
     }
 }
 
@@ -806,7 +881,7 @@ pub(super) fn publish(
     origin: &str,
     log: &Membership,
     record: &ControlRecord,
-    revoked_at: u64,
+    revoked_at: Option<u64>,
     covered: &[String],
     now: u64,
 ) -> Result<bool, Fault> {
@@ -947,7 +1022,7 @@ fn owner(
                 return Err(Fault::Invalid);
             }
             let covered = covered_hosts(log, record.principal());
-            let appended = publish(root, origin, log, &record, now, &covered, now)?;
+            let appended = publish(root, origin, log, &record, None, &covered, now)?;
             Ok(serde_json::json!({"appended":appended,"record_id":record.record_id()}))
         }
     }
@@ -957,6 +1032,10 @@ fn owner(
 pub(crate) enum ReportControlEvent {
     Stop(String),
     Resume(String),
+}
+
+pub(super) fn report_events_hash(events: &[ReportControlEvent]) -> String {
+    atem_client::Hash32::of(&serde_json::to_vec(events).expect("serializable report control events")).to_hex()
 }
 
 pub(crate) enum LedgerUpdate {
@@ -1008,7 +1087,7 @@ pub(super) fn apply(
             if binding.is_some() {
                 return Err(Fault::Invalid);
             }
-            let appended = publish(root, origin, log, &record, revoked_at, &covered, now)?;
+            let appended = publish(root, origin, log, &record, Some(revoked_at), &covered, now)?;
             Ok(serde_json::json!({"appended":appended}))
         }
         Command::Reserve { principal } => {

@@ -79,6 +79,32 @@ pub(crate) async fn reconcile_report_restart(
     in_flight: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let key = portal.report_control_binding();
+    let (needs_resume, has_history, archived_ids) =
+        compare_journals(connection, portal, events, in_flight).await?;
+    if has_history {
+        sqlx::query(
+            "INSERT INTO station_delegated_report_resumptions(binding,resume_id)
+             SELECT $1, id::uuid FROM unnest($2::text[]) AS prior(id) ON CONFLICT DO NOTHING",
+        )
+        .bind(&key).bind(archived_ids.iter().map(ToString::to_string).collect::<Vec<_>>())
+        .execute(&mut *connection).await?;
+        let consumed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM station_delegated_report_resumptions WHERE binding=$1",
+        ).bind(&key).fetch_one(connection).await?;
+        if consumed != operator_resume_count(events)? as i64 {
+            return Err(invalid());
+        }
+    }
+    Ok(needs_resume)
+}
+
+async fn compare_journals(
+    connection: &mut PgConnection,
+    portal: &FeedBinding,
+    events: &[ReportControlEvent],
+    in_flight: Option<&str>,
+) -> Result<(bool, bool, HashSet<uuid::Uuid>), sqlx::Error> {
+    let key = portal.report_control_binding();
     let mut rows = sqlx::query_as::<_, (String, Option<Value>)>(
         "SELECT h.evidence_hash, CASE WHEN octet_length(h.journal::text) <= $3 THEN h.journal END
          FROM station_delegated_reporting_history h WHERE h.origin=$1 AND h.binding=$2
@@ -113,24 +139,67 @@ pub(crate) async fn reconcile_report_restart(
         }
         has_history = true;
     }
-    drop(rows);
-    if has_history {
-        // Consumption is permanent. Rebuild missing IDs before considering an
-        // operator's request, in the same transaction as any resulting resume.
-        sqlx::query(
-            "INSERT INTO station_delegated_report_resumptions(binding,resume_id)
-             SELECT $1, id::uuid FROM unnest($2::text[]) AS prior(id) ON CONFLICT DO NOTHING",
-        )
-        .bind(&key).bind(archived_ids.iter().map(ToString::to_string).collect::<Vec<_>>())
-        .execute(&mut *connection).await?;
-        let consumed: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM station_delegated_report_resumptions WHERE binding=$1",
-        ).bind(&key).fetch_one(connection).await?;
-        if consumed != operator_resume_count(events)? as i64 {
-            return Err(invalid());
+    Ok((needs_resume, has_history, archived_ids))
+}
+
+/// Read the reporting state captured under the closed fence. A lost stop or
+/// delivery claim remains visible to the operator without preparing an open ledger.
+pub(super) async fn candidate_events(
+    db: &mut PgConnection, portal: &FeedBinding, genesis: &str, history: &Value,
+) -> Result<Option<Vec<ReportControlEvent>>, sqlx::Error> {
+    let events = match history["current_evidence_hash"].as_str() {
+        None if history["distinct_journals"] == 0 => Vec::new(),
+        None => return Ok(None),
+        Some(hash) => match current_events(db, portal, hash).await? {
+            Some(events) => events,
+            None => return Ok(None),
+        },
+    };
+    // An account's retained ledger may be the only surviving evidence of a
+    // reporter stop or a journal prefix lost by the global reporting table.
+    let states: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT COALESCE((retained->'feed'->>'report_control_seq')::bigint,0),
+            retained->'feed'->>'report_control_hash',retained->'feed'->'ledger'->>'stopped'
+         FROM station_delegated_recovery_plans WHERE origin=$1 AND genesis_hash=$2",
+    ).bind(&portal.station_origin).bind(genesis).fetch_all(db).await?;
+    for (seq, hash, stopped) in states {
+        let seq = usize::try_from(seq).map_err(|_| invalid())?;
+        let Some(prefix) = events.get(..seq) else { return Ok(None) };
+        if hash.is_some_and(|hash| hash != crate::remote_api::recovery::delegated::report_events_hash(prefix)) {
+            return Ok(None);
+        }
+        if let Some(client) = stopped {
+            let stop = ReportControlEvent::Stop(client);
+            if prefix.last() != Some(&stop) && !events[seq..].contains(&stop) {
+                return Ok(None);
+            }
         }
     }
-    Ok(needs_resume)
+    Ok(Some(events))
+}
+
+async fn current_events(
+    db: &mut PgConnection, portal: &FeedBinding, hash: &str,
+) -> Result<Option<Vec<ReportControlEvent>>, sqlx::Error> {
+    let journal: Value = sqlx::query_scalar(
+        "SELECT journal FROM station_delegated_reporting_history WHERE origin=$1 AND binding=$2 AND evidence_hash=$3",
+    ).bind(&portal.station_origin).bind(portal.report_control_binding()).bind(hash)
+        .fetch_one(&mut *db).await?;
+    if source_hash(&journal)? != hash { return Err(invalid()); }
+    let events: Vec<ReportControlEvent> = serde_json::from_value(journal["events"].clone()).map_err(|_| invalid())?;
+    let claim: Option<String> = serde_json::from_value(journal["in_flight"].clone()).map_err(|_| invalid())?;
+    match compare_journals(db, portal, &events, claim.as_deref()).await {
+        Ok((needs_resume, _, archived_ids)) => {
+            let stopped = matches!(events.last(), Some(ReportControlEvent::Stop(_)));
+            if (needs_resume && !stopped) || archived_ids.len() != operator_resume_count(&events)? {
+                return Ok(None);
+            }
+            Ok(Some(events))
+        }
+        // The ordinary recovery review must stay available to reconcile a restored prefix.
+        Err(sqlx::Error::Protocol(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Preparation holds the deployment fence through commit. The live reporter

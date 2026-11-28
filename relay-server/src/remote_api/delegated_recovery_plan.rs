@@ -16,14 +16,28 @@ pub(crate) mod reporting_history;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
+#[path = "delegated_service_drafts.rs"]
+mod service_drafts;
+#[path = "delegated_service_components.rs"]
+pub(crate) mod service_components;
+#[path = "delegated_candidate_snapshot.rs"]
+mod candidate_snapshot;
+#[path = "delegated_replacement_feed.rs"]
+mod replacement_feed;
+#[path = "delegated_publication.rs"]
+pub(crate) mod publication;
 #[path = "delegated_snapshot_stops.rs"]
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
 mod history;
+#[path = "delegated_recovery_memberships.rs"]
+mod memberships;
 #[path = "delegated_native_recovery.rs"]
 pub(crate) mod native;
 #[path = "delegated_recovery_signatures.rs"]
 pub(crate) mod signatures;
+#[path = "delegated_copy_reservations.rs"]
+pub(crate) mod copy_reservations;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
@@ -109,15 +123,37 @@ pub(crate) async fn prepare_with_sources(
     vault: Option<&crate::service_keys::ServiceKeyVault>,
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    let stops = review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    let (_, report) = prepare_in_transaction(&mut tx, binding, genesis, ceilings, portal, vault).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+async fn prepare_in_transaction(
+    connection: &mut PgConnection,
+    binding: &Binding,
+    genesis: &str,
+    ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
+    portal: Option<&crate::integration_feed::FeedBinding>,
+    vault: Option<&crate::service_keys::ServiceKeyVault>,
+) -> Result<(Membership, Value), sqlx::Error> {
+    let (prepared, log, mut report) = checkpoint(connection, binding, genesis, true).await?;
+    let stops = review_evidence(connection, &prepared, &log, binding, &mut report, true).await?;
     let reservations = match ceilings {
         Some(store) => Some(store.reservations(log.account_id(), genesis).await.map_err(|_| invalid())?),
         None => None,
     };
     let observed = observe_reservations(
-        &mut tx, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
+        connection, &binding.origin, log.account_id(), genesis, reservations.as_deref(),
     ).await?;
+    if ceilings.is_some() {
+        let copy_floors: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT r.principal,MAX(r.issued_at) FROM station_delegated_copy_reservations r
+             JOIN station_delegated_recovery_plans p USING(plan_id)
+             WHERE p.origin=$1 AND p.genesis_hash=$2 GROUP BY r.principal ORDER BY r.principal LIMIT 4097",
+        ).bind(&binding.origin).bind(genesis).fetch_all(&mut *connection).await?;
+        if copy_floors.len() > history::MAX_RECORDS { return Err(invalid()); }
+        report["reserved_copy_times"] = json!(copy_floors.into_iter().collect::<BTreeMap<_,_>>());
+    }
     let clock_evidence = match reservations.as_deref() {
         Some(rows) => Some(crate::service_signing_ceilings::SigningCeilings::recovery_evidence(
             rows, &observed, &report,
@@ -134,21 +170,38 @@ pub(crate) async fn prepare_with_sources(
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
-        let revokes = snapshot_stops::staged_service_revokes(
-            &mut tx, stops, &prepared, &log, &binding.origin,
-            report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
-        ).await?;
-        let source = portal_services::observe(&mut tx, binding, portal, vault, subject, &log,
+        let covered = covers_retained_membership(&report);
+        let revokes = if covered {
+            snapshot_stops::staged_service_revokes(
+                connection, &stops, &prepared, &log, &binding.origin,
+                report["reconstruction_hash"].as_str().ok_or_else(invalid)?,
+            ).await?
+        } else {
+            BTreeMap::new()
+        };
+        let source = portal_services::observe(connection, binding, portal, vault, subject, &log,
             reservations.as_deref(), &observed, &report, &revokes).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,
         }))?.into();
         report["portal_service_evidence"] = source;
-        report["reporting_history"] = reporting_history::retain(&mut tx, binding, portal).await?;
+        report["reporting_history"] = reporting_history::retain(connection, binding, portal).await?;
+        if vault.is_some() && ceilings.is_some() {
+            report["service_drafts"] = if covered {
+                service_drafts::prepare(connection, &prepared, &log, binding, &report).await?
+            } else {
+                json!({"status":"membership_history_unresolved"})
+            };
+            if covered {
+                let candidate = candidate_snapshot::assemble(
+                    connection, &prepared, &log, &binding.origin, &report, &stops,
+                ).await?;
+                replacement_feed::stage(connection, &prepared, &log, portal, &mut report, candidate).await?;
+            }
+        }
     }
-    tx.commit().await?;
-    Ok(report)
+    Ok((log, report))
 }
 
 async fn observe_reservations(
@@ -194,6 +247,9 @@ pub(crate) async fn review_for_owner(
     let (prepared, log, mut report) =
         checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
     review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    if !covers_retained_membership(&report) {
+        return Err(invalid());
+    }
     let summary = json!({
         "version": 1,
         "account_id": log.account_id(),
@@ -220,6 +276,48 @@ pub(crate) async fn review_for_owner(
     Ok(summary)
 }
 
+/// Page only the originals still needing a manager signature at this review.
+pub(crate) async fn originals_for_owner(
+    pool: &PgPool, binding: &Binding, genesis: &str, owner: &str,
+    plan_id: &str, review: &str, offset: usize,
+) -> Result<Option<Value>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let (prepared, log, mut report) =
+        checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
+    let sources = review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
+    if !covers_retained_membership(&report) { return Err(invalid()); }
+    if prepared.plan_id != plan_id || report["reconstruction_hash"] != review { return Ok(None); }
+    let page = originals_page(&report, &sources.signed, plan_id, review, offset)?;
+    tx.commit().await?;
+    Ok(Some(page))
+}
+
+fn originals_page(report: &Value, signed: &BTreeMap<String, Value>, plan_id: &str, review: &str,
+    offset: usize) -> Result<Value, sqlx::Error> {
+    // The review builds obligations in record-ID order from the signed evidence map.
+    let obligations = report["recovery_signatures"]["known_native_obligations"].as_array().ok_or_else(invalid)?;
+    let mut pending = obligations.iter().filter(|row| row["requirement"] == "fresh_manager_signature").skip(offset).peekable();
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    while let Some(row) = pending.peek() {
+        let id = row["original"]["record_id"].as_str().ok_or_else(invalid)?;
+        let record = signed.get(id).ok_or_else(invalid)?;
+        let size = serde_json::to_vec(record).map_err(|_| invalid())?.len() + 1;
+        // Reserve space for the bounded plan, hash and pagination fields.
+        if records.len() == 64 || bytes + size > 262_144 - 512 { break; }
+        records.push(record);
+        bytes += size;
+        pending.next();
+    }
+    let more = pending.peek().is_some();
+    if more && records.is_empty() { return Err(invalid()); }
+    Ok(json!({"plan_id":plan_id,"reconstruction_hash":review,"offset":offset,"records":records,"more":more}))
+}
+
+fn covers_retained_membership(report: &Value) -> bool {
+    report["known_history"]["membership_gaps"].as_array().is_some_and(Vec::is_empty)
+}
+
 async fn review_evidence(
     connection: &mut PgConnection,
     prepared: &Prepared,
@@ -231,6 +329,11 @@ async fn review_evidence(
     let mut source = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
     let (summary, copies) = signatures::inspection(connection, prepared, log, binding, report, &mut source).await?;
     report["recovery_signatures"] = summary;
+    report["reconstruction_hash"] = source_hash(&reconstruction_inputs(report))?.into();
+    Ok(snapshot_stops::StopSources { signed: source.records, copies })
+}
+
+fn reconstruction_inputs(report: &Value) -> Value {
     let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
         "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
@@ -238,12 +341,14 @@ async fn review_evidence(
     if let Some(confirmations) = report.get("author_confirmation_hash") {
         reconstruction["author_confirmation_hash"] = confirmations.clone();
     }
+    if let Some(services) = report["known_history"].get("candidate_service_components_hash") {
+        reconstruction["candidate_service_components_hash"] = services.clone();
+    }
     // Invalidate components staged before retained copies were counted as stops.
     if report["recovery_signatures"]["records"].as_array().is_some_and(|rows| !rows.is_empty()) {
         reconstruction["includes_signed_copies"] = true.into();
     }
-    report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
-    Ok(snapshot_stops::StopSources { signed: source.records, copies })
+    reconstruction
 }
 
 struct SignedEvidence {
@@ -282,9 +387,13 @@ async fn review_source_evidence(
         sources["exported_records"] = json!(history.new_export_digests);
     }
     let evidence_hash = source_hash(&sources)?;
+    if operator_review {
+        let base = Hash32::from_hex(&evidence_hash).map_err(|_| invalid())?;
+        report["known_authors"]["pending_final_reports"] = json!(history.author_round.pending(log.head(), base));
+    }
     let exported_at_cut = history.latest_exports.into_iter()
-        .filter(|(base, _)| base.to_hex() == evidence_hash)
-        .flat_map(|(_, ids)| ids).collect();
+        .filter(|(head, base, _)| *head == log.head() && base.to_hex() == evidence_hash)
+        .flat_map(|(_, _, ids)| ids).collect();
     report["evidence_hash"] = evidence_hash.into();
     Ok(SignedEvidence { external_source_hash, records: history.signed, exported_at_cut })
 }
@@ -353,7 +462,6 @@ async fn checkpoint_for_owner(
         "membership": root.membership,
         "feed": feed,
     });
-    let source_hash = source_hash(&retained)?;
     // JSONB's text representation can be larger than canonical JSON. Check
     // the actual persisted size so a successful first call is readable again.
     let fits: bool = sqlx::query_scalar("SELECT octet_length($1::jsonb::text) <= $2")
@@ -377,8 +485,10 @@ async fn checkpoint_for_owner(
     .fetch_optional(&mut *connection)
     .await?;
     let prepared = if let Some(prepared) = prepared {
-        if prepared.abandoned || prepared.source_hash != source_hash
-            || prepared.retained != retained
+        if prepared.abandoned || prepared.source_hash != source_hash(&prepared.retained)?
+            || prepared.retained["account_subject"] != retained["account_subject"]
+            || prepared.retained["account_id"] != retained["account_id"]
+            || prepared.retained["feed"] != retained["feed"]
             || !canonical_uuid(&prepared.plan_id)
             || !canonical_uuid(&prepared.candidate_feed_id)
             || prepared.candidate_feed_id == review["retained_feed_id"]
@@ -386,6 +496,7 @@ async fn checkpoint_for_owner(
             // Never replace an earlier plan or silently drop its obligations.
             return Err(invalid());
         }
+        memberships::observe(connection, &prepared, &log, &root.membership, create).await?;
         prepared
     } else {
         if !create {
@@ -395,7 +506,7 @@ async fn checkpoint_for_owner(
             abandoned: false,
             plan_id: uuid::Uuid::new_v4().to_string(),
             candidate_feed_id: uuid::Uuid::new_v4().to_string(),
-            source_hash,
+            source_hash: source_hash(&retained)?,
             retained,
         };
         if prepared.candidate_feed_id == review["retained_feed_id"] {
