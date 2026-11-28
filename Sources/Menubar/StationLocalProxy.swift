@@ -37,7 +37,8 @@ final class StationLocalProxy {
     private var queue: [Data] = []
     private var queuedBytes = 0
     private var sending = false
-    private var localQueue: [(bytes: Data, retryChallenge: Bool)] = []
+    private enum LocalWrite { case packet, retryChallenge, retryAcceptance }
+    private var localQueue: [(bytes: Data, kind: LocalWrite)] = []
     private var localBytes = 0
     private var localSending = false
     private var queuedSuspension: Data?
@@ -123,12 +124,13 @@ final class StationLocalProxy {
             let op = fields["op"]?.string
             if phase == .proof, op == "host_challenge", !challengeForwarded {
                 challengeForwarded = true
-                forwardLocal(bytes, retryChallenge: retryAfterSuspension)
+                forwardLocal(bytes, kind: retryAfterSuspension ? .retryChallenge : .packet)
                 return
             }
             if phase == .proof, proofForwarded, op == "host_route_ok" {
-                phase = .ready; retryAfterSuspension = false
-                retryCount = 0; timer?.cancel(); forwardLocal(bytes); return
+                phase = .ready; retryCount = 0; timer?.cancel()
+                forwardLocal(bytes, kind: retryAfterSuspension ? .retryAcceptance : .packet)
+                return
             }
             if phase == .proof, op == "host_route_refused" {
                 let suspended = proofForwarded && bytes.count <= 1024 && fields["v"] == .integer(1)
@@ -236,9 +238,9 @@ final class StationLocalProxy {
         }
     }
 
-    private func forwardLocal(_ bytes: Data, retryChallenge: Bool = false) {
+    private func forwardLocal(_ bytes: Data, kind: LocalWrite = .packet) {
         guard localQueue.count < 128, localBytes + bytes.count <= 8 * 1024 * 1024 else { failed(); return }
-        localQueue.append((bytes, retryChallenge)); localBytes += bytes.count; flushLocal()
+        localQueue.append((bytes, kind)); localBytes += bytes.count; flushLocal()
     }
 
     private func flushLocal() {
@@ -246,10 +248,11 @@ final class StationLocalProxy {
         let bytes = write.bytes
         localSending = true; let generation = attempt
         if bytes == queuedSuspension { queuedSuspension = nil }
-        writeLocal(bytes, write.retryChallenge) { [weak self] error in
+        writeLocal(bytes, write.kind == .retryChallenge) { [weak self] error in
             Task { @MainActor in
                 guard let self, self.attempt == generation else { return }
                 if error != nil { self.failed(); return }
+                if write.kind == .retryAcceptance { self.retryAfterSuspension = false }
                 // Keep a closing channel until the write completes so queue
                 // rejection or a failed write still closes it during retirement.
                 if case .close(let handle, _) = try? RemoteChannelEnvelope.readHost(bytes) {
@@ -313,7 +316,7 @@ final class StationLocalProxy {
         // A host can ignore a challenge that arrives before its own timer
         // elapses. Once it answers, a missing verdict leaves the proof pending.
         let unansweredRetry = retryAfterSuspension && phase == .proof && challengeForwarded && !proofForwarded
-        if retryAfterSuspension, phase == .proof, proofForwarded {
+        if retryAfterSuspension, proofForwarded {
             refuse()
             return
         }

@@ -217,7 +217,11 @@ final class StationLocalProxyTests: XCTestCase {
         await checkSuspensionRetry(.unanswered)
     }
 
-    private enum RetryOutcome { case accepted, lostVerdict, unanswered }
+    func testFailedLocalAcceptanceDeliveryKeepsTheDirectGeneration() async {
+        await checkSuspensionRetry(.failedLocalVerdict)
+    }
+
+    private enum RetryOutcome { case accepted, lostVerdict, unanswered, failedLocalVerdict }
 
     private func checkSuspensionRetry(_ outcome: RetryOutcome) async {
         let f = Fixture()
@@ -271,8 +275,15 @@ final class StationLocalProxyTests: XCTestCase {
         XCTAssertTrue(f.proxy.receiveHost(nextProof))
         await drain()
         XCTAssertEqual(f.reconnected.sent, [nextProof])
-        if outcome == .lostVerdict {
-            f.reconnected.reader?(.failure(URLError(.networkConnectionLost)))
+        if outcome == .lostVerdict || outcome == .failedLocalVerdict {
+            if outcome == .failedLocalVerdict {
+                f.holdLocalWrites = true
+                f.proxy.receiveStation(oldOK)
+                XCTAssertEqual(f.local.last, oldOK)
+                f.localCompletions.last?(URLError(.networkConnectionLost))
+            } else {
+                f.reconnected.reader?(.failure(URLError(.networkConnectionLost)))
+            }
             await drain()
             XCTAssertEqual(f.proxy.phase, .refused)
             XCTAssertEqual(f.retryIntervals, [30])

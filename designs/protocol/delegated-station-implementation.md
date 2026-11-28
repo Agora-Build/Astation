@@ -859,7 +859,8 @@ work. This path requires Atem's same-generation challenge hook for the joint che
 
 If the host leaves a fresh challenge unanswered, the Mac waits another 30
 seconds before retrying. If the host returns a proof and the Station verdict
-is lost, the Mac holds the attempt until the local authentication generation changes.
+is lost upstream or its write to the host fails, the Mac holds the attempt
+until the local authentication generation changes.
 An ordinary proof refusal also ends the attempt. On other upstream reconnects,
 the local server's existing authentication rules apply. A replacement local
 generation closes the previous channels before issuing its authentication request.
