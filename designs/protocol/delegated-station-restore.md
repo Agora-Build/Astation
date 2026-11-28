@@ -317,18 +317,28 @@ A failed fence write does not prove that other replicas stopped. Keep the fleet
 drained and fix storage; never restart it with an older generation.
 
 While the replicas are drained and the configured generation is fenced,
-`list-roots` compares device-list genesis hashes in the Station database
-with registrations in its dedicated independent signing store. It returns up
-to 64 hashes in order. Pass `next_after` as the next call's argument until it
-is null. Each page reads both stores and fails if either is unavailable.
+`list-roots` compares retained device lists with registrations in the
+independent signing store. With reporting configured on a built-in Station,
+it also checks native binding transitions, administrative release requests
+and authenticated Portal checkpoints retained under any report credential
+for the configured issuer, Portal and Station. This finds native-only lists
+with zero registered service keys. A historical unbind or release still
+identifies a list whose history needs recovery.
 
-If `root_present` is false, the backup lacks the list named by the signing
-store. `registered_keys` includes unused registrations left by interrupted
-provisioning. A positive `keys_with_reservations` means the independent store
-committed signing time for at least one key. Recover the list and reconcile
-its history before reopening. A list lost from both stores requires another
-source of evidence. Each page is a fresh observation. Restart from the first
-page after restoring rows.
+Each page returns up to 64 distinct hashes in order. Pass `next_after` on the
+next call until it is null. `binding_discovery` is `retained` when the command
+checked the built-in binding sources, `reporting_unconfigured` when it could
+only check roots and registrations on a built-in Station, and `not_applicable`
+for custom Stations. Each page requires both databases. A malformed retained
+checkpoint in the selected scope fails the read.
+
+If `root_present` is false, recover the signed list and reconcile its history
+before reopening. `registered_keys` includes unused registrations left by
+interrupted provisioning. A positive `keys_with_reservations` means the
+independent store committed signing time for at least one key. Discovery uses
+historical evidence only. A list missing from every available source still
+requires independent evidence. Each page is a fresh observation. Restart
+from the first page after restoring rows.
 
 `inspect` reads one account root and the configured origin's fence in a single
 read-only, repeatable-read Postgres transaction. It works while the fence is

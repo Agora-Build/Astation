@@ -253,7 +253,11 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             eprintln!("list-roots requires the independent signing database");
             return 1;
         };
-        return match list_roots(&pool, &binding, &signing, args.get(1).map(String::as_str)).await {
+        let Ok(portal) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+            eprintln!("invalid Portal reporting configuration");
+            return 1;
+        };
+        return match list_roots(&pool, &binding, &signing, portal.as_ref(), args.get(1).map(String::as_str)).await {
             Ok(page) => { println!("{page}"); 0 }
             Err(_) => { eprintln!("could not list recovery roots; check the closed generation and both databases"); 1 }
         };

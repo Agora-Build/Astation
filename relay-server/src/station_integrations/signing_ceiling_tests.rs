@@ -21,9 +21,9 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
     let signing = SigningCeilings::fixture(external.pool.clone()).await;
     let fence = Binding::new("https://station.example", 1).unwrap();
     fence.initialize(&primary.pool, false).await.unwrap();
-    assert!(list_roots(&primary.pool, &fence, &signing, None).await.is_err());
+    assert!(list_roots(&primary.pool, &fence, &signing, None, None).await.is_err());
     fence.initialize(&primary.pool, true).await.unwrap();
-    let empty = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    let empty = list_roots(&primary.pool, &fence, &signing, None, None).await.unwrap();
     assert_eq!(empty["roots"], json!([]));
     assert!(empty["next_after"].is_null());
 
@@ -40,13 +40,13 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
     signing.register_new_key("account", &hash(64), "other", "key").await.unwrap();
     signing.reserve("account", &hash(64), "other", "key", 0, 1..=2).await.unwrap();
     let replica = primary.reconnect(2).await;
-    let first = list_roots(&primary.pool, &fence, &signing, None).await.unwrap();
+    let first = list_roots(&primary.pool, &fence, &signing, None, None).await.unwrap();
     assert_eq!(first["next_after"], hash(64));
     assert_eq!(first["roots"].as_array().unwrap().len(), 64);
     assert_eq!(first["roots"][63], json!({"genesis_hash":hash(64),"root_present":false,
         "registered_keys":2,"keys_with_reservations":1}));
-    assert_eq!(list_roots(&replica, &fence, &signing, None).await.unwrap(), first);
-    let second = list_roots(&replica, &fence, &signing, first["next_after"].as_str()).await.unwrap();
+    assert_eq!(list_roots(&replica, &fence, &signing, None, None).await.unwrap(), first);
+    let second = list_roots(&replica, &fence, &signing, None, first["next_after"].as_str()).await.unwrap();
     assert!(second["next_after"].is_null());
     let rows: Vec<_> = [&first, &second].into_iter()
         .flat_map(|page| page["roots"].as_array().unwrap()).collect();
@@ -58,14 +58,14 @@ async fn postgres_delegated_list_roots_finds_entire_missing_lists_across_pages()
         assert_eq!(row["keys_with_reservations"].as_i64(), Some(i64::from(i == 64)));
     }
     // Exactly one full remaining page must have no continuation.
-    let exact = list_roots(&replica, &fence, &signing, Some(&hash(32))).await.unwrap();
+    let exact = list_roots(&replica, &fence, &signing, None, Some(&hash(32))).await.unwrap();
     assert_eq!(exact["roots"].as_array().unwrap().len(), 64);
     assert!(exact["next_after"].is_null());
     let newer = Binding::new(&fence.origin, 2).unwrap();
     newer.initialize(&primary.pool, true).await.unwrap();
-    assert!(list_roots(&replica, &fence, &signing, Some(&hash(64))).await.is_err());
+    assert!(list_roots(&replica, &fence, &signing, None, Some(&hash(64))).await.is_err());
     sqlx::query("DROP TABLE station_service_signing_ceilings").execute(&external.pool).await.unwrap();
-    assert!(list_roots(&replica, &newer, &signing, None).await.is_err());
+    assert!(list_roots(&replica, &newer, &signing, None, None).await.is_err());
     replica.close().await;
     primary.cleanup().await;
     external.cleanup().await;
