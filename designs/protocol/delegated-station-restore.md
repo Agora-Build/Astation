@@ -242,7 +242,10 @@ During publication Station rebuilds each device list's review while holding
 the primary recovery fence and the independent signing store. It compares that
 list's process exports against the rebuilt membership, plan and evidence. A
 missing manager roster, conflicting slot, ambiguous selected process, or a
-reported process outside the review stops the transaction. The final verifier
+reported process outside the review stops the transaction. Each stop requiring
+a replacement must appear in its signing manager's final journal report as the
+selected signed copy. `recovery_signatures.pending_copy_exports` lists the
+original and selected copy IDs still awaiting that evidence. The final verifier
 also receives the rebuilt review and its process comparison for each list.
 Station installs the feeds and receipts only after every list passes.
 Checking a displaced process's signed journal attachment, the final

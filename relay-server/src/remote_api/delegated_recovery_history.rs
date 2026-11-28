@@ -60,7 +60,7 @@ pub(super) struct History {
     pub author_round: super::author_history::AuthorRound,
     pub new_export_digests: BTreeMap<String, String>,
     pub confirmation_hashes: Vec<String>,
-    // One latest verified export per signer, slot and process, in this plan.
+    // The latest verified export from each signer's journal in this plan.
     pub latest_exports: Vec<(atem_client::membership::Head, Hash32, Vec<String>)>,
 }
 
@@ -230,7 +230,8 @@ pub(super) async fn inspection(
                     verified.records.iter().map(ControlRecord::record_id));
             }
             if current_plan {
-                latest_exports.insert((verified.signer.clone(), verified.slot.clone(), verified.process),
+                // A successor can report the same exclusive journal from a different slot.
+                latest_exports.insert((verified.signer.clone(), verified.journal.id),
                     (verified.head, verified.recovery.evidence_hash(), verified.records.iter().map(|r| r.record_id().to_owned()).collect()));
             }
             for record in verified.records {

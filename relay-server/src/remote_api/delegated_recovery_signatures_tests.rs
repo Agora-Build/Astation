@@ -138,6 +138,7 @@ async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_pu
     assert_eq!(signatures["records"].as_array().unwrap().len(), 1);
     assert_eq!(signatures["records"][0]["current_review"], true);
     assert_eq!(signatures["records"][0]["verification"], "valid");
+    assert_eq!(signatures["pending_copy_exports"], json!([]), "the authorized original is carried unchanged");
     let matched = obligation(&first, source.record_id());
     assert_eq!(matched["requirement"], "signed_copy_retained");
     assert_eq!(matched["copy_record_id"], copy["body"]["record_id"]);

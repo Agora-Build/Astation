@@ -294,6 +294,9 @@ impl Publication {
                 || !authors["journal_gaps"]
                     .as_array()
                     .is_some_and(Vec::is_empty)
+                || !review["recovery_signatures"]["pending_copy_exports"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
             {
                 return Err(invalid());
             }

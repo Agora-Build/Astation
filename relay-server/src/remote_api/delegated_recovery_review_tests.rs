@@ -803,6 +803,10 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
         "replacements":[{"original_record_id":original.record_id(),"record":copy}]});
     let plan_id = initial["plan_id"].as_str().unwrap();
     assert_eq!(retain_http(&app, &genesis, plan_id, Some("alice"), copies.to_string().into_bytes()).await.0, StatusCode::OK);
+    let retained_copy = plan::prepare(&replica, &binding, &genesis).await.unwrap();
+    assert_eq!(retained_copy["recovery_signatures"]["pending_copy_exports"], json!([{
+        "original_record_id": original.record_id(), "copy_record_id": replacement.record_id
+    }]));
     let mut newly_discovered = replacement.clone();
     newly_discovered.record_id = uuid::Uuid::new_v4().to_string();
     newly_discovered.issued_at += 1;
@@ -865,6 +869,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let mapped = &confirmed["recovery_signatures"]["records"][0];
     assert_eq!(mapped["current_review"], false);
     assert_eq!(mapped["exported_at_cut"], true);
+    assert_eq!(confirmed["recovery_signatures"]["pending_copy_exports"], json!([]));
     let staged = plan::snapshot_stops::stage(&resumed, &binding, &genesis,
         confirmed["reconstruction_hash"].as_str().unwrap()).await.unwrap();
     assert_eq!(staged["stop_count"], 1);
@@ -940,6 +945,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let latest = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(&latest["evidence_hash"], hash);
     assert_eq!(latest["recovery_signatures"]["records"][0]["exported_at_cut"], false);
+    assert_eq!(latest["recovery_signatures"]["pending_copy_exports"][0]["original_record_id"], original.record_id());
     assert!(plan::snapshot_stops::stage(&resumed, &binding, &genesis,
         latest["reconstruction_hash"].as_str().unwrap()).await.is_err());
     roster["evidence_hash"] = latest["evidence_hash"].clone();
