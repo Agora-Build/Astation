@@ -289,8 +289,15 @@ pub(super) async fn observe(
         .collect();
     // Portal identifies the Agora.Build owner but does not identify an R9
     // genesis for a service. Keep these out of this list's signing inputs.
-    let unattributed: Vec<_> = portal_keys
-        .difference(&attributed_keys)
+    let unmatched_portal: BTreeSet<_> = portal_keys.difference(&attributed_keys).cloned().collect();
+    let other_lists = match vault {
+        Some(vault) if !unmatched_portal.is_empty() => {
+            other_list_memberships(connection, portal, subject, owner, &genesis, vault, &unmatched_portal).await?
+        }
+        _ => BTreeMap::new(),
+    };
+    let unattributed: Vec<_> = unmatched_portal.iter()
+        .filter(|identity| !other_lists.contains_key(*identity))
         .map(|(id, key)| {
             json!({"service_id":id,"key_fingerprint":key,
             "portal_observation":observation(id,key)})
@@ -303,6 +310,9 @@ pub(super) async fn observe(
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
         "provisioning_without_fingerprint":pending,
         "portal_keys_without_attribution":unattributed,"services":rows});
+    if !other_lists.is_empty() {
+        evidence["portal_keys_at_other_lists"] = json!(other_lists.into_values().collect::<Vec<_>>());
+    }
     if vault.is_some() {
         evidence["protected_service_keys"] = json!(protected);
     }
@@ -334,6 +344,82 @@ pub(super) async fn observe(
         .into();
     }
     Ok(evidence)
+}
+
+/// A Portal fingerprint is account-wide. Attribute it elsewhere only when the
+/// unique provisioning row, protected key and the owner's signed list agree.
+async fn other_list_memberships(
+    db: &mut PgConnection,
+    portal: &FeedBinding,
+    subject: &str,
+    owner: &str,
+    current_genesis: &str,
+    vault: &ServiceKeyVault,
+    unmatched: &BTreeSet<(String, String)>,
+) -> Result<BTreeMap<(String, String), Value>, sqlx::Error> {
+    let ids: Vec<_> = unmatched
+        .iter()
+        .filter_map(|(id, _)| id.strip_prefix("svc-"))
+        .collect();
+    let scope =
+        json!({"issuer":portal.issuer,"station_origin":portal.station_origin,"owner":owner});
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT p.integration_id,p.context,p.fingerprint,k.sealed
+         FROM station_integration_provisioning p JOIN station_service_keys k ON k.context=($5 || p.context || ']')
+         WHERE p.binding=$1 AND p.integration_id=ANY($2) AND p.context::jsonb @> $3
+          AND p.context::jsonb->>'genesis'<>$4 AND length(p.fingerprint)=64
+          AND octet_length(p.context)<=4096 AND octet_length(k.sealed)<=8192 FOR SHARE OF p,k NOWAIT",
+    ).bind(portal.storage_key().map_err(|_| invalid())?).bind(ids).bind(scope).bind(current_genesis)
+        .bind(format!(r#"["{SERVICE_KEY_CONTEXT}","#)).fetch_all(&mut *db).await?;
+    let mut by_list = BTreeMap::<String, Vec<(String, String)>>::new();
+    for (id, stored, fingerprint, sealed) in rows {
+        let Ok(context) = serde_json::from_str::<ServiceKeyContext>(&stored) else {
+            continue;
+        };
+        let identity = (format!("svc-{id}"), fingerprint);
+        if context.integration_id == id
+            && context.service_id == identity.0
+            && unmatched.contains(&identity)
+            && serde_json::to_string(&context).map_err(|_| invalid())? == stored
+            && vault.retained_fingerprint(&context, &sealed).as_ref() == Ok(&identity.1)
+        {
+            by_list.entry(context.genesis).or_default().push(identity);
+        }
+    }
+    let mut verified = BTreeMap::new();
+    for (genesis, identities) in by_list {
+        let root: Option<(String, Value)> = sqlx::query_as(
+            "SELECT state->>'account',state->'membership' FROM remote_recovery_roots
+             WHERE genesis_hash=$1 AND account_subject=$2 AND octet_length(state::text)<=$3
+              AND state->>'account' IS NOT NULL AND state ? 'membership' FOR SHARE NOWAIT",
+        )
+        .bind(&genesis)
+        .bind(subject)
+        .bind(super::MAX_STATE as i64)
+        .fetch_optional(&mut *db)
+        .await?;
+        let Some((account, membership)) = root else {
+            continue;
+        };
+        let hash = atem_client::Hash32::from_hex(&genesis).map_err(|_| invalid())?;
+        let Ok(log) = Membership::from_stored(&account, &hash, &membership) else {
+            continue;
+        };
+        if log.frozen().is_some() {
+            continue;
+        }
+        for (id, key) in identities {
+            if log.member(&id).is_some_and(|m| {
+                matches!(m.status, MemberStatus::Active | MemberStatus::Removed)
+                    && m.member.service_key_fingerprint().as_ref() == Some(&key)
+            }) {
+                let proof = json!({"service_id":id,"key_fingerprint":key,"genesis_hash":genesis,
+                    "membership_head":log.head().to_json()});
+                verified.insert((id, key), proof);
+            }
+        }
+    }
+    Ok(verified)
 }
 
 #[derive(Clone, Copy, Default)]

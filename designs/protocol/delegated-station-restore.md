@@ -1092,6 +1092,13 @@ publication. If the Portal alone identifies a
 key for this Agora.Build owner, `portal_keys_without_attribution` preserves its
 lifecycle observation. The owner can have several R9 lists, so this evidence
 requires reconciliation before the Station can attribute the key to this list.
+For an owner with multiple lists, `portal_keys_at_other_lists` records a
+matching integration enrolled on another list. Station checks the provisioning
+record for this reporting binding, authenticates the protected key in its
+original context, and verifies the service fingerprint against that owner's
+signed membership at the other genesis. The evidence names that genesis and
+membership head. Its recovery handles the service's controls. If any of those
+checks fails, the integration stays in `portal_keys_without_attribution`.
 Rows owned by other Agora.Build accounts are excluded.
 These are obligations for review. Signing and publication still require a
 current coverage decision, protected key access, complete participants and

@@ -632,6 +632,172 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
 
 #[tokio::test]
 #[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_restore_attributes_a_portal_service_to_its_owners_other_list() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::remote_api::push_ingress::tests::Fixture;
+    use atem_client::membership::Head;
+
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+        .execute(&external.pool)
+        .await
+        .unwrap();
+    let (db, runtime, enrolled) =
+        fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let other = Fixture::new(enrolled.created - 5000);
+    let genesis = other.log.genesis_hash().to_hex();
+    let enrolled_genesis = enrolled.log.genesis_hash().to_hex();
+    let recovery = &runtime.app.recovery;
+    for entry in other.log.entries() {
+        assert_eq!(
+            recovery
+                .append_test_entry(
+                    &genesis,
+                    PRINCIPAL,
+                    entry.clone(),
+                    Head {
+                        seq: entry.seq - 1,
+                        hash: entry.prev_hash
+                    }
+                )
+                .await,
+            StatusCode::OK
+        );
+    }
+    let draft = runtime
+        .prepare(ID, OWNER, request(&enrolled))
+        .await
+        .unwrap();
+    let fingerprint = draft["fingerprint"].as_str().unwrap();
+    let before_enrollment: Value =
+        sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+            .bind(&enrolled_genesis)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    append_body(
+        &runtime,
+        &enrolled,
+        serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap(),
+    )
+    .await;
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-27T10:00:00.000Z","integrations":[{
+        "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":fingerprint,
+        "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    }]}});
+    let cut =
+        PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let next = previous
+        .apply_checkpoint(cut, previous.received_at)
+        .unwrap();
+    let fence = Binding::new(&runtime.binding.station_origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    runtime
+        .policies
+        .commit_for_recovery(&previous, &next, Some(&fence))
+        .await
+        .unwrap();
+    let replica = db.reconnect(2).await;
+    let prepare = |pool| {
+        plan::prepare_with_sources(
+            pool,
+            &fence,
+            &genesis,
+            recovery.signing_ceilings.get(),
+            Some(&runtime.binding),
+            Some(&runtime.vault),
+        )
+    };
+    let first = prepare(&db.pool).await.unwrap();
+    let evidence = &first["portal_service_evidence"];
+    assert_eq!(evidence["portal_keys_without_attribution"], json!([]));
+    assert_eq!(
+        evidence["portal_keys_at_other_lists"][0]["genesis_hash"],
+        enrolled_genesis
+    );
+    assert_eq!(
+        evidence["portal_keys_at_other_lists"][0]["key_fingerprint"],
+        fingerprint
+    );
+    assert_eq!(evidence["services"], json!([]));
+    assert_eq!(first["candidate_snapshot"]["record_count"], 0);
+    assert_eq!(first["snapshot_complete"], false);
+    assert_eq!(
+        prepare(&replica).await.unwrap()["portal_service_evidence_hash"],
+        first["portal_service_evidence_hash"]
+    );
+    let owning_review = plan::prepare_with_sources(
+        &replica,
+        &fence,
+        &enrolled_genesis,
+        recovery.signing_ceilings.get(),
+        Some(&runtime.binding),
+        Some(&runtime.vault),
+    )
+    .await
+    .unwrap();
+    let owning_service = &owning_review["portal_service_evidence"]["services"][0];
+    assert_eq!(owning_service["key_fingerprint"], fingerprint);
+    assert_eq!(
+        owning_service["snapshot_review"]["fresh_stop_actions"],
+        json!([{"action":"revoke","interrupt_running":true}])
+    );
+
+    let unresolved = |review: &Value| {
+        assert_eq!(
+            review["portal_service_evidence"]["portal_keys_without_attribution"][0]
+                ["key_fingerprint"],
+            fingerprint
+        );
+        assert_eq!(
+            review["candidate_snapshot"]["status"],
+            "provisioning_unresolved"
+        );
+        assert!(review["portal_service_evidence"]
+            .get("portal_keys_at_other_lists")
+            .is_none());
+    };
+    sqlx::query(
+        "UPDATE remote_recovery_roots SET account_subject='another-owner' WHERE genesis_hash=$1",
+    )
+    .bind(&enrolled_genesis)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    unresolved(&prepare(&replica).await.unwrap());
+    sqlx::query("UPDATE remote_recovery_roots SET account_subject=$2 WHERE genesis_hash=$1")
+        .bind(&enrolled_genesis)
+        .bind(PRINCIPAL)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&enrolled_genesis)
+        .bind(&before_enrollment)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    unresolved(&prepare(&replica).await.unwrap());
+    append_body(
+        &runtime,
+        &enrolled,
+        serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap(),
+    )
+    .await;
+    sqlx::query("UPDATE station_service_keys SET sealed='{}'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    unresolved(&prepare(&replica).await.unwrap());
+    replica.close().await;
+    drop(runtime);
+    db.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
 async fn postgres_delegated_restore_finds_revoked_service_missing_from_membership() {
     use crate::integration_checkpoint::PortalCheckpoint;
 
