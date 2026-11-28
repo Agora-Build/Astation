@@ -287,7 +287,10 @@ public final class RemoteControlRecoveryPublication {
             (try? Self.body($0.bodyJSON).recordId) == old.recordId
         }), saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
         try draftJournal(log, managerID).withPermittedStopChange(bodyJSON: operation.bodyJSON) {
-            try commit { $0.operations.append(operation) }
+            try commit {
+                if replacingRecordID != nil { $0.version = 3 }
+                $0.operations.append(operation)
+            }
         }
         return review
     }
@@ -464,7 +467,7 @@ public final class RemoteControlRecoveryPublication {
     }
     private func commit<T>(_ change: (inout Checkpoint) throws -> T) throws -> T {
         var next = saved
-        next.version = 3
+        next.version = max(next.version, 2)
         let result = try change(&next)
         let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
         let bytes = try encoder.encode(next)
