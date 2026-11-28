@@ -153,9 +153,11 @@ A newly exported signed record changes the evidence hash. All authors then
 confirm the new round. A still-valid outstanding report for the previous round
 can arrive after another author exports a new record. Station retains the late
 response under its original challenge. A change to the checkpoint, imports or
-native archives requires a new challenge even for retention. The Mac keeps the held journal revision while renewing
-its challenge and durably advances its local checkpoint before exposing the new
-signature. Each request is bounded to 256 KiB
+native archives requires a new challenge even for retention. The Mac keeps the
+record and draft sets frozen. A renewed report keeps its revision until another
+SDK process attaches. The next signature covers that attachment and requires
+fresh review if the owner was already confirming an older revision. An exact
+retry sends the saved signed bytes. Each request is bounded to 256 KiB
 and the Station retains up to 256 submissions per plan.
 
 A successful response contains `plan_id`, `retained_only: true` and
@@ -181,11 +183,15 @@ plan. `known_authors.prior_plans` lists the authors and reports from each earlie
 retained membership head. An old report describes only its original plan.
 
 The operator review lists `known_authors.journal_gaps` when a previously
-observed member journal has no current report, its highest current revision
-falls below a prior plan's observation, or its signed creation sequence
-changes. The review also flags different signed record or draft sets at the
-same journal revision, and changes to either frozen set within one plan. These
-conflicts survive later confirmations, process replacement and plan abandonment.
+observed member journal has no current report, a signed revision falls below
+one observed in an earlier generation, or its signed creation sequence changes.
+`revision_regression` identifies the first affected generation, its lowest
+reported revision and the highest revision in earlier generations. Reports
+within one generation can arrive in any order. The discrepancy stays visible
+after the journal catches up. The review also flags different signed record
+or draft sets at the same journal revision, and changes to either frozen set
+within one plan. These conflicts survive later confirmations, process
+replacement and plan abandonment.
 A later plan's report from the same journal must still export every previously
 reported signed stop for this origin. If any are missing, `previous_export_missing`
 lists their IDs in `missing_record_ids`, even when the newer report has a higher

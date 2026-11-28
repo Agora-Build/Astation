@@ -990,6 +990,28 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     assert_eq!(gap["missing_record_ids"], json!([body.record_id]));
     assert!(checked["known_history"]["records"].as_array().unwrap().iter()
         .any(|row| row["record_id"] == body.record_id));
+    // A second authentic report from this generation goes below generation one's
+    // revision 2. The already retained revision 3 cannot reconcile that rollback.
+    let mut mint = mint;
+    mint["recovery"]["evidence_hash"] = checked["evidence_hash"].clone();
+    let (status, raw) = post_recovery(&peer, &format!("{base}/signer-challenges"), Some("alice"),
+        mint.to_string().into_bytes()).await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = SignerReportChallenge::parse(raw.to_string().as_bytes()).unwrap();
+    let rolled_back = JournalView { revision: 1, ..journal };
+    let request = signer_report_body(&demoted, &challenge, signer, slot, ORIGIN,
+        &rolled_back, challenge.issued_at()).unwrap();
+    let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &request).unwrap();
+    let payload = json!({"report":signed.to_json(),"records":records});
+    assert_eq!(post_recovery(&peer, &path, Some("alice"), payload.to_string().into_bytes()).await.0,
+        StatusCode::OK);
+    let inspected = plan::prepare(&database.pool, &next, &genesis).await.unwrap();
+    let gap = &inspected["known_authors"]["journal_gaps"][0];
+    assert_eq!(gap["reasons"], json!(["previous_export_missing","revision_below_prior_plan"]));
+    assert_eq!(gap["revision_regression"], json!({
+        "generation":2, "lowest_revision":1, "highest_earlier_revision":2
+    }));
+    assert_eq!(plan::prepare(&replica, &next, &genesis).await.unwrap(), inspected);
     sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0")
         .execute(&database.pool)
         .await
