@@ -1077,6 +1077,14 @@ For an explicitly undated legacy revocation, Station can use the first
 It retains that event across restarts. An interrupt, a repeated revoke or the
 current state attached to an older event cannot supply a missing first event.
 
+When the original time is unknown at intake, Station starts the reporting
+deadline at the signed revoke's issue time. When Portal later supplies the
+original time for the same service and key, Station can lower the stored start
+and emit an overdue final. An existing final keeps its report ID, host set and
+delivery history. The correction uses the signed membership's public key and
+survives removal of the private service key. A pending interrupt goes through
+the normal signing path after the bookkeeping transaction commits.
+
 A signed membership removal ends the cover requirement. A verified revoke for
 the service and its key also ends it once Station stages that revoke in the
 replacement snapshot. The review reports the reason in `coverage_end` and
