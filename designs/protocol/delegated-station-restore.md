@@ -293,8 +293,10 @@ both the old configuration and the old database.
 
 Migration `0015` stores the highest generation and a ready/fenced state per
 Station origin. At initial generation `1`, Station checks for retained feeds,
-delegated reporting journals, verifier rosters, recovery-stamped Portal
-checkpoints and positive reservations in the configured signing database.
+live or archived reporting journals, recovery plans, verifier rosters,
+recovery-stamped Portal checkpoints and positive signing reservations.
+An earlier origin's recorded positive reservation still counts if the
+independent signing store has since lost that row.
 A regular Portal checkpoint or unused service-key registration can precede
 first activation. Existing delegated history with no recovery row,
 a missing row at any later generation, or an increased generation closes a
