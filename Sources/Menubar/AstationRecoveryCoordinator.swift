@@ -2448,6 +2448,8 @@ extension AstationRecoveryCoordinator {
                 replacing = prior.body.recordId
             }
             guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+            try requireManager(log)
+            try requireDelegatedControl(log)
             try requireDurableRecoveryCheckpoint()
             if replacing == nil { return prior }
         }
@@ -2488,6 +2490,8 @@ extension AstationRecoveryCoordinator {
         try requireDurableRecoveryCheckpoint()
         try await authority.revalidate(retained, log: before)
         guard current(), !Task.isCancelled, membershipLog?.head() == before.head() else { throw RemoteChannelError.staleLink }
+        try requireManager(before)
+        try requireDelegatedControl(before)
         try requireDurableRecoveryCheckpoint()
         var confirmedAt: UInt64 = 0
         if !retained.signed {
@@ -2504,6 +2508,8 @@ extension AstationRecoveryCoordinator {
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
         try await authority.revalidate(retained, log: latest)
         guard current(), !Task.isCancelled, membershipLog?.head() == latest.head() else { throw RemoteChannelError.staleLink }
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
         try requireDurableRecoveryCheckpoint()
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
