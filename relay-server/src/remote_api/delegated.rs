@@ -726,12 +726,17 @@ impl super::RecoveryStore {
             return Err(());
         }
         let required_floor = previously_signed.max(u64::try_from(floor).map_err(|_| ())?);
+        let revoked_at = if matches!(desired, ServiceDesired::Revoked { .. }) {
+            checkpoint.known_revocation_ms(&context.integration_id)?.unwrap_or(clock.wall_ms)
+        } else {
+            clock.wall_ms
+        };
         for record in signer.sign_control_batch(store, &bodies, required_floor, policy_allows_signing).await? {
             feed.publish(
                 origin,
                 &log,
                 &record,
-                clock.wall_ms,
+                revoked_at,
                 &covered,
                 clock.wall_ms,
             )

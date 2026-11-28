@@ -841,6 +841,49 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_revocation_uses_portal_time_after_station_downtime() {
+        use super::super::tests::{append_body, fixture, request};
+        let (database, runtime, f) = fixture().await;
+        let genesis = f.log.genesis_hash().to_hex();
+        runtime.app.recovery.configure_delegated(&runtime.binding.station_origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        let fingerprint = draft["fingerprint"].as_str().unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        policy(&runtime, "ready", fingerprint, None).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        // The ordinary feed carries the stop. The authenticated checkpoint dates it.
+        policy(&runtime, "revoking", fingerprint, Some(false)).await;
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let revoked_at = chrono::Utc::now() - chrono::Duration::hours(25);
+        let mut row = serde_json::to_value(&previous.integrations[ID]).unwrap();
+        row["id"] = json!(ID);
+        row["revokedAt"] = json!(revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
+            "at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "integrations":[row]}});
+        let snapshot = crate::integration_checkpoint::PortalCheckpoint::parse(
+            source.to_string().as_bytes(), &runtime.binding).unwrap();
+        let next = previous.apply_checkpoint(snapshot, chrono::Utc::now().timestamp()).unwrap();
+        assert_eq!(previous.known_revocation_ms(ID), Ok(None));
+        let mut other_key = next.clone();
+        other_key.integrations.get_mut(ID).unwrap().r9_svc = Some("b".repeat(64));
+        assert_eq!(other_key.known_revocation_ms(ID), Ok(None));
+        let mut legacy = next.clone();
+        legacy.portal_snapshot.as_mut().unwrap().integrations.get_mut(ID).unwrap().revoked_at = None;
+        assert_eq!(legacy.known_revocation_ms(ID), Ok(None));
+        runtime.policies.commit(&previous, &next).await.unwrap();
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        let revocation: Value = sqlx::query_scalar(
+            "SELECT state->'delegated'->$2->'ledger'->'revocations'->$3 FROM remote_recovery_roots WHERE genesis_hash=$1",
+        ).bind(&genesis).bind(&runtime.binding.station_origin).bind(format!("service:svc-{ID}"))
+            .fetch_one(&database.pool).await.unwrap();
+        assert_eq!(revocation["revoked_at_ms"], revoked_at.timestamp_millis());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_service_lifecycle_signs_once_and_retains_key_until_r9_removal() {
         use super::super::tests::{append_body, fixture, request, signed_action};
         use atem_client::{

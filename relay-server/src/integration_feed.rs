@@ -610,6 +610,31 @@ impl PolicyCheckpoint {
             && now.checked_sub(self.received_at).is_some_and(|age| (0..MAX_POLICY_AGE_SECS).contains(&age))
     }
 
+    /// A terminal checkpoint preserves the original Portal revocation time across
+    /// later feed changes, including an interrupt requested after revocation.
+    pub(crate) fn known_revocation_ms(&self, id: &str) -> Result<Option<u64>, ()> {
+        let Some(snapshot) = &self.portal_snapshot else {
+            return Ok(None);
+        };
+        if snapshot.binding != self.binding {
+            return Err(());
+        }
+        let Some(row) = snapshot.integrations.get(id) else {
+            return Ok(None);
+        };
+        let current = self.integrations.get(id).ok_or(())?;
+        if !matches!(row.policy.state.as_str(), "revoking" | "revoked")
+            || !matches!(current.state.as_str(), "revoking" | "revoked")
+            || !row.policy.same_verifier(current)
+        {
+            return Ok(None);
+        }
+        row.revoked_at.as_deref().map(|at| {
+            let time = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| ())?;
+            u64::try_from(time.timestamp_millis()).map_err(|_| ())
+        }).transpose()
+    }
+
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         if !self.policy_current(now) {
             return Err(());
