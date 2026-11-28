@@ -1,5 +1,6 @@
 //! Prepare the Station's own unsigned records while its recovery fence is closed.
 use super::{invalid, source_hash, Binding, Prepared};
+use crate::service_signing_ceilings::SigningMark;
 use atem_client::{
     control::{
         ControlAbout, ControlAction, ControlBody, ControlFeed, ControlPrincipal, ControlSigner,
@@ -101,15 +102,16 @@ fn batches(review: &Value) -> Result<DraftBatches<'_>, sqlx::Error> {
             unresolved.push(problem("signing_reservation_missing"));
             continue;
         };
-        let mark = &marks[format!("service:{service}")];
-        if mark["key_fingerprint"] != key || mark["highest_reserved_ms"].as_u64() != Some(ceiling) {
+        let mark = serde_json::from_value::<SigningMark>(marks[format!("service:{service}")].clone()).ok();
+        let Some(mark) = mark.filter(|m| m.key_fingerprint == key
+            && m.highest_reserved_ms == ceiling && m.sign_above_ms >= ceiling) else {
             unresolved.push(problem("signing_mark_unavailable"));
             continue;
-        }
+        };
         ready.push(Batch {
             service,
             key: Hash32::from_hex(key).map_err(|_| invalid())?,
-            above: mark["sign_above_ms"].as_u64().ok_or_else(invalid)?,
+            above: mark.sign_above_ms,
             actions,
         });
     }

@@ -14,6 +14,16 @@ pub(crate) struct Reservation {
     pub highest_ms: i64,
 }
 
+/// The independent key ceiling and the possibly higher time observed for the
+/// principal (including a manager's stop). Both belong to the reviewed cut.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SigningMark {
+    pub key_fingerprint: String,
+    pub highest_reserved_ms: u64,
+    pub sign_above_ms: u64,
+}
+
 impl SigningCeilings {
     pub(crate) async fn from_env(primary: &PgPool) -> Result<Option<Self>, ()> {
         match std::env::var("STATION_SIGNING_CEILING_DATABASE_URL") {
@@ -123,6 +133,67 @@ impl SigningCeilings {
         Ok(())
     }
 
+    pub(crate) async fn live_mark(
+        &self,
+        account: &str,
+        genesis: &str,
+        service: &str,
+        key: &str,
+        required_key_floor: u64,
+        principal_floor: u64,
+    ) -> Result<SigningMark, ()> {
+        let ceiling: i64 = sqlx::query_scalar(
+            "SELECT highest_ms FROM station_service_signing_ceilings
+            WHERE account_id=$1 AND genesis_hash=$2 AND service_id=$3 AND key_hash=$4",
+        )
+        .bind(account)
+        .bind(genesis)
+        .bind(service)
+        .bind(key)
+        .fetch_one(&self.0)
+        .await
+        .map_err(|_| ())?;
+        let highest_reserved_ms = u64::try_from(ceiling).map_err(|_| ())?;
+        if highest_reserved_ms < required_key_floor {
+            return Err(());
+        }
+        Ok(SigningMark {
+            key_fingerprint: key.into(),
+            highest_reserved_ms,
+            sign_above_ms: highest_reserved_ms.max(principal_floor),
+        })
+    }
+
+    pub(crate) async fn reserve_reviewed(
+        &self,
+        account: &str,
+        genesis: &str,
+        service: &str,
+        mark: &SigningMark,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<(), ()> {
+        let (first, last) = range.into_inner();
+        if mark.sign_above_ms < mark.highest_reserved_ms
+            || first <= mark.sign_above_ms
+            || first > last
+            || last > atem_client::canonical::MAX_SAFE_INTEGER
+        {
+            return Err(());
+        }
+        // A different reservation, even one below the first draft time, changes
+        // the reviewed clock. An uncertain commit consumes the range.
+        let result = sqlx::query("UPDATE station_service_signing_ceilings SET highest_ms=$5
+            WHERE account_id=$1 AND genesis_hash=$2 AND service_id=$3 AND key_hash=$4 AND highest_ms=$6")
+            .bind(account).bind(genesis).bind(service).bind(&mark.key_fingerprint)
+            .bind(last as i64).bind(mark.highest_reserved_ms as i64)
+            .execute(&self.0).await.map_err(|_| ())?;
+        if result.rows_affected() != 1 {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn reserve(
         &self,
         account: &str,
@@ -132,22 +203,18 @@ impl SigningCeilings {
         previously_signed: u64,
         range: std::ops::RangeInclusive<u64>,
     ) -> Result<(), ()> {
-        let (first, last) = range.into_inner();
-        if first <= previously_signed
-            || first > last
-            || last > atem_client::canonical::MAX_SAFE_INTEGER
-        {
-            return Err(());
-        }
-        // An uncertain commit burns the range. Only a successful reply permits signing.
-        let result = sqlx::query("UPDATE station_service_signing_ceilings SET highest_ms=$6
-            WHERE account_id=$1 AND genesis_hash=$2 AND service_id=$3 AND key_hash=$4 AND highest_ms<$5 AND highest_ms >= $7")
-            .bind(account).bind(genesis).bind(service).bind(key).bind(first as i64).bind(last as i64).bind(previously_signed as i64)
-            .execute(&self.0).await.map_err(|_| ())?;
-        if result.rows_affected() != 1 {
-            return Err(());
-        }
-        Ok(())
+        let mark = self
+            .live_mark(
+                account,
+                genesis,
+                service,
+                key,
+                previously_signed,
+                previously_signed,
+            )
+            .await?;
+        self.reserve_reviewed(account, genesis, service, &mark, range)
+            .await
     }
 
     pub(crate) fn recovery_evidence(
@@ -216,12 +283,16 @@ impl SigningCeilings {
                 continue;
             }
             let principal = format!("service:{service}");
-            let mut mark = u64::try_from(*ceiling).map_err(|_| ())?;
+            let highest_reserved_ms = u64::try_from(*ceiling).map_err(|_| ())?;
+            let mut mark = highest_reserved_ms;
             for value in [retained.get(&principal), copies.get(&principal)].into_iter().flatten() {
                 mark = mark.max(value.as_u64().ok_or(())?);
             }
-            marks.insert(principal, serde_json::json!({"key_fingerprint":key,
-                "highest_reserved_ms":ceiling, "sign_above_ms":mark}));
+            marks.insert(principal, SigningMark {
+                key_fingerprint: key.to_string(),
+                highest_reserved_ms,
+                sign_above_ms: mark,
+            });
         }
         // Preserve even registrations absent from restored membership. The
         // publisher must reread these observations under the recovery fence.

@@ -966,3 +966,92 @@ async fn postgres_delegated_service_drafts_retry_without_signing_or_reopening() 
     primary.cleanup().await;
     external.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_candidate_service_signatures_bind_the_reviewed_clock_and_feed() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::service_keys::load_approved;
+    use crate::service_signing_ceilings::SigningMark;
+    use atem_client::control::{
+        check_snapshot_consistency, ControlBody, SnapshotConsistency, SnapshotInput,
+    };
+
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql")).execute(&external.pool).await.unwrap();
+    let (primary, runtime, fixture) = fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    let enrollment = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(&runtime, &fixture, serde_json::from_str(enrollment["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    let key = enrollment["fingerprint"].as_str().unwrap();
+    let context = runtime.context(ID).await.unwrap();
+    let log = runtime.recovery_log(&genesis, OWNER).await.unwrap();
+    let signer = load_approved(&primary.pool, &runtime.vault, &context, key).await.unwrap();
+    let clock = recovery.signing_ceilings.get().unwrap();
+    let replica = SigningCeilings::connect(&primary.pool, (*external.pool.connect_options()).clone()).await.unwrap();
+    assert_eq!(recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0, StatusCode::OK);
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-27T10:00:00.000Z",
+        "integrations":[{"id":ID,"ownerAccount":OWNER,"state":"paused","scopes":["agent.view"],"r9Svc":key,
+        "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10}]}});
+    let policy = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let next = previous.apply_checkpoint(policy, previous.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&previous, &next, Some(&fence)).await.unwrap();
+
+    let principal = format!("service:{}", context.service_id);
+    let prepare = async || {
+        let review = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(clock),
+            Some(&runtime.binding), Some(&runtime.vault)).await.unwrap();
+        assert_eq!(review["service_drafts"]["status"], "prepared");
+        let bodies: Vec<_> = review["service_drafts"]["unsigned_bodies"].as_array().unwrap().iter()
+            .map(|body| ControlBody::from_json(body).unwrap()).collect();
+        assert_eq!(bodies.len(), 2);
+        let mark: SigningMark = serde_json::from_value(review["service_clock_evidence"]["snapshot_signing_marks"][&principal].clone()).unwrap();
+        (review["candidate_feed_id"].as_str().unwrap().to_owned(), bodies, mark)
+    };
+    let (candidate, bodies, mark) = prepare().await;
+    let old_feed = uuid::Uuid::new_v4().to_string();
+    let mut mixed = bodies.clone();
+    mixed[1].feed.as_mut().unwrap().feed_id = old_feed.clone();
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &mixed, &mark, || true).await.is_err());
+    assert!(signer.sign_control_batch(clock, &log, &old_feed, &bodies, &mark, || true).await.is_err());
+    let mut wrong_key = mark.clone();
+    wrong_key.key_fingerprint = "a".repeat(64);
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &bodies, &wrong_key, || true).await.is_err());
+    let mut higher_native_stop = mark.clone();
+    higher_native_stop.sign_above_ms = bodies[0].issued_at;
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &bodies, &higher_native_stop, || true).await.is_err());
+    assert_eq!(replica.reservations(log.account_id(), &genesis).await.unwrap()[0].highest_ms, 0);
+
+    // An intervening reservation below both draft timestamps still invalidates the review.
+    replica.reserve(log.account_id(), &genesis, &context.service_id, key, 0, 1..=1).await.unwrap();
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &bodies, &mark, || true).await.is_err());
+    assert_eq!(replica.reservations(log.account_id(), &genesis).await.unwrap()[0].highest_ms, 1);
+    let (_, fresh, updated) = prepare().await;
+    let allowed = std::cell::Cell::new(true);
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &fresh, &updated,
+        || allowed.replace(false)).await.is_err());
+    let burned = fresh.last().unwrap().issued_at;
+    assert_eq!(replica.reservations(log.account_id(), &genesis).await.unwrap()[0].highest_ms as u64, burned);
+
+    let (_, fresh, updated) = prepare().await;
+    let records = signer.sign_control_batch(&replica, &log, &candidate, &fresh, &updated, || true).await.unwrap();
+    assert!(records[0].issued_at() > burned);
+    assert!(signer.sign_control_batch(clock, &log, &candidate, &fresh, &updated, || true).await.is_err());
+    let input = SnapshotInput {
+        list: &log, origin, candidate_feed_id: &candidate, retained: &[], snapshot: &records,
+        marks: &[(principal.clone(), updated.sign_above_ms)].into(), covered: &[principal].into(),
+    };
+    assert_eq!(check_snapshot_consistency(&input).unwrap(), SnapshotConsistency::Consistent);
+    assert!(feed(&runtime, &genesis).await.is_empty());
+    assert!(fence.lock(&mut *primary.pool.acquire().await.unwrap()).await.is_err());
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
