@@ -205,6 +205,99 @@ final class StationLocalProxyTests: XCTestCase {
         XCTAssertEqual(f.local, [challenge, refusal], "An old completion cannot revive a retired queue")
     }
 
+    func testDeliveredSuspensionRetriesUpstreamAndRequiresFreshNativeAndHostProof() async {
+        await checkSuspensionRetry(loseVerdict: false)
+    }
+
+    func testLostVerdictAfterTheFreshChallengeKeepsTheDirectGeneration() async {
+        await checkSuspensionRetry(loseVerdict: true)
+    }
+
+    private func checkSuspensionRetry(loseVerdict: Bool) async {
+        let f = Fixture()
+        f.completeRetryImmediately = true
+        await f.start(); f.authenticateNative()
+        let challenge = Data(#"{"type":"relay","op":"host_challenge","v":1,"room":"native","nonce":"first"}"#.utf8)
+        let proof = Data(#"{"type":"relay","op":"host_route","v":1,"proof":{"sig":"first"}}"#.utf8)
+        let refused = Data(#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended","text":"Account paused"}"#.utf8)
+        f.proxy.receiveStation(challenge)
+        await drain()
+        XCTAssertTrue(f.proxy.receiveHost(proof))
+        await drain()
+        f.holdLocalWrites = true
+        f.proxy.receiveStation(refused)
+        await drain()
+        XCTAssertEqual(f.local.last, refused)
+        XCTAssertEqual(f.proxy.phase, .refused)
+        XCTAssertTrue(f.retryIntervals.isEmpty)
+        f.proxy.start()
+        XCTAssertEqual(f.connections, 1)
+        f.holdLocalWrites = false
+        f.localCompletions.last?(nil)
+        await drain()
+        XCTAssertEqual(f.retryIntervals, [30])
+        XCTAssertEqual(f.connections, 2)
+        XCTAssertEqual(f.proxy.phase, .native)
+        let oldOK = Data(#"{"type":"relay","op":"host_route_ok","v":1}"#.utf8)
+        f.socket.reader?(.success(.string(String(decoding: oldOK, as: UTF8.self))))
+        await drain()
+        XCTAssertEqual(f.proxy.phase, .native)
+        XCTAssertFalse(f.proxy.receiveHost(Data(#"{"type":"channel","event":"frame","channel":"native_1","frame":{}}"#.utf8)))
+        f.authenticateNative()
+        let fresh = Data(#"{"type":"relay","op":"host_challenge","v":1,"room":"native","nonce":"second"}"#.utf8)
+        f.proxy.receiveStation(fresh)
+        await drain()
+        XCTAssertEqual(f.local.last, fresh)
+        XCTAssertEqual(f.retryChallenges, [fresh])
+        XCTAssertTrue(f.reconnected.sent.isEmpty)
+        f.proxy.receiveStation(oldOK)
+        XCTAssertEqual(f.proxy.phase, .proof)
+        let nextProof = Data(#"{"type":"relay","op":"host_route","v":1,"proof":{"sig":"second"}}"#.utf8)
+        XCTAssertTrue(f.proxy.receiveHost(nextProof))
+        await drain()
+        XCTAssertEqual(f.reconnected.sent, [nextProof])
+        if loseVerdict {
+            f.reconnected.reader?(.failure(URLError(.networkConnectionLost)))
+            await drain()
+            XCTAssertEqual(f.proxy.phase, .refused)
+            XCTAssertEqual(f.retryIntervals, [30])
+            XCTAssertEqual(f.connections, 2)
+            XCTAssertFalse(f.proxy.receiveHost(Data(#"{"type":"channel","event":"frame","channel":"native_1","frame":{}}"#.utf8)))
+        } else {
+            f.proxy.receiveStation(oldOK)
+            await drain()
+            XCTAssertEqual(f.proxy.phase, .ready)
+        }
+        f.proxy.close()
+    }
+
+    func testSuspensionRetryRequiresAProofValidNoticeAndSuccessfulCurrentLocalWrite() async {
+        for (prove, reason, writeFailed, current) in [
+            (false, "Paused", false, true), (true, "  ", false, true),
+            (true, "Paused", true, true), (true, "Paused", false, false)
+        ] {
+            let f = Fixture()
+            f.completeRetryImmediately = true
+            await f.start(); f.authenticateNative()
+            f.proxy.receiveStation(Data(#"{"type":"relay","op":"host_challenge","v":1,"room":"native"}"#.utf8))
+            await drain()
+            if prove {
+                XCTAssertTrue(f.proxy.receiveHost(Data(#"{"type":"relay","op":"host_route","v":1}"#.utf8)))
+                await drain()
+            }
+            f.holdLocalWrites = true
+            let refusal = Data(#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended","text":"\#(reason)"}"#.utf8)
+            f.proxy.receiveStation(refusal)
+            f.current = current
+            f.localCompletions.last?(writeFailed ? URLError(.networkConnectionLost) : nil)
+            await drain()
+            XCTAssertEqual(f.proxy.phase, .refused)
+            XCTAssertTrue(f.retryIntervals.isEmpty)
+            XCTAssertEqual(f.connections, 1)
+            f.proxy.close()
+        }
+    }
+
     func testFullLocalQueueStillClosesChannelWhenItsCloseCannotBeForwarded() async throws {
         let f = Fixture()
         await f.ready()
@@ -251,16 +344,31 @@ final class StationLocalProxyTests: XCTestCase {
     @MainActor private final class Fixture {
         var current = true
         let socket = ProxySocket()
+        let reconnected = ProxySocket()
+        var connections = 0
+        var retryIntervals: [TimeInterval] = []
+        var retryChallenges: [Data] = []
+        var completeRetryImmediately = false
         var local: [Data] = []
         var holdLocalWrites = false
         var localCompletions: [(Error?) -> Void] = []
         lazy var proxy = StationLocalProxy(current: { [weak self] in self?.current == true },
-            connect: { [unowned self] in self.socket }, sign: { _ in #"{"type":"relayAuth"}"# },
-            writeLocal: { [unowned self] bytes, done in
+            connect: { [unowned self] in
+                self.connections += 1
+                return self.connections == 1 ? self.socket : self.reconnected
+            }, sign: { _ in #"{"type":"relayAuth"}"# },
+            writeLocal: { [unowned self] bytes, retryChallenge, done in
                 self.local.append(bytes)
+                if retryChallenge { self.retryChallenges.append(bytes) }
                 if self.holdLocalWrites { self.localCompletions.append(done) }
                 else { done(nil) }
-            }, closeLocal: { [unowned self] bytes in self.local.append(bytes) })
+            }, closeLocal: { [unowned self] bytes in self.local.append(bytes) },
+            waitBeforeRetry: { [weak self] seconds in
+                self?.retryIntervals.append(seconds)
+                if self?.completeRetryImmediately != true {
+                    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                }
+            })
 
         func start() async {
             proxy.start()
@@ -276,6 +384,8 @@ final class StationLocalProxyTests: XCTestCase {
         func ready() async {
             await start(); authenticateNative()
             proxy.receiveStation(Data(#"{"type":"relay","op":"host_challenge","v":1,"room":"native"}"#.utf8))
+            for _ in 0..<30 { await Task.yield() }
+            XCTAssertTrue(proxy.receiveHost(Data(#"{"type":"relay","op":"host_route","v":1,"proof":{"sig":"test"}}"#.utf8)))
             for _ in 0..<30 { await Task.yield() }
             proxy.receiveStation(Data(#"{"type":"relay","op":"host_route_ok","v":1}"#.utf8))
             for _ in 0..<30 { await Task.yield() }

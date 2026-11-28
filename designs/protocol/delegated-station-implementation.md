@@ -847,13 +847,21 @@ WebSocket receive and fragment-aggregation limits; control messages retain
 the shared 256 KiB / 64-record limits. A transport failure closes the proxy's
 virtual channels and retries with backoff. A closing channel remains tracked
 until the local write succeeds, so queue rejection still retires it. The local
-socket tracks at most 128 native and proxy channel handles together. Atem signs
-one challenge per local authentication generation: a subsequent Station challenge causes fresh local
-authentication on the same TCP socket, with old channels closed **before** the
-new authentication request and a new client generation. Both loopback and LAN
-reuse their existing authentication credentials; this requires no new pairing
-ceremony. An explicit host-proof refusal stops that proxy attempt and leaves
-ordinary local/LAN traffic usable. Early challenges are dropped, never buffered.
+socket tracks at most 128 native and proxy channel handles together.
+
+When the Station refuses a verified proxy proof with `service_suspended` (B-1),
+the Mac forwards the verdict to the local host. After the local write succeeds,
+it waits 30 seconds and opens a new forwarding connection to the selected
+Station. It authenticates that connection before forwarding its fresh
+challenge on the same local generation. Direct channels stay open. The host
+must verify the new route and finish its control sync before accepting delegated
+work. This path requires Atem's same-generation challenge hook for the joint check.
+
+If the fresh challenge has gone to the host and its verdict is lost, the Mac
+holds the forwarding attempt until the local authentication generation changes.
+An ordinary proof refusal also ends the attempt. On other upstream reconnects,
+the local server's existing authentication rules apply. A replacement local
+generation closes the previous channels before issuing its authentication request.
 
 Native forwarding additionally requires exact
 `ASTATION_LOCAL_STATION_PROXY=true`, a verified host advertising `host.delegated`,
