@@ -91,8 +91,9 @@ pub(crate) struct IntegrationPolicy {
     pub interrupt_running: Option<bool>,
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub held: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revoked_at: Option<String>,
+    // Missing on older feeds. An explicit null identifies a pre-migration revoke.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<Option<String>>,
 }
 
 impl IntegrationPolicy {
@@ -135,7 +136,8 @@ impl IntegrationPolicy {
     pub(crate) fn validate(&self) -> Result<(), ()> {
         let stopped = matches!(self.state.as_str(), "revoking" | "revoked");
         if (stopped && self.held.is_some()) || (self.state == "paused" && self.held == Some(false))
-            || self.revoked_at.as_deref().is_some_and(|at| !stopped || !crate::integration_checkpoint::timestamp(at))
+            || (!stopped && self.revoked_at.is_some())
+            || self.recorded_revocation().is_some_and(|at| !crate::integration_checkpoint::timestamp(at))
         {
             return Err(());
         }
@@ -192,15 +194,21 @@ impl IntegrationPolicy {
             .map_err(|_| ())
     }
 
+    fn recorded_revocation(&self) -> Option<&str> {
+        self.revoked_at.as_ref().and_then(Option::as_deref)
+    }
+
     fn retain_revocation_time(&mut self, prior: &Self) -> Result<(), ()> {
         if self.owner_account != prior.owner_account { return Err(()); }
-        if let Some(at) = &prior.revoked_at {
+        if prior.revoked_at.is_some() {
             if !self.preserves_observed_lifecycle(prior)
-                || self.revoked_at.as_ref().is_some_and(|next| next != at)
+                || matches!((self.recorded_revocation(), prior.recorded_revocation()), (Some(a), Some(b)) if a != b)
             {
                 return Err(());
             }
-            self.revoked_at = Some(at.clone());
+            if self.recorded_revocation().is_none() {
+                self.revoked_at = prior.revoked_at.clone();
+            }
         }
         Ok(())
     }
@@ -300,6 +308,9 @@ pub(crate) struct PolicyCheckpoint {
     verifier_grants: BTreeMap<String, u64>,
     pub denied: bool,
     pub integrations: BTreeMap<String, IntegrationPolicy>,
+    // Present only after observing an authenticated prefix starting at cursor zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_revocations: Option<BTreeMap<String, FirstRevocation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal_snapshot: Option<crate::integration_checkpoint::PortalCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +320,13 @@ pub(crate) struct PolicyCheckpoint {
     // Last ordinary page only. The shared journal retains every release at commit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binding_releases: Vec<PendingRelease>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FirstRevocation {
+    id: u64,
+    owner: String,
+    at: Option<String>,
 }
 
 impl PolicyCheckpoint {
@@ -323,6 +341,7 @@ impl PolicyCheckpoint {
             verifier_grants: BTreeMap::new(),
             denied: true,
             integrations: BTreeMap::new(),
+            first_revocations: None,
             portal_snapshot: None,
             portal_snapshot_revision: None,
             availability: None,
@@ -353,6 +372,7 @@ impl PolicyCheckpoint {
         next.portal_snapshot_revision = None;
         next.binding_releases.clear();
         if let Some(snapshot) = page.integrations {
+            next.first_revocations.get_or_insert_with(BTreeMap::new);
             next.integrations.clear();
             for mut row in snapshot {
                 if !client_id(&row.id, "i-") || next.integrations.contains_key(&row.id) {
@@ -398,6 +418,17 @@ impl PolicyCheckpoint {
             if let Some(id) = change.integration_id() {
                 if !client_id(id, "i-") {
                     return Err(());
+                }
+                if change.kind == "integration_revoked" {
+                    if let (Some(events), Some(policy)) = (&mut next.first_revocations, &change.integration) {
+                        let at = change.at.as_ref().and_then(serde_json::Value::as_str)
+                            .filter(|at| crate::integration_checkpoint::timestamp(at)).map(str::to_owned);
+                        let event = FirstRevocation { id: change.id, owner: policy.owner_account.clone(), at };
+                        let prior = events.entry(id.to_owned()).or_insert_with(|| event.clone());
+                        if event.owner != prior.owner || event.id < prior.id || event.id == prior.id && event != *prior {
+                            return Err(());
+                        }
+                    }
                 }
                 let continuous = change.integration.as_ref().zip(next.integrations.get(id))
                     .is_some_and(|(new, old)| new.same_verifier(old) && new.permits_external_verifier(now));
@@ -474,7 +505,7 @@ impl PolicyCheckpoint {
         for (id, old) in &self.integrations {
             match snapshot.integrations.get(id) {
                 Some(row) if !row.policy.preserves_observed_lifecycle(old)
-                    || old.revoked_at.is_some() && old.revoked_at != row.revoked_at => return Err(()),
+                    || old.recorded_revocation().is_some() && old.recorded_revocation() != row.revoked_at.as_deref() => return Err(()),
                 None if matches!(old.state.as_str(), "revoking" | "revoked") => return Err(()),
                 _ => {}
             }
@@ -672,14 +703,20 @@ impl PolicyCheckpoint {
         if self.portal_snapshot.as_ref().is_some_and(|cut| cut.binding != self.binding) {
             return Err(());
         }
-        let checkpoint_at = self.portal_snapshot.as_ref().and_then(|cut| cut.integrations.get(id))
-            .filter(|row| row.policy.same_verifier(current) && matches!(row.policy.state.as_str(), "revoking" | "revoked"))
-            .and_then(|row| row.revoked_at.as_deref());
-        let ordinary_at = current.revoked_at.as_deref();
+        let stopped_checkpoint = self.portal_snapshot.as_ref().and_then(|cut| cut.integrations.get(id))
+            .filter(|row| row.policy.same_verifier(current) && matches!(row.policy.state.as_str(), "revoking" | "revoked"));
+        let checkpoint_at = stopped_checkpoint.and_then(|row| row.revoked_at.as_deref());
+        let ordinary_at = current.recorded_revocation();
         if matches!((ordinary_at, checkpoint_at), (Some(a), Some(b)) if a != b) {
             return Err(());
         }
-        ordinary_at.or(checkpoint_at).map(|at| {
+        let first_event = || {
+            if current.revoked_at != Some(None) && stopped_checkpoint.is_none() { return None; }
+            let event = self.first_revocations.as_ref()?.get(id)?;
+            if event.owner != current.owner_account { return None; }
+            event.at.as_deref()
+        };
+        ordinary_at.or(checkpoint_at).or_else(first_event).map(|at| {
             let time = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| ())?;
             u64::try_from(time.timestamp_millis()).map_err(|_| ())
         }).transpose()
@@ -789,6 +826,13 @@ impl PolicyStore {
                         return Err(());
                     }
                     policy.validate()?;
+                }
+                if checkpoint.first_revocations.as_ref().is_some_and(|events| events.iter().any(|(id, event)| {
+                    !client_id(id, "i-") || !crate::integration_checkpoint::account_id(&event.owner)
+                        || !(1..=MAX_SAFE_INTEGER).contains(&event.id)
+                        || event.at.as_deref().is_some_and(|at| !crate::integration_checkpoint::timestamp(at))
+                })) {
+                    return Err(());
                 }
                 if let Some(snapshot) = &checkpoint.portal_snapshot {
                     snapshot.validate_for(binding)?;
@@ -969,6 +1013,41 @@ mod tests {
             let row: IntegrationPolicy = serde_json::from_value(value).unwrap();
             assert!(row.validate().is_err());
         }
+    }
+
+    #[test]
+    fn legacy_deadline_uses_only_the_first_revocation_witnessed_from_cursor_zero() {
+        let now = 1_800_000_000;
+        let stamp = "2026-11-20T00:00:00.000Z";
+        let later = "2026-11-23T00:00:00.000Z";
+        let millis = |at: &str| chrono::DateTime::parse_from_rfc3339(at).unwrap().timestamp_millis() as u64;
+        let mut row = policy("revoked");
+        row["id"] = json!(ID);
+        row["revokedAt"] = Value::Null;
+        row["interruptRunning"] = json!(true);
+        let apply = |state: &PolicyCheckpoint, id, kind, at: &str, projection: &Value| {
+            let mut raw = json!({"cursor":id,"changes":[{"id":id,"kind":kind,"at":at,
+                "integrationId":ID,"state":"revoked","integration":projection}]});
+            if state.cursor == 0 { raw["integrations"] = json!([projection]); }
+            state.apply(state.cursor, FeedPage::parse(&serde_json::to_vec(&raw).unwrap()).unwrap(), now).unwrap()
+        };
+        let origin = PolicyCheckpoint::empty(binding()).unwrap();
+        let snapshot = apply(&origin, 1, "integration_created", stamp, &row);
+        assert_eq!(snapshot.known_revocation_ms(ID), Ok(None), "the current projection alone cannot date a legacy revoke");
+        let first = apply(&snapshot, 2, "integration_revoked", stamp, &row);
+        let saved = PolicyStore::decode_checkpoint(&binding(), Some(serde_json::to_string(&first).unwrap())).unwrap();
+        for kind in ["integration_interrupt_requested", "integration_revoked"] {
+            let replay = apply(&saved, 3, kind, later, &row);
+            assert_eq!(replay.known_revocation_ms(ID), Ok(Some(millis(stamp))));
+        }
+        let mut old_bytes = serde_json::to_value(&first).unwrap();
+        old_bytes.as_object_mut().unwrap().remove("first_revocations");
+        let old: PolicyCheckpoint = serde_json::from_value(old_bytes).unwrap();
+        let late_only = apply(&old, 3, "integration_revoked", later, &row);
+        assert_eq!(late_only.known_revocation_ms(ID), Ok(None), "an upgraded reader cannot assume a recent revoke was the first");
+        row["revokedAt"] = json!("2026-11-19T00:00:00.000Z");
+        let dated = apply(&saved, 3, "integration_interrupt_requested", later, &row);
+        assert_eq!(dated.known_revocation_ms(ID), Ok(Some(millis("2026-11-19T00:00:00.000Z"))));
     }
 
     #[test]
