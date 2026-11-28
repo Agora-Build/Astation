@@ -1009,6 +1009,11 @@ by the observed checkpoint. Station matches the signed active member and key
 to the stored provisioning context for this issuer, Station, owner, and genesis.
 A paused service needs a new cover followed by a hold. An active service needs
 a new cover followed by a release so a host that kept the old hold can resume.
+Portal's authenticated `held` flag preserves this distinction after grant
+expiry. An explicit `true` carries the hold and an explicit `false` allows
+release subject to the ordinary owner and binding checks. Both leave expired
+API access denied. An older expired row without the flag leaves recovery at
+`pre_expiry_state_unresolved`.
 A release requires an ordinary Portal policy read less than 120 seconds old
 on both custom and built-in Stations. A recovery checkpoint preserves that
 read time. A future timestamp or an expired lease withholds the release.
@@ -1022,6 +1027,10 @@ requires the service's own revoke for reporting, and a later interrupt request
 requires an interrupt if the own-key stop did not already include one. After
 a Portal or native revoke, `fresh_stop_actions` lists only the missing stops,
 even when membership already removed the service.
+
+The ordinary integration feed, cursor-zero snapshot and recovery checkpoint
+can provide the original `revokedAt` for the first signed revoke. A later
+interrupt preserves that time. A legacy row may have no recorded time.
 
 A signed membership removal ends the cover requirement. A verified revoke for
 the service and its key also ends it once Station stages that revoke in the

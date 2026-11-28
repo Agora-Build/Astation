@@ -76,8 +76,12 @@ pub(super) async fn observe(
     };
     let observation = |id: &str, key: &str| match integration(id, key) {
         Some(row) => {
-            json!({"state":row.policy.state, "interrupt_running":row.policy.interrupt_running,
-            "revoked_at":row.revoked_at, "expires_at":row.policy.expires_at})
+            let mut observation = json!({"state":row.policy.state, "interrupt_running":row.policy.interrupt_running,
+                "revoked_at":row.revoked_at, "expires_at":row.policy.expires_at});
+            if let Some(held) = row.policy.held {
+                observation["held"] = json!(held);
+            }
+            observation
         }
         None => json!({"status":"unresolved"}),
     };
@@ -422,7 +426,7 @@ impl ServiceStops {
         let actions = match desired {
             Some(ServiceDesired::Held) => json!([{"action":"cover"},{"action":"hold"}]),
             Some(ServiceDesired::Active) => {
-                if !row.policy.grant_unexpired(now) {
+                if !row.policy.confirms_control_release(now) {
                     return json!({"status":"pre_expiry_state_unresolved"});
                 }
                 if !can_release {
