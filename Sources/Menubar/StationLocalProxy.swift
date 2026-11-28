@@ -32,10 +32,13 @@ final class StationLocalProxy {
     private var pending: (call: String, membership: Bool, deadline: TimeInterval)?
     private var feeds: [String: String] = [:]
     private var challengeForwarded = false
+    private var proofForwarded = false
+    private var retryAfterSuspension = false
     private var queue: [Data] = []
     private var queuedBytes = 0
     private var sending = false
-    private var localQueue: [Data] = []
+    private enum LocalWrite { case packet, retryChallenge, retryAcceptance }
+    private var localQueue: [(bytes: Data, kind: LocalWrite)] = []
     private var localBytes = 0
     private var localSending = false
     private var queuedSuspension: Data?
@@ -45,19 +48,24 @@ final class StationLocalProxy {
     private let current: () -> Bool
     private let connect: () async throws -> IdentityRelaySocket
     private let sign: (String) throws -> String
-    private let writeLocal: (Data, @escaping (Error?) -> Void) -> Void
+    private let writeLocal: (Data, Bool, @escaping (Error?) -> Void) -> Void
     private let closeLocal: (Data) -> Void
     private let now: () -> TimeInterval
+    private let waitBeforeRetry: (TimeInterval) async throws -> Void
 
     deinit { timer?.cancel(); socket?.cancel(with: .goingAway, reason: nil) }
 
     init(current: @escaping () -> Bool, connect: @escaping () async throws -> IdentityRelaySocket,
          sign: @escaping (String) throws -> String,
-         writeLocal: @escaping (Data, @escaping (Error?) -> Void) -> Void,
+         writeLocal: @escaping (Data, Bool, @escaping (Error?) -> Void) -> Void,
          closeLocal: @escaping (Data) -> Void,
-         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         waitBeforeRetry: @escaping (TimeInterval) async throws -> Void = {
+             try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+         }) {
         self.current = current; self.connect = connect; self.sign = sign
         self.writeLocal = writeLocal; self.closeLocal = closeLocal; self.now = now
+        self.waitBeforeRetry = waitBeforeRetry
     }
 
     func start() {
@@ -115,22 +123,25 @@ final class StationLocalProxy {
         if fields["type"]?.string == "relay" {
             let op = fields["op"]?.string
             if phase == .proof, op == "host_challenge", !challengeForwarded {
-                challengeForwarded = true; forwardLocal(bytes); return
+                challengeForwarded = true
+                forwardLocal(bytes, kind: retryAfterSuspension ? .retryChallenge : .packet)
+                return
             }
-            if phase == .proof, challengeForwarded, op == "host_route_ok" {
-                phase = .ready; retryCount = 0; timer?.cancel(); forwardLocal(bytes); return
+            if phase == .proof, proofForwarded, op == "host_route_ok" {
+                phase = .ready; retryCount = 0; timer?.cancel()
+                forwardLocal(bytes, kind: retryAfterSuspension ? .retryAcceptance : .packet)
+                return
             }
             if phase == .proof, op == "host_route_refused" {
-                refuse(finalLocal: bytes); return
+                let suspended = proofForwarded && bytes.count <= 1024 && fields["v"] == .integer(1)
+                    && Set(object.keys) == ["type", "op", "v", "code", "text"]
+                    && fields["code"]?.string == "service_suspended" && Self.validServiceText(fields["text"]?.string)
+                refuse(finalLocal: bytes, retryAfterDelivery: suspended); return
             }
             if phase == .ready, op == "service_suspended" {
                 guard bytes.count <= 1024, fields["v"] == .integer(1),
                       Set(object.keys) == ["type", "op", "v", "text"],
-                      let reason = fields["text"]?.string, (1...256).contains(reason.utf8.count),
-                      !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      !reason.unicodeScalars.contains(where: {
-                          [.control, .format, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
-                      }) else { return }
+                      Self.validServiceText(fields["text"]?.string) else { return }
                 // The host owns the suspension gate. Invalidate outstanding
                 // Station calls and forward the original notice on this link.
                 pending = nil
@@ -187,6 +198,7 @@ final class StationLocalProxy {
         }
         guard fields["type"]?.string == "relay" else { return false }
         if phase == .proof, challengeForwarded, fields["op"]?.string == "host_route" {
+            proofForwarded = true
             enqueue(bytes); return true
         }
         guard phase == .ready, let call = try? relayDecodeToStation(message: text) else { return true }
@@ -226,19 +238,21 @@ final class StationLocalProxy {
         }
     }
 
-    private func forwardLocal(_ bytes: Data) {
+    private func forwardLocal(_ bytes: Data, kind: LocalWrite = .packet) {
         guard localQueue.count < 128, localBytes + bytes.count <= 8 * 1024 * 1024 else { failed(); return }
-        localQueue.append(bytes); localBytes += bytes.count; flushLocal()
+        localQueue.append((bytes, kind)); localBytes += bytes.count; flushLocal()
     }
 
     private func flushLocal() {
-        guard !localSending, let bytes = localQueue.first, current() else { return }
+        guard !localSending, let write = localQueue.first, current() else { return }
+        let bytes = write.bytes
         localSending = true; let generation = attempt
         if bytes == queuedSuspension { queuedSuspension = nil }
-        writeLocal(bytes) { [weak self] error in
+        writeLocal(bytes, write.kind == .retryChallenge) { [weak self] error in
             Task { @MainActor in
                 guard let self, self.attempt == generation else { return }
                 if error != nil { self.failed(); return }
+                if write.kind == .retryAcceptance { self.retryAfterSuspension = false }
                 // Keep a closing channel until the write completes so queue
                 // rejection or a failed write still closes it during retirement.
                 if case .close(let handle, _) = try? RemoteChannelEnvelope.readHost(bytes) {
@@ -252,14 +266,14 @@ final class StationLocalProxy {
 
     private func clearTransport(suspension: Data? = nil) {
         var submittedClose: String?
-        if suspension != nil, localSending, let bytes = localQueue.first,
+        if suspension != nil, localSending, let bytes = localQueue.first?.bytes,
            case .close(let handle, "service_suspended") = try? RemoteChannelEnvelope.readHost(bytes) {
             submittedClose = handle
         }
         queuedSuspension = nil
         timer?.cancel(); timer = nil
         socket?.cancel(with: .goingAway, reason: nil); socket = nil
-        pending = nil; feeds.removeAll(); challengeForwarded = false
+        pending = nil; feeds.removeAll(); challengeForwarded = false; proofForwarded = false
         queue.removeAll(); queuedBytes = 0; sending = false
         localQueue.removeAll(); localBytes = 0; localSending = false
         // Closing old channels remains necessary after account/Station authority
@@ -272,24 +286,53 @@ final class StationLocalProxy {
         channels.removeAll()
         // The Station socket can end before the last local write completes.
         // The local socket serializes these terminal writes in submission order.
-        if let suspension, current() { writeLocal(suspension) { _ in } }
+        if let suspension, current() { writeLocal(suspension, false) { _ in } }
     }
 
-    private func refuse(finalLocal: Data? = nil) {
+    private static func validServiceText(_ text: String?) -> Bool {
+        guard let text, (1...256).contains(text.utf8.count),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return !text.unicodeScalars.contains {
+            [.control, .format, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
+        }
+    }
+
+    private func refuse(finalLocal: Data? = nil, retryAfterDelivery: Bool = false) {
         attempt = UUID(); phase = .refused; clearTransport()
-        // The old queue is retired, but Atem still needs the definitive verdict.
-        if let finalLocal, current() { writeLocal(finalLocal) { _ in } }
+        guard let finalLocal, current() else { return }
+        let generation = attempt
+        writeLocal(finalLocal, false) { [weak self] error in
+            guard retryAfterDelivery, error == nil else { return }
+            Task { @MainActor in
+                guard let self, self.attempt == generation, self.current() else { return }
+                self.retryAfterSuspension = true
+                self.scheduleRetry(after: 30)
+            }
+        }
     }
 
     private func failed() {
         guard phase != .closed, phase != .refused else { return }
+        // A host can ignore a challenge that arrives before its own timer
+        // elapses. Once it answers, a missing verdict leaves the proof pending.
+        let unansweredRetry = retryAfterSuspension && phase == .proof && challengeForwarded && !proofForwarded
+        if retryAfterSuspension, proofForwarded {
+            refuse()
+            return
+        }
         attempt = UUID(); clearTransport(suspension: current() ? queuedSuspension : nil); phase = .connecting
         guard current() else { close(); return }
         retryCount = min(retryCount + 1, 6)
-        let delay = min(pow(2, Double(retryCount)), 30)
-        timer = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard !Task.isCancelled else { return }; self?.start()
+        scheduleRetry(after: unansweredRetry ? 30 : min(pow(2, Double(retryCount)), 30))
+    }
+
+    private func scheduleRetry(after delay: TimeInterval) {
+        let generation = attempt
+        timer = Task { [weak self, waitBeforeRetry] in
+            do { try await waitBeforeRetry(delay) } catch { return }
+            guard !Task.isCancelled, let self, self.attempt == generation, self.current() else { return }
+            self.phase = .connecting
+            self.start()
         }
     }
 
