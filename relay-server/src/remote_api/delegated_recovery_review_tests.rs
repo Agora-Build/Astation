@@ -438,7 +438,7 @@ async fn postgres_signer_challenge_is_private_committed_and_reused_by_other_repl
 async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas() {
     use atem_client::member_report::{sign_signer_report, signer_report_body, JournalView, SignerReportChallenge};
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
-    let (_, f, genesis, binding) = retained(&database).await;
+    let (store, mut f, genesis, binding) = retained(&database).await;
     binding.initialize(&database.pool, true).await.unwrap();
     let plan = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     let a = RecoveryStore::postgres(database.reconnect(2).await);
@@ -499,7 +499,7 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     // This signed record was already in the checkpoint when both slots got their challenges.
     assert_eq!(http(&b, &genesis, Some("alice")).await.1["evidence_hash"], plan["evidence_hash"]);
     sqlx::query("DELETE FROM station_delegated_signer_challenges WHERE slot='astation-macos'").execute(&database.pool).await.unwrap();
-    assert_eq!(post_recovery(&a, &path, Some("alice"), bytes).await, one);
+    assert_eq!(post_recovery(&a, &path, Some("alice"), bytes.clone()).await, one);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_delegated_signer_reports").fetch_one(&database.pool).await.unwrap();
     assert_eq!(count, 1);
     assert_eq!(saved(&database.pool, &genesis).await, before);
@@ -564,6 +564,39 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let other = http(&a, &genesis, Some("alice")).await.1;
     assert_eq!(other["evidence_hash"], plan["evidence_hash"]);
     assert_ne!(other["reconstruction_hash"], review["reconstruction_hash"]);
+    let staged = plan::snapshot_stops::stage(&database.pool, &binding, &genesis,
+        other["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    assert_eq!(staged["stop_count"], 1);
+    let (status, pending) = post_recovery(&a, &format!("{base}/signer-challenges"), Some("alice"), mint("pending")).await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = SignerReportChallenge::parse(pending.to_string().as_bytes()).unwrap();
+    let journal = JournalView {id:[3;16], since:1, revision:0, records:vec![], drafts:vec![]};
+    let body = signer_report_body(&f.log, &challenge, signer, "pending", ORIGIN, &journal, challenge.issued_at()).unwrap();
+    let pending = sign_signer_report(&f.keys, &KeyId::new("manager"), &body).unwrap();
+
+    let extended = super::recovery_plan::demote_manager(&mut f);
+    let remove = Action::Remove { device_id: "phone".into() };
+    let entry = sign_entry(&f.keys, &KeyId::new("replacement-manager"),
+        extended.draft("replacement-manager", f.created, &remove)).unwrap();
+    let mut previous = f.log.head();
+    for next in extended.entries().iter().filter(|e| e.seq > f.log.head().seq).chain(std::iter::once(&entry)) {
+        assert_eq!(store.append_test_entry(&genesis, "alice", next.clone(), previous).await, StatusCode::OK);
+        previous = Head { seq:next.seq, hash:next.hash() };
+    }
+    let restart = database.reconnect(2).await;
+    let moved = plan::prepare(&restart, &binding, &genesis).await.unwrap();
+    assert_eq!(moved["plan_id"], plan["plan_id"]);
+    assert_ne!(moved["evidence_hash"], other["evidence_hash"]);
+    assert_eq!(moved["known_authors"]["members"][signer]["reports"].as_array().unwrap().len(), 2);
+    let obligation = moved["known_history"]["records"].as_array().unwrap().iter()
+        .find(|row| row["record_id"] == original["body"]["record_id"]).unwrap();
+    assert_eq!(obligation["verification"], "removed_manager");
+    assert!(plan::snapshot_stops::stage(&restart, &binding, &genesis, other["reconstruction_hash"].as_str().unwrap()).await.is_err());
+    assert!(comparison(roster.clone()).await.is_err());
+    assert_eq!(post_recovery(&a, &path, Some("alice"),
+        json!({"report":pending.to_json(),"records":[]}).to_string().into_bytes()).await.0, StatusCode::CONFLICT);
+    assert_eq!(post_recovery(&b, &path, Some("alice"), bytes).await, one);
+    restart.close().await;
     // A corrupted retained report cannot appear in a subsequent operator review.
     sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0").execute(&database.pool).await.unwrap();
     assert!(comparison(roster).await.is_err());
@@ -578,13 +611,16 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
 
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
     let (_, mut f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let before = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     f.log = super::recovery_plan::demote_manager(&mut f);
     let mut root = saved(&database.pool, &genesis).await;
     root["membership"] = f.log.to_stored();
     sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
         .bind(&genesis).bind(&root).execute(&database.pool).await.unwrap();
-    binding.initialize(&database.pool, true).await.unwrap();
     let initial = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    assert_eq!(initial["plan_id"], before["plan_id"]);
+    assert_ne!(initial["evidence_hash"], before["evidence_hash"]);
     let replica = database.reconnect(2).await;
     let store = RecoveryStore::postgres(replica.clone());
     store.configure_recovery_review(ORIGIN, 1).await.unwrap();

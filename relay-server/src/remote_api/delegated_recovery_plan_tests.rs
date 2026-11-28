@@ -356,13 +356,26 @@ async fn postgres_delegated_recovery_requires_restored_membership_to_cover_every
         assert_eq!(saved(&peer, &genesis).await, *restored);
         if generation == 2 {
             // Deliver the signed extension through the ordinary membership append.
-            // The old preparation cannot be reused with a different head.
+            // Keep the original checkpoint and open a fresh report round in this plan.
             let mut previous = f.log.head();
             for entry in later_log.entries().iter().filter(|e| e.seq > f.log.head().seq) {
                 assert_eq!(store.append_test_entry(&genesis, "alice", entry.clone(), previous).await, StatusCode::OK);
                 previous = Head { seq: entry.seq, hash: entry.hash() };
             }
-            assert!(prepare(&peer, &binding, &genesis).await.is_err());
+            assert!(review_for_owner(&peer, &binding, &genesis, "alice").await.is_err());
+            let advanced = prepare(&peer, &binding, &genesis).await.unwrap();
+            assert_eq!(advanced["plan_id"], review["plan_id"]);
+            assert_eq!(advanced["candidate_feed_id"], review["candidate_feed_id"]);
+            assert_eq!(advanced["source_hash"], review["source_hash"]);
+            assert_eq!(advanced["known_history"]["membership_gaps"], json!([]));
+            assert_ne!(advanced["evidence_hash"], review["evidence_hash"]);
+            assert_eq!(prepare(&database.pool, &binding, &genesis).await.unwrap(), advanced);
+            for stale in [&initial, &diverged] {
+                replace(stale).await;
+                assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+            }
+            replace(&demoted).await;
+            assert_eq!(prepare(&peer, &binding, &genesis).await.unwrap(), advanced);
             let corrected = Binding::new(ORIGIN, 3).unwrap();
             corrected.initialize(&peer, true).await.unwrap();
             let current = prepare(&peer, &corrected, &genesis).await.unwrap();

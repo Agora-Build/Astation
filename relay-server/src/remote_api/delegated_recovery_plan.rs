@@ -22,6 +22,8 @@ mod service_drafts;
 pub(crate) mod snapshot_stops;
 #[path = "delegated_recovery_history.rs"]
 mod history;
+#[path = "delegated_recovery_memberships.rs"]
+mod memberships;
 #[path = "delegated_native_recovery.rs"]
 pub(crate) mod native;
 #[path = "delegated_recovery_signatures.rs"]
@@ -374,7 +376,6 @@ async fn checkpoint_for_owner(
         "membership": root.membership,
         "feed": feed,
     });
-    let source_hash = source_hash(&retained)?;
     // JSONB's text representation can be larger than canonical JSON. Check
     // the actual persisted size so a successful first call is readable again.
     let fits: bool = sqlx::query_scalar("SELECT octet_length($1::jsonb::text) <= $2")
@@ -398,8 +399,10 @@ async fn checkpoint_for_owner(
     .fetch_optional(&mut *connection)
     .await?;
     let prepared = if let Some(prepared) = prepared {
-        if prepared.abandoned || prepared.source_hash != source_hash
-            || prepared.retained != retained
+        if prepared.abandoned || prepared.source_hash != source_hash(&prepared.retained)?
+            || prepared.retained["account_subject"] != retained["account_subject"]
+            || prepared.retained["account_id"] != retained["account_id"]
+            || prepared.retained["feed"] != retained["feed"]
             || !canonical_uuid(&prepared.plan_id)
             || !canonical_uuid(&prepared.candidate_feed_id)
             || prepared.candidate_feed_id == review["retained_feed_id"]
@@ -407,6 +410,7 @@ async fn checkpoint_for_owner(
             // Never replace an earlier plan or silently drop its obligations.
             return Err(invalid());
         }
+        memberships::observe(connection, &prepared, &log, &root.membership, create).await?;
         prepared
     } else {
         if !create {
@@ -416,7 +420,7 @@ async fn checkpoint_for_owner(
             abandoned: false,
             plan_id: uuid::Uuid::new_v4().to_string(),
             candidate_feed_id: uuid::Uuid::new_v4().to_string(),
-            source_hash,
+            source_hash: source_hash(&retained)?,
             retained,
         };
         if prepared.candidate_feed_id == review["retained_feed_id"] {

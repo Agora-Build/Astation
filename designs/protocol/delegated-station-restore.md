@@ -523,8 +523,14 @@ times or report delivery. For a present feed, missing clocks, duplicate record I
 account/origin/feed are refused. It never initializes a missing root, feed or
 fence. Concurrent operators/replicas and retry after restart return the same
 durable plan and replacement UUID. A commit failure returns no successful plan.
-Changes to the retained membership, ownership or feed require review; retry
-never overwrites the earlier plan. A later external recovery generation gets
+When signed membership advances, run `prepare` again. Station checks the
+extension against the last head observed by any replica. The original source,
+plan and replacement feed keep their identities. The new head starts a fresh
+author report round and invalidates staging against the previous review.
+Earlier reports and copies remain verifiable at their acceptance heads. The
+latest membership determines each stop's current authority. A rollback, fork,
+change of owner or change to the retained feed refuses preparation.
+A later external recovery generation gets
 its own plan while retaining the old one. Backup blobs, routes and push state
 do not establish control history and are excluded from this checkpoint.
 
@@ -621,7 +627,8 @@ These are lower bounds, not proof that later clocks/history survived.
 The combined `evidence_hash` binds the exact prepared plan/source, all known
 checkpoint commitments and imported evidence. It changes when later evidence is
 retained; it authorizes no signature or reopening. Reconciliation is bounded to
-128 checkpoints, 16 MiB of retained checkpoint JSONB and 4,096 distinct combined
+128 checkpoints and membership observations combined, 16 MiB of their
+retained JSONB and 4,096 distinct combined
 record IDs, in addition to the import limits. Exceeding a bound or finding a
 corrupt/foreign checkpoint refuses recovery without truncation or a partial
 plan/import. Known historical feed IDs cannot become the new candidate ID.
