@@ -1158,6 +1158,21 @@ supply historical stops. A list can have an empty candidate or one containing
 only revokes and interrupts. The assembled result is a preview. Publication
 requires the final participant check and a separate commit.
 
+With an assembled snapshot, `prepare` also stages the ordered records, fresh
+acknowledgment ledger and signing watermarks together in PostgreSQL. The
+`replacement_feed` receipt identifies the reviewed inputs and the exact stored
+feed. Retrying that review on another replica uses the original capture time,
+including for revocation deadlines. The watermarks include unused service and
+recovery-copy reservations. The old feed remains in the original checkpoint.
+
+The replacement ledger starts with an empty set of host acknowledgments.
+It applies the existing reporting journal before recording the snapshot's
+revokes and interrupts. A lost journal prefix, stop or delivery claim can
+produce `awaiting_reporting_history`. The operator can still inspect the other
+recovery evidence. The live reporter retains its outstanding delivery claim.
+A staged receipt grants no authority to serve the feed or release a manager's
+signing hold.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run

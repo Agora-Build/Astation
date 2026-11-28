@@ -285,7 +285,7 @@ impl SigningCeilings {
             let principal = format!("service:{service}");
             let highest_reserved_ms = u64::try_from(*ceiling).map_err(|_| ())?;
             let mut mark = highest_reserved_ms;
-            for value in [retained.get(&principal), copies.get(&principal)].into_iter().flatten() {
+            for value in [retained.get(&principal), copies.get(&principal), plan["reserved_copy_times"].get(&principal)].into_iter().flatten() {
                 mark = mark.max(value.as_u64().ok_or(())?);
             }
             marks.insert(principal, SigningMark {

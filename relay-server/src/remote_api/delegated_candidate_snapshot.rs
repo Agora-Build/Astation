@@ -1,12 +1,12 @@
 //! Reconstruct a candidate for operator review while the recovery fence is locked.
 //! The participant check and atomic publication consume separate evidence.
-use super::{invalid, service_components, snapshot_stops::StopSources, source_hash, Prepared};
+use super::{invalid, service_components, snapshot_stops::StopSources, Prepared};
 use crate::service_signing_ceilings::SigningMark;
 use atem_client::{
     control::{ControlAction, ControlBody, ControlPrincipal, ControlRecord},
     membership::Membership,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgConnection;
 use std::collections::BTreeMap;
 
@@ -100,20 +100,25 @@ fn matches_draft(
     Ok(true)
 }
 
-pub(super) async fn inspect(
+pub(super) enum Candidate {
+    Waiting(&'static str),
+    Assembled(Vec<ControlRecord>),
+}
+
+pub(super) async fn assemble(
     db: &mut PgConnection,
     plan: &Prepared,
     log: &Membership,
     origin: &str,
     review: &Value,
     sources: &StopSources,
-) -> Result<Value, sqlx::Error> {
+) -> Result<Candidate, sqlx::Error> {
     let draft = &review["service_drafts"];
     if draft["status"] != "prepared" {
-        return Ok(json!({"status":"awaiting_service_review"}));
+        return Ok(Candidate::Waiting("awaiting_service_review"));
     }
     let Some(provisioned) = provisioned_keys(&review["portal_service_evidence"])? else {
-        return Ok(json!({"status":"provisioning_unresolved"}));
+        return Ok(Candidate::Waiting("provisioning_unresolved"));
     };
     let expected = draft["unsigned_bodies"]
         .as_array()
@@ -175,15 +180,12 @@ pub(super) async fn inspect(
             fresh = records;
         }
         if fresh.is_empty() {
-            return Ok(json!({"status":"awaiting_service_signatures"}));
+            return Ok(Candidate::Waiting("awaiting_service_signatures"));
         }
     }
     let Some(records) = sources.with_services(log, origin, plan, &fresh, &provisioned, &marks)?
     else {
-        return Ok(json!({"status":"awaiting_stop_evidence"}));
+        return Ok(Candidate::Waiting("awaiting_stop_evidence"));
     };
-    let signed = Value::Array(records.iter().map(|r| r.object().to_json()).collect());
-    Ok(
-        json!({"status":"assembled","record_count":records.len(),"records_hash":source_hash(&signed)?}),
-    )
+    Ok(Candidate::Assembled(records))
 }
