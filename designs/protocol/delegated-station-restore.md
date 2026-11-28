@@ -456,11 +456,20 @@ exporting saved signatures remain local operations. Loading a plan installs no
 authority and enables no confirmation button; complete authoritative collection,
 reservation, preparation and publication still require the provider below.
 
-The screen also lists original signed stops retained in the selected Station's
-protected local journal. These are local evidence, not a complete Station history;
-unsigned intent is never offered as an original signature. After loading a plan,
-**Prepare Copy** invokes the existing trusted recovery-authority adapter for that
-exact original and context. It requires both the delegated gate and recovery
+The screen lists signed stops saved on this Mac. Loading the review also reads
+`GET /api/remote/v1/logs/<genesis>/control/recovery/<plan>/originals` from the
+selected Station with the native account bearer. Each request names the exact
+`reconstruction_hash` in the `review` query parameter and the number of rows
+already read in `offset`. Station checks account ownership and the closed plan
+under the recovery lock. It returns up to 64 outstanding former-manager stops
+in record-ID order, within 256 KiB. A changed plan or reconstruction returns
+409. A foreign or missing account root returns the same 404. The Mac verifies
+each signed record against the pinned membership head before displaying the
+list. A failed page discards the entire Station list.
+
+**Prepare Copy** rechecks the Station review for a selected remote original,
+compares any local record with the same ID, and invokes the trusted recovery
+authority for that exact signed object. It requires both the delegated gate and recovery
 provider, rechecks the protected checkpoint before reservation and draft storage,
 and revalidates current account, Station and membership across async work.
 Membership refresh rechecks protected state before writing and after each network
@@ -832,20 +841,18 @@ destinations and independently approved Portal mirrors stay intact.
 
 Preparation is scoped to the exact account/genesis, Station, external generation,
 plan, source/evidence commitments, replacement feed and membership head. A saved
-draft is not authorization. The trusted `RemoteControlRecoveryAuthorizing`
-adapter must establish complete current history/clocks and durably reserve its
-timestamp before preparation, then validate that reservation and review again
-before and after owner confirmation and at signing. The journal also refuses
-times at or below any recovery draft/copy it already retained for that principal;
-these local observations still cannot establish a complete clock.
+draft records the exact signing request. The recovery adapter must establish the
+current closed plan, authenticated original and current manager, and check its
+reservation again at confirmation and signing. The local journal keeps increasing
+copy timestamps for a principal. The protocol uses native stop timestamps for
+display. A current manager signs needed copies before submitting the final
+signer report and entering its signing hold. Complete participant history and
+the service signing clock are required for snapshot publication. Requiring either
+to sign a native copy would make recovery wait for its own result.
 
-There is **no production adapter** yet.
-The coordinator defaults this provider to nil and refuses preparation/signing
-before a prompt or key operation, including when ordinary delegated control has
-an authorization provider. A caller-supplied plan, observed lower bound, restored
-database, wall clock or owner click cannot substitute for the missing authority.
-The complete history/clock reconciliation and authenticated adapter remain to
-be built before enabling the native recovery workflow.
+The production coordinator still has no recovery-authority provider. Viewing
+verified originals works while signing is gated. A configured provider must
+also enforce the protected author journal and the owner-confirmed signing request.
 
 Control Activity's **Review Recovery Copies** opens a separate protected local
 review. It lists only drafts already prepared through that trusted adapter and

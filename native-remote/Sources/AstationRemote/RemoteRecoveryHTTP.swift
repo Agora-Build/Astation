@@ -93,7 +93,7 @@ public struct RemoteStationSignerChallenge: Sendable {
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryOriginalsTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -244,6 +244,44 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
             stationOrigin: stationOrigin, expected: expected)
         review.stationReceipt = ReviewReceipt(review.context)
         return review
+    }
+
+    public func controlRecoveryOriginals(for review: RemoteControlRecoveryPreparation) async throws -> [String] {
+        let context = review.context
+        try context.validate()
+        guard context.stationOrigin == stationOrigin, RemoteRecoveryKit.validHash(review.reconstructionHash) else {
+            throw RemoteChannelError.invalidInput
+        }
+        let endpoint = path(context.genesisHash, "control/recovery/\(context.planID)/originals")
+        var records: [String] = []
+        var lastID = ""
+        var size = 0
+        while true {
+            var url = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
+            url.queryItems = [URLQueryItem(name: "review", value: review.reconstructionHash),
+                              URLQueryItem(name: "offset", value: String(records.count))]
+            let (_, bytes) = try await perform(url: url.url!, method: "GET")
+            let page = try Self.dictionary(bytes)
+            guard Set(page.keys) == ["plan_id", "reconstruction_hash", "offset", "records", "more"],
+                  page["plan_id"] as? String == context.planID,
+                  page["reconstruction_hash"] as? String == review.reconstructionHash,
+                  let offset = page["offset"] as? NSNumber, CFGetTypeID(offset) != CFBooleanGetTypeID(),
+                  offset.stringValue == String(records.count),
+                  let rows = page["records"] as? [[String: Any]], rows.count <= 64,
+                  let more = page["more"] as? NSNumber, CFGetTypeID(more) == CFBooleanGetTypeID(),
+                  records.count + rows.count <= 4096, !more.boolValue || (!rows.isEmpty && records.count + rows.count < 4096)
+            else { throw RemoteRecoveryTransportError.invalidResponse }
+            for row in rows {
+                let json = try Self.json(row)
+                let body = try parseControlRecord(recordJson: json)
+                size += json.utf8.count
+                guard size <= 16 * 1024 * 1024, RemoteControlRecoveryContext.validUUID(body.recordId),
+                      body.recordId > lastID else { throw RemoteRecoveryTransportError.invalidResponse }
+                lastID = body.recordId
+                records.append(json)
+            }
+            if !more.boolValue { return records }
+        }
     }
 
     public func planEnd(for held: RemoteControlRecoveryContext) async throws -> RemoteStationPlanEnd? {

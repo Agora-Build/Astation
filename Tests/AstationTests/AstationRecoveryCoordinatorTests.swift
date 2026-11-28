@@ -138,7 +138,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryOriginalsTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
     init(stationOrigin: String = "https://configured.example", controlFeedID: String = UUID().uuidString.lowercased()) {
         controlStationOrigin = stationOrigin
@@ -201,6 +201,12 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
         return RemoteControlRecoveryRetention(recordIDs: ids, reconstructionHash: String(repeating: "e", count: 64))
     }
 
+    var recoveryOriginals: [String] = []
+    func setRecoveryOriginals(_ records: [String]) { recoveryOriginals = records }
+    func controlRecoveryOriginals(for review: RemoteControlRecoveryPreparation) async throws -> [String] {
+        guard preparedRecovery == review else { throw RemoteRecoveryTransportError.unavailable }
+        return recoveryOriginals
+    }
     func setRecoveryReview(_ value: RemoteControlRecoveryPreparation) { preparedRecovery = value }
     func holdNextRecoveryReview() { holdRecoveryReview = true }
     func releaseRecoveryReview() { holdRecoveryReview = false; recoveryReviewWaiter?.resume(); recoveryReviewWaiter = nil }
@@ -3463,6 +3469,51 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let preparation = RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64))
         await h.relay.setRecoveryReview(preparation)
         return (coordinator, preparation)
+    }
+
+    func testStationOriginalFromFormerManagerCanBePreparedOnAnotherMacOnlyAtReviewedCut() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let original = try XCTUnwrap(records.first)
+        let log = try await coordinator.hostSenderMembership()
+        let context = try RemoteControlRecoveryContext(accountID: log.accountId(), genesisHash: log.genesisHash(),
+            stationOrigin: "https://configured.example", generation: 1, planID: UUID().uuidString.lowercased(),
+            sourceHash: String(repeating: "a", count: 64), evidenceHash: String(repeating: "b", count: 64),
+            candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
+        let review = RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64))
+        await h.relay.setRecoveryReview(review)
+        await h.relay.setRecoveryOriginals(records)
+        XCTAssertTrue(try coordinator.localControlRecoveryOriginals(stationOrigin: context.stationOrigin, current: { true }).isEmpty)
+        let candidates = try await coordinator.loadStationRecoveryOriginals(for: review, current: { true })
+        let candidate = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(candidate.body.signer, "member:manager-b")
+        authority.original = original
+        authority.context = context
+        await h.relay.setRecoveryReview(.init(context: context, reconstructionHash: String(repeating: "d", count: 64)))
+        do {
+            _ = try await coordinator.prepareControlRecoveryCopy(recordID: candidate.body.recordId,
+                context: context, stationOriginal: candidate, current: { true })
+            XCTFail("accepted an original from a superseded review")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(authority.reservations, 0)
+        await h.relay.setRecoveryReview(review)
+        let prompts = h.ownerRequests.count
+        let draft = try await coordinator.prepareControlRecoveryCopy(recordID: candidate.body.recordId,
+            context: context, stationOriginal: candidate, current: { true })
+        XCTAssertEqual(draft.originalRecordJSON, original)
+        XCTAssertEqual(draft.body.signer, "member:manager-a")
+        XCTAssertEqual(draft.body.revokeSeq, candidate.body.revokeSeq)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        let exported = try await coordinator.signControlRecoveryCopy(draft, current: { true })
+        XCTAssertTrue(exported.contains(draft.body.recordId))
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        let wrong = original.replacingOccurrences(of: candidate.body.recordId, with: UUID().uuidString.lowercased())
+        await h.relay.setRecoveryOriginals([original, wrong])
+        do {
+            _ = try await coordinator.loadStationRecoveryOriginals(for: review, current: { true })
+            XCTFail("a forged original must invalidate the entire response")
+        } catch {}
     }
 
     func testPreparedRecoveryAcquisitionNeverInstallsAuthorityOrChangesProtectedState() async throws {

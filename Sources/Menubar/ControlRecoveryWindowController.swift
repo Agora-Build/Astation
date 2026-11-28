@@ -34,7 +34,9 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let prepare = NSButton(title: "Prepare Copy...", target: nil, action: nil)
     private var access: Access?
     private var rows: [RemoteControlRecoveryReview] = []
-    private var originals: [RemoteControlActivity] = []
+    private var localOriginals: [ControlRecordBody] = []
+    private var stationOriginals: [String: AstationRecoveryCoordinator.StationRecoveryOriginal] = [:]
+    private var originals: [ControlRecordBody] = []
     private var preparation: RemoteControlRecoveryPreparation?
     private var generation = UUID()
     private var task: Task<Void, Never>?
@@ -132,7 +134,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         rows.indices.contains(choices.indexOfSelectedItem) ? rows[choices.indexOfSelectedItem] : nil
     }
 
-    private var selectedOriginal: RemoteControlActivity? {
+    private var selectedOriginal: ControlRecordBody? {
         originals.indices.contains(originalChoices.indexOfSelectedItem) ? originals[originalChoices.indexOfSelectedItem] : nil
     }
 
@@ -146,7 +148,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         generation = UUID(); task?.cancel()
         panel?.cancel(nil); panel = nil
         if let alert { window?.endSheet(alert.window, returnCode: .abort) }
-        alert = nil; heldPlan = nil; access = nil; rows = []; originals = []; preparation = nil
+        alert = nil; heldPlan = nil; access = nil; rows = []; localOriginals = []; stationOriginals = [:]; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
@@ -160,7 +162,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
 
     @objc private func reload() {
         guard task == nil, panel == nil else { return }
-        generation = UUID(); heldPlan = nil; access = nil; rows = []; originals = []; preparation = nil
+        generation = UUID(); heldPlan = nil; access = nil; rows = []; localOriginals = []; stationOriginals = [:]; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
@@ -176,11 +178,9 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 ? "No saved recovery copies. Load the Station review, then prepare a copy of an original stop. Preparation requires verified recovery authority."
                 : "Saved copies shown. History, clocks, publication and reopening are separate recovery steps."
             do {
-                originals = try value.coordinator.localControlRecoveryOriginals(stationOrigin: stationOrigin,
-                    current: { self.isCurrent(value, epoch: epoch) })
-                originalChoices.addItems(withTitles: originals.map {
-                    $0.body.principal + " - " + $0.body.recordId
-                })
+                localOriginals = try value.coordinator.localControlRecoveryOriginals(stationOrigin: stationOrigin,
+                    current: { self.isCurrent(value, epoch: epoch) }).map(\.body)
+                updateOriginalChoices()
             } catch {
                 // A currently unreviewable original must not hide an independently
                 // retained signed copy. Export still rechecks the protected store.
@@ -205,6 +205,17 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             guard isCurrent(access, epoch: epoch) else { return }
             heldPlan = nil
             authorStatus.stringValue = "This Mac's stop inventory is unavailable. Refresh to try again."
+        }
+    }
+
+    private func updateOriginalChoices() {
+        let selectedID = selectedOriginal?.recordId
+        originals = stationOriginals.values.map(\.body).sorted { $0.recordId < $1.recordId }
+        originals += localOriginals.filter { stationOriginals[$0.recordId] == nil }
+        originalChoices.removeAllItems()
+        originalChoices.addItems(withTitles: originals.map { $0.principal + " - " + $0.recordId })
+        if let selectedID, let index = originals.firstIndex(where: { $0.recordId == selectedID }) {
+            originalChoices.selectItem(at: index)
         }
     }
 
@@ -245,6 +256,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         guard loadReview.isEnabled, let access else { return }
         let epoch = generation
         preparation = nil
+        stationOriginals.removeAll()
+        updateOriginalChoices()
         stationStatus.stringValue = "Loading the selected Station's prepared recovery review..."
         task = Task { [weak self] in
             guard let self else { return }
@@ -255,7 +268,18 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 guard isCurrent(access, epoch: epoch), access.canSign() else { return }
                 preparation = value
                 stationStatus.stringValue = "Station review loaded for recovery generation \(value.context.generation). Access remains fenced."
-                status.stringValue = "Complete history, signing clocks and service authority still need verification before signing or reopening."
+                do {
+                    let records = try await access.coordinator.loadStationRecoveryOriginals(for: value,
+                        current: { self.isCurrent(access, epoch: epoch) && access.canSign() })
+                    guard isCurrent(access, epoch: epoch), access.canSign() else { return }
+                    for record in records { stationOriginals[record.body.recordId] = record }
+                    updateOriginalChoices()
+                    status.stringValue = records.isEmpty ? "Station has no outstanding stops from former managers."
+                        : "Station has \(records.count) signed stops that need a current manager's review."
+                } catch {
+                    guard isCurrent(access, epoch: epoch) else { return }
+                    status.stringValue = "Could not load Station's original stops. " + error.localizedDescription
+                }
             } catch {
                 guard isCurrent(access, epoch: epoch) else { return }
                 stationStatus.stringValue = "Could not load the Station review: " + error.localizedDescription
@@ -273,8 +297,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             "\nSource: \(context.sourceHash)\nEvidence: \(context.evidenceHash)\nReconstruction: \(preparation.reconstructionHash)"
     }
 
-    static func explanation(_ original: RemoteControlActivity) -> String {
-        let body = original.body
+    static func explanation(_ body: ControlRecordBody) -> String {
         return "Original signed stop: \(body.recordId)\nPrincipal: \(body.principal)\nAction: \(body.action)" +
             "\nInterrupt running: \(body.action == "interrupt_running" || body.interruptRunning == true ? "yes" : "no")" +
             (body.revokeSeq.map { "\nHost revoke sequence: \($0)" } ?? "") +
@@ -385,8 +408,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
             let current = { self.isCurrent(access, epoch: epoch) && access.canSign() && self.preparation == preparation }
             do {
-                let review = try await access.coordinator.prepareControlRecoveryCopy(recordID: original.body.recordId,
-                    context: preparation.context, current: current)
+                let review = try await access.coordinator.prepareControlRecoveryCopy(recordID: original.recordId,
+                    context: preparation.context, stationOriginal: stationOriginals[original.recordId], current: current)
                 guard current() else { return }
                 setCopies(try access.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin, current: current),
                     selecting: review.body.recordId)

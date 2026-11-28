@@ -25,6 +25,10 @@ async fn http(app: &crate::AppState, genesis: &str, owner: Option<&str>) -> (Sta
 }
 
 async fn get_recovery(app: &crate::AppState, path: &str, owner: Option<&str>) -> (StatusCode, Value) {
+    get_recovery_bounded(app, path, owner, 8192).await
+}
+
+async fn get_recovery_bounded(app: &crate::AppState, path: &str, owner: Option<&str>, max_bytes: usize) -> (StatusCode, Value) {
     let mut request = Request::builder()
         .uri(path)
         .extension(axum::extract::ConnectInfo(
@@ -39,7 +43,7 @@ async fn get_recovery(app: &crate::AppState, path: &str, owner: Option<&str>) ->
         .unwrap();
     assert_eq!(response.headers()["cache-control"], "no-store");
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let bytes = to_bytes(response.into_body(), max_bytes).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
@@ -74,6 +78,74 @@ fn copy_input(f: &Fixture, plan: &Value, root: &Value) -> Value {
     body.issued_at = f.created + 1000;
     let copy = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap();
     json!({"evidence_hash":plan["evidence_hash"],"replacements":[{"original_record_id":original.record_id(),"record":copy.to_json()}]})
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_pages_only_outstanding_former_manager_originals_at_one_review() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (_, mut f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let initial = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let mut root = saved(&database.pool, &genesis).await;
+    let first = root["delegated"][ORIGIN]["records"][1].clone();
+    let original = ControlRecord::parse(first.to_string().as_bytes()).unwrap();
+    let mut expected = vec![first];
+    for _ in 0..64 {
+        let mut body = original.body().clone();
+        body.record_id = uuid::Uuid::new_v4().to_string();
+        expected.push(build_control(&f.keys, &KeyId::new("manager"), &body).unwrap().to_json());
+    }
+    let replica = database.reconnect(2).await;
+    let reader = RecoveryStore::postgres(replica.clone());
+    reader.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let app = make_app(reader);
+    let path = |state: &Value, offset: usize| format!("/api/remote/v1/logs/{genesis}/control/recovery/{}/originals?review={}&offset={offset}",
+        state["plan_id"].as_str().unwrap(), state["reconstruction_hash"].as_str().unwrap());
+    let empty = get_recovery(&app, &path(&initial, 0), Some("alice")).await;
+    assert_eq!(empty.0, StatusCode::OK);
+    assert_eq!(empty.1["records"], json!([]));
+    assert_eq!(empty.1["more"], false);
+    f.log = super::recovery_plan::demote_manager(&mut f);
+    root["membership"] = f.log.to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis).bind(&root).execute(&database.pool).await.unwrap();
+    let changed = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let import = |records: Value| json!({"plan_id":changed["plan_id"],"source_hash":changed["source_hash"],"records":records});
+    plan::stops::retain(&database.pool, &binding, &genesis, import(json!(&expected[1..])).to_string().as_bytes()).await.unwrap();
+    let mut forged = expected[0].clone();
+    forged["body"]["record_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let cut = plan::stops::retain(&database.pool, &binding, &genesis, import(json!([forged])).to_string().as_bytes()).await.unwrap();
+    assert_eq!(get_recovery(&app, &path(&cut,0), None).await.0, StatusCode::UNAUTHORIZED);
+    let foreign = get_recovery(&app, &path(&cut,0), Some("bob")).await;
+    assert_eq!(foreign.0, StatusCode::NOT_FOUND);
+    assert_eq!(foreign, get_recovery(&app, &path(&cut,0).replace(&genesis, &"a".repeat(64)), Some("alice")).await);
+    assert_eq!(get_recovery(&app, &path(&initial, 64), Some("alice")).await.0, StatusCode::CONFLICT);
+    expected.sort_by(|a, b| a["body"]["record_id"].as_str().cmp(&b["body"]["record_id"].as_str()));
+    for (offset, end) in [(0,64), (64,65)] {
+        let (status, page) = get_recovery_bounded(&app, &path(&cut, offset), Some("alice"), 262_144).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page, json!({"plan_id":cut["plan_id"],"reconstruction_hash":cut["reconstruction_hash"],
+            "offset":offset,"records":&expected[offset..end],"more":end < 65}));
+    }
+    // Another replica stores an approved copy. A page of the old review must no longer be served.
+    let mut body = original.body().clone();
+    body.signer = ControlSigner::Member("replacement-manager".into());
+    body.record_id = uuid::Uuid::new_v4().to_string();
+    body.issued_at = f.created + 1000;
+    let copy = build_control(&f.keys, &KeyId::new("replacement-manager"), &body).unwrap().to_json();
+    let batch = json!({"evidence_hash":cut["evidence_hash"],"replacements":[{"original_record_id":original.record_id(),"record":copy}]});
+    let current = plan::signatures::retain(&database.pool, &binding, &genesis, cut["plan_id"].as_str().unwrap(), batch.to_string().as_bytes()).await.unwrap();
+    assert_eq!(get_recovery(&app, &path(&cut,64), Some("alice")).await.0, StatusCode::CONFLICT);
+    let (status, page) = get_recovery_bounded(&app, &path(&current,0), Some("alice"), 262_144).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["more"], false);
+    let records = page["records"].as_array().unwrap();
+    assert_eq!(records.len(), 64);
+    assert!(records.iter().all(|r| r != &original.object().to_json()));
+    assert_eq!(saved(&replica, &genesis).await, root);
+    replica.close().await;
+    database.cleanup().await;
 }
 
 #[tokio::test]
