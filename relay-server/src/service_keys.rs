@@ -188,6 +188,7 @@ impl ServiceSigner {
         store: &crate::service_signing_ceilings::SigningCeilings,
         bodies: &[atem_client::control::ControlBody],
         previously_signed: u64,
+        policy_allows_signing: impl Fn() -> bool,
     ) -> Result<Vec<atem_client::control::ControlRecord>, ()> {
         use atem_client::control::{principal_key_of, ControlRecord};
         let first = bodies.first().ok_or(())?;
@@ -215,6 +216,11 @@ impl ServiceSigner {
         bodies
             .iter()
             .map(|body| {
+                // Waiting for a reservation can outlast the grant. Keep the
+                // reservation consumed even if the signature is withheld.
+                if !policy_allows_signing() {
+                    return Err(());
+                }
                 let object = self.sign_control(body).map_err(|_| ())?;
                 ControlRecord::from_signed(object).map_err(|_| ())
             })
