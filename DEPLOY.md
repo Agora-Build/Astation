@@ -839,8 +839,13 @@ After a publisher disconnects, use
 operator's database connections and the current Station origin and generation.
 It checks the primary fence before clearing the observed signing hold. An active
 publisher keeps its hold. A retry after that publisher finishes is safe.
-The command changes only signing-store availability. Read the primary
-publication receipts to determine whether the feeds were installed. If the
+The command changes only signing-store availability. To verify a lost publication
+response, run `admin delegated-recovery inspect <genesis_hash>` on either replica
+for each reviewed device list. Compare the plan ID, candidate feed ID, cut hash
+and feed hash in `root.publication_receipt` with the reviewed publication. The
+hashes identify the original publication even after new records arrive. A null
+receipt means this owner has no committed publication for that list and
+configured generation. Check `recovery_ready` separately for the current fence. If the
 primary was replaced while a hold was active, reconcile it against the original
 cluster, database and fence table. If those are lost, keep signing drained
 until the operator has accounted for the old publisher and its commit outcome.

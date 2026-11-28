@@ -162,6 +162,7 @@ pub(crate) async fn review_publication(
                 async |_, review, comparison| {
                     reviews.push(json!({
                         "genesis_hash":review["genesis_hash"], "plan_id":review["plan_id"],
+                        "candidate_feed_id":review["candidate_feed_id"],
                         "cut_hash":review["replacement_feed"]["cut_hash"],
                         "feed_hash":review["replacement_feed"]["feed_hash"],
                         "process_comparison":comparison,
@@ -417,7 +418,7 @@ mod tests {
         integration_checkpoint::PortalCheckpoint,
         remote_api::{
             push_ingress::tests::Fixture,
-            recovery::delegated_recovery::{inspect, plan},
+            recovery::delegated_recovery::{inspect, inspect_root, plan},
         },
         station_integrations::tests::{fixture_with_ceiling_cluster, PRINCIPAL},
         test_database::TestDatabase,
@@ -822,6 +823,7 @@ mod tests {
                 .find(|row| row["genesis_hash"] == review["genesis_hash"])
                 .unwrap();
             assert_eq!(row["cut_hash"], review["replacement_feed"]["cut_hash"]);
+            assert_eq!(row["candidate_feed_id"], review["candidate_feed_id"]);
             assert_eq!(row["feed_hash"], review["replacement_feed"]["feed_hash"]);
             assert_eq!(
                 row["process_comparison"]["matching_evidence_confirmations"]
@@ -1052,6 +1054,10 @@ mod tests {
                 );
                 for i in 0..2 {
                     assert_eq!(receipt(i).await.unwrap()["outcome"], "pending");
+                    let genesis = reviews[i]["genesis_hash"].as_str().unwrap();
+                    let inspection = inspect_root(&replica, &fence, genesis, None).await.unwrap();
+                    assert_eq!(inspection["recovery_ready"], false);
+                    assert!(inspection["root"]["publication_receipt"].is_null());
                 }
                 // A new root cannot appear after the verifier enumerates this generation.
                 let mut writer = replica.begin().await?;
@@ -1078,6 +1084,13 @@ mod tests {
                 .unwrap();
             let result = receipt(i).await.unwrap();
             assert_eq!(result["outcome"], "published");
+            let inspection = inspect_root(&replica, &fence, &genesis, None).await.unwrap();
+            assert_eq!(inspection["recovery_ready"], true);
+            assert_eq!(inspection["root"]["publication_receipt"], json!({
+                "plan_id":result["plan_id"], "candidate_feed_id":result["candidate_feed_id"],
+                "cut_hash":reviews[i]["replacement_feed"]["cut_hash"],
+                "feed_hash":reviews[i]["replacement_feed"]["feed_hash"]
+            }));
             assert_eq!(
                 result["candidate_feed_id"],
                 after["delegated"][&fence.origin]["feed_id"]
@@ -1115,6 +1128,9 @@ mod tests {
         later.initialize(&db.pool, true).await.unwrap();
         let genesis = reviews[0]["genesis_hash"].as_str().unwrap();
         let id = reviews[0]["plan_id"].as_str().unwrap();
+        let inspection = inspect_root(&replica, &later, genesis, None).await.unwrap();
+        assert_eq!(inspection["recovery_ready"], false);
+        assert!(inspection["root"]["publication_receipt"].is_null());
         assert_eq!(
             plan::outcome::for_owner(&replica, &later, genesis, id, PRINCIPAL)
                 .await
