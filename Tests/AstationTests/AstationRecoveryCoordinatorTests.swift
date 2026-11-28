@@ -1065,6 +1065,11 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             let review = try await writer.prepareProcessReview(member: member, current: { true })
             try await writer.acceptProcessReview(review, lines: lines, current: { true })
         }
+        let origin = plan.context.stationOrigin
+        let log = try await writer.hostSenderMembership()
+        let journal = try RemoteMemberVerifierJournal(log: log, origin: origin,
+            read: { h.verifierHistoryBytes[origin] }, persist: { h.verifierHistoryBytes[origin] = $0 })
+        try journal.record(RemoteMemberVerifierSlot(memberID: member, slot: "offline", process: other), conflict: true)
         let restarted = try h.coordinator()
         let panel = RecoveryCopySavePanel(), url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         panel.destination = url
@@ -1085,12 +1090,17 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(rows.compactMap { $0["slot"] as? String }, ["desktop", "desktop", "offline"])
         XCTAssertEqual(rows.compactMap { $0["process"] as? String }, [other, local, other])
         XCTAssertEqual(rows.compactMap { $0["selected"] as? Bool }, [true, false, false])
+        XCTAssertEqual(object["conflicted_slots"] as? [[String: String]], [["member": member, "slot": "offline"]])
         XCTAssertEqual(object["evidence_hash"] as? String, plan.context.evidenceHash)
         XCTAssertEqual(object["reconstruction_hash"] as? String, plan.reconstructionHash)
         XCTAssertFalse(restarted.controlRecoveryAvailable)
         XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { false }))
         let foreign = try h.coordinator(relayURL: "https://another.example")
         XCTAssertThrowsError(try foreign.exportAuthorRoster(plan, current: { true }))
+        let pinned = h.verifierHistoryBytes.removeValue(forKey: origin)
+        XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
+        XCTAssertNil(h.verifierHistoryBytes[origin])
+        h.verifierHistoryBytes[origin] = pinned
         h.store.readFailure = true
         XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
     }

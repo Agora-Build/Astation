@@ -726,6 +726,24 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
         plan::author_roster::compare(&resumed, &binding, &genesis, initial["plan_id"].as_str().unwrap(), &inputs).await
     };
     assert_eq!(compare_files(&[manager.clone(), phone.clone(), phone.clone()]).await.unwrap(), result);
+    assert_eq!(result["conflicted_author_slots"], json!([]));
+    let mut observed = phone.clone();
+    let conflicts = json!([{"member":"phone","slot":"native"},{"member":"phone","slot":"old-slot"}]);
+    observed["conflicted_slots"] = conflicts.clone();
+    for files in [
+        vec![phone.clone(), observed.clone(), manager.clone()],
+        vec![manager.clone(), observed.clone(), phone.clone(), observed.clone()],
+    ] {
+        let combined = compare_files(&files).await.unwrap();
+        assert_eq!(combined["conflicted_author_slots"], conflicts);
+        assert_eq!(combined["matching_evidence_confirmations"], result["matching_evidence_confirmations"]);
+        assert_eq!(combined["recovery_ready"], false);
+    }
+    for invalid in [json!(null), json!([conflicts[0], conflicts[0]]),
+        json!([{"member":"unknown","slot":"native"}]), json!([{"member":"phone","slot":"/"}])] {
+        observed["conflicted_slots"] = invalid;
+        assert!(compare_files(&[observed.clone()]).await.is_err());
+    }
     let mut conflict = phone.clone();
     conflict["slots"][0]["selected"] = json!(false);
     assert!(compare_files(&[phone.clone(), conflict]).await.is_err());

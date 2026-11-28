@@ -229,6 +229,15 @@ stale file refuses the combined comparison. A retried receipt retains its origin
 scope. Comparing exported files cannot attest their provenance, establish complete history,
 release a signing hold or reopen a feed.
 
+When the Mac has a pinned verifier journal, the export also reads its saved
+process conflicts for this Station and device list. A missing pinned journal
+requires recovery before the Mac can export. Station lists reported conflicts
+for current and former managers in `conflicted_author_slots`, including slots
+the manager has since removed from the roster. A matching signed report can
+still describe one process's records. The conflict remains visible alongside it.
+Station combines conflicts from all supplied exports. An older export or an
+export from another Mac can add observations but cannot clear one.
+
 Recovery rechecks each retained report with the membership and challenge from
 the plan that accepted it. A signed revoke or interrupt exported only in that
 report appears among the replacement plan's obligations, including after
